@@ -250,11 +250,17 @@ function parseDepString(dep: string): { name: string; version: string } {
 /** P2-31 FIX: Write package.json for a bot project */
 // P2-BR-9 FIX: Made async, uses writeFile instead of writeFileSync
 async function writeBotPackageJson(botDir: string, botId: string, deps: string[], main: string) {
+  const hasBetterSqlite3 = deps.some(d => d.includes('better-sqlite3'))
   const pkgJson = {
     name: `bot-${botId}`,
     version: '1.0.0',
     type: 'commonjs' as const,
     main,
+    ...(hasBetterSqlite3 ? {
+      pnpm: {
+        onlyBuiltDependencies: ['better-sqlite3'],
+      },
+    } : {}),
     dependencies: {} as Record<string, string>,
   }
   for (const dep of deps) {
