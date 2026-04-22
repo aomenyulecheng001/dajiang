@@ -100,7 +100,7 @@ async function patchTelegrafRedactToken(botDir: string): Promise<void> {
 // rebuilds them using `pnpm rebuild` or `npm rebuild`, which runs node-gyp
 // under the real Node.js runtime.
 //
-// NATIVE FIX: Enhanced with actual load test — checks if the .node binary can
+// NATIVE FIX: Enhanced with actual load test - checks if the .node binary can
 // actually be required by Node.js, not just if the file exists on disk.
 // This catches cases where:
 // - .node file was compiled for a different Node.js version
