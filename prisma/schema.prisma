@@ -1,0 +1,81 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Bot {
+  id            String   @id @default(cuid())
+  name          String   @unique
+  description   String
+  emoji         String   @default("🤖")
+  customIcon    String   @default("")
+  status        String   @default("inactive")
+  health        String   @default("unknown")
+  language      String   @default("typescript")
+  template      String   @default("custom")
+  version       String   @default("1.0.0")
+  code          String   @default("")
+  codeBlocks    String   @default("[]")
+  dependencies  String   @default("[]")
+  envVars       String   @default("[]")
+  config        String   @default("{}")
+  stats         String   @default("{}")
+  projectFiles  String   @default("[]")
+  entryPoint      String   @default("")
+  lastRunnerStatus String   @default("")
+  lastDeployedAt   String   @default("")
+  /// P1 OPT: Extracted from config JSON — avoids JSON.parse on every webhook hit
+  webhookSecret  String   @default("")
+  createdAt       DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  logEntries    BotLog[]
+  messages      BotMessage[]
+
+  @@index([status])
+  @@index([updatedAt])
+  @@index([createdAt])
+}
+
+model BotLog {
+  id        String   @id @default(cuid())
+  botId     String
+  bot       Bot      @relation(fields: [botId], references: [id], onDelete: Cascade)
+  timestamp DateTime @default(now())
+  level     String   @default("info")
+  message   String
+  source    String   @default("")
+
+  @@index([botId, timestamp])
+  @@index([botId, id])
+  @@index([botId, level])
+  @@index([botId, timestamp, level])
+}
+
+model BotMessage {
+  id        String    @id @default(cuid())
+  botId     String
+  bot       Bot       @relation(fields: [botId], references: [id], onDelete: Cascade)
+  userId    String
+  userName  String    @default("")
+  text      String    @default("")
+  command   String?
+  timestamp DateTime  @default(now())
+
+  @@index([botId, timestamp])
+  @@index([botId, userId])
+  @@index([botId, command])
+}
+
+model Account {
+  id           String   @id @default(cuid())
+  username     String   @unique
+  password     String
+  tokenVersion Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}

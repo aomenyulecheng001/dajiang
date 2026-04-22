@@ -1,0 +1,195 @@
+import { readFileSync } from 'fs'
+import type { BotProcess } from './types'
+import { getChildProcessMemory, intentionalStopSet, cancelRestartTimer, memoryKilledSet } from './process-manager'
+import { appendLog } from './log-manager'
+import { io } from './socket'
+
+// ─── CPU Usage Tracking ─────────────────────────────────────────────────
+
+interface CpuSnapshot {
+  utime: number  // user time in milliseconds
+  stime: number  // system time in milliseconds
+  startTime: number  // process start time (clock ticks)
+  totalCpuMs: number  // total CPU time when snapshot was taken
+  wallTimeMs: number  // wall clock time when snapshot was taken
+}
+
+/**
+ * Read CPU usage data for a process from /proc/{pid}/stat (Linux only).
+ * P3-18/20 NOTE: This returns null on macOS/Windows. On those platforms,
+ * cpuUsage will default to 0. Cross-platform CPU monitoring would require
+ * the `systeminformation` npm package or `os.cpus()` based heuristics.
+ *
+ * P2-3 FIX: Uses readFileSync instead of execSync to avoid blocking shell.
+ * Direct file reads are significantly faster and avoid shell interpretation.
+ *
+ * /proc/{pid}/stat format (relevant fields):
+ *   field 14: utime  - user-mode CPU ticks
+ *   field 15: stime  - kernel-mode CPU ticks
+ *   field 22: starttime - process start time (ticks since boot)
+ */
+function readProcCpu(pid: number): CpuSnapshot | null {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf-8')
+    // The comm field (field 2) may contain spaces and parentheses, so we split from the end
+    const lastParen = stat.lastIndexOf(')')
+    if (lastParen === -1) return null
+
+    const fields = stat.substring(lastParen + 2).trim().split(/\s+/)
+    // Fields after comm: 1-based index from after ')'
+    // utime = index 13 (0-based), stime = index 14, starttime = index 21
+    const utime = parseInt(fields[13])
+    const stime = parseInt(fields[14])
+    const startTime = parseInt(fields[21])
+
+    if (isNaN(utime) || isNaN(stime) || isNaN(startTime)) return null
+
+    // Get total CPU time from /proc/stat (sum of all CPU times across cores)
+    let totalCpuTicks = 0
+    try {
+      // P2-3 FIX: Read /proc/stat directly instead of `cat | head` via execSync
+      const cpuStat = readFileSync('/proc/stat', 'utf-8')
+      const firstLine = cpuStat.split('\n')[0] // cpu line is always first
+      const cpuParts = firstLine.split(/\s+/).slice(1).map(Number)
+      totalCpuTicks = cpuParts.reduce((sum, v) => sum + (isNaN(v) ? 0 : v), 0)
+    } catch {
+      totalCpuTicks = 0
+    }
+
+    // Get clock tick rate (typically 100 Hz on Linux)
+    const hertz = 100
+
+    return {
+      utime: utime / hertz * 1000,  // Convert ticks to ms
+      stime: stime / hertz * 1000,
+      startTime,
+      totalCpuMs: totalCpuTicks / hertz * 1000,
+      wallTimeMs: Date.now(),
+    }
+  } catch {
+    return null
+  }
+}
+
+// Store previous CPU snapshots per bot
+const cpuSnapshots = new Map<string, CpuSnapshot>()
+
+/**
+ * Calculate CPU usage percentage for a bot process.
+ * Uses delta between current and previous snapshot.
+ * Returns 0 if no previous data or unable to read.
+ */
+function calculateCpuUsage(botId: string, pid: number): number {
+  const current = readProcCpu(pid)
+
+  if (!current) return 0
+
+  const prev = cpuSnapshots.get(botId)
+  cpuSnapshots.set(botId, current)
+
+  if (!prev) return 0  // Need at least 2 snapshots to calculate delta
+
+  // Calculate deltas
+  const processDeltaMs = (current.utime + current.stime) - (prev.utime + prev.stime)
+  const wallDeltaMs = current.wallTimeMs - prev.wallTimeMs
+
+  if (wallDeltaMs <= 0) return 0
+
+  // CPU usage = (process CPU time delta / wall time delta) * 100
+  // Clamp to 0-100% (per core)
+  const usage = (processDeltaMs / wallDeltaMs) * 100
+  return Math.max(0, Math.min(100, Math.round(usage * 100) / 100))
+}
+
+// ─── Monitoring ──────────────────────────────────────────────────────────
+
+let monitorTimer: ReturnType<typeof setInterval> | null = null
+
+export function startMonitoring(botProcesses: Map<string, BotProcess>): void {
+  // Avoid duplicate timers
+  if (monitorTimer) return
+
+  monitorTimer = setInterval(() => {
+    for (const [botId, bot] of botProcesses.entries()) {
+      if (bot.status !== 'running' || !bot.process || !bot.process.pid) continue
+
+      try {
+        bot.memoryUsage = getChildProcessMemory(bot.process.pid)
+      } catch {
+        // Ignore monitoring errors
+      }
+
+      // P1-6 FIX: Calculate actual CPU usage
+      try {
+        bot.cpuUsage = calculateCpuUsage(botId, bot.process.pid)
+      } catch {
+        // If CPU calculation fails, leave previous value
+      }
+
+      // Memory watchdog — auto-restart if exceeding limit
+      // Only act if not already in memoryKilledSet (prevent re-triggering every 3s)
+      if (bot.memoryUsage > bot.maxMemoryMb * 1024 * 1024 && bot.memoryUsage > 0 && !memoryKilledSet.has(botId)) {
+        const memMb = Math.round(bot.memoryUsage / 1024 / 1024)
+        appendLog(botId, `内存超限: ${memMb}MB > ${bot.maxMemoryMb}MB，正在重启...`, 'warn')
+        // Mark as memory-killed so handleBotExit knows this is NOT an intentional stop
+        // even though we use SIGTERM to kill the process.
+        // Also prevents the watchdog from re-triggering on the next monitoring cycle.
+        memoryKilledSet.add(botId)
+        intentionalStopSet.delete(botId)
+        cancelRestartTimer(botId)
+        // Don't reset restartCount — respect maxRestarts limit to prevent infinite restart loops
+        // for bots with persistent memory leaks. The user must manually restart after maxRestarts.
+        if (bot.process && bot.process.pid) {
+          const procRef = bot.process
+          try { procRef.kill('SIGTERM') } catch { /* ignore */ }
+          // SIGKILL fallback — same pattern as stopBotProcess.
+          // Prevents orphaned processes that ignore SIGTERM from holding resources.
+          const forceKillTimer = setTimeout(() => {
+            // BUG FIX: Use exitCode === null instead of !procRef.killed.
+            // Node.js sets killed=true immediately after SIGTERM, not when
+            // the process actually exits (same bug as in stopBotProcess).
+            if (procRef.exitCode === null && bot.process === procRef) {
+              appendLog(botId, '内存超限进程未响应 SIGTERM，强制终止...', 'warn')
+              try { procRef.kill('SIGKILL') } catch { /* ignore */ }
+            }
+          }, 5000)
+          forceKillTimer.unref() // BUG FIX: Don't let this timer prevent graceful shutdown
+          // Clear force-kill timer if process exits naturally
+          procRef.once('close', () => { clearTimeout(forceKillTimer) })
+        }
+      }
+    }
+
+    // P2-35 FIX: Only broadcast resource data for running bots to reduce unnecessary data
+    const resourceData: Record<string, { cpuUsage: number; memoryUsage: number; memoryUsageMb: number; status: string; pid?: number; restartCount: number; uptime?: number }> = {}
+    for (const [botId, bot] of botProcesses.entries()) {
+      if (bot.status !== 'running') continue // Skip non-running bots
+      resourceData[botId] = {
+        cpuUsage: bot.cpuUsage,
+        memoryUsage: bot.memoryUsage,
+        memoryUsageMb: Math.round(bot.memoryUsage / 1024 / 1024 * 100) / 100,
+        status: bot.status,
+        pid: bot.pid,
+        restartCount: bot.restartCount,
+        uptime: bot.startedAt ? Math.floor((Date.now() - new Date(bot.startedAt).getTime()) / 1000) : undefined,
+      }
+    }
+
+    // P2-BR-6 FIX: Clean up cpuSnapshots entries for bots no longer in botProcesses
+    for (const botId of cpuSnapshots.keys()) {
+      if (!botProcesses.has(botId)) {
+        cpuSnapshots.delete(botId)
+      }
+    }
+
+    io.emit('resources:update', resourceData)
+  }, 3000)
+}
+
+export function stopMonitoring(): void {
+  if (monitorTimer) {
+    clearInterval(monitorTimer)
+    monitorTimer = null
+  }
+  cpuSnapshots.clear()
+}
