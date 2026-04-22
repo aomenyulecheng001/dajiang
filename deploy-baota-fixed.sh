@@ -245,7 +245,7 @@ cp -r public .next/standalone/ 2>/dev/null || true
 cp .env .next/standalone/.env 2>/dev/null || true
 mkdir -p .next/standalone/prisma
 cp prisma/schema.prisma .next/standalone/prisma/ 2>/dev/null || true
-ln -sf "${PROJECT_DIR}/db" .next/standalone/db 2>/dev/null || cp -r db .next/standalone/db
+ln -sf "${PROJECT_DIR}/db" .next/standalone/db 2>/dev/null || cp -r db .next/standalone/db 2>/dev/null || true
 
 echo_success "构建产物验证通过"
 
