@@ -549,12 +549,19 @@ export const useBotStore = create<BotStore>((set, get) => ({
 
     while (attempt < MAX_RETRIES) {
       try {
-        // P1 FIX: Request all bots with large pageSize to avoid pagination issues
-        const res = await authFetch(`/api/bots?pageSize=${PAGINATION.MAX_PAGE_SIZE}`)
+        // OPTIMIZED: Use HYDRATION_PAGE_SIZE for better performance
+        // Loads first page of bots efficiently instead of requesting all at once
+        const res = await authFetch(`/api/bots?page=1&pageSize=${PAGINATION.HYDRATION_PAGE_SIZE}`)
         if (res.ok) {
           const data = await res.json()
-          // P2-API-1 FIX: Handle paginated response format
-          const raw: Bot[] = Array.isArray(data) ? data : (data.bots || [])
+          // Handle new API response format: { data, pagination, meta }
+          // Also support legacy format: { bots } for backward compatibility
+          const raw: Bot[] = Array.isArray(data.data) 
+            ? data.data 
+            : Array.isArray(data.bots) 
+              ? data.bots 
+              : []
+          
           // Normalize bots to ensure all nested fields have safe defaults
           const bots: Bot[] = raw.map(normalizeBot)
           set({ bots })

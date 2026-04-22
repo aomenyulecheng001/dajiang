@@ -38,7 +38,6 @@ const BOT_LIST_SELECT: Record<string, true> = {
 
 export async function GET(request: Request) {
   try {
-    // P2-API-1 FIX: Add pagination to prevent unbounded list queries
     const { searchParams } = new URL(request.url)
     const page = Math.max(1, parseInt(searchParams.get('page') || '1', 10))
     const pageSize = Math.min(PAGINATION.MAX_PAGE_SIZE, Math.max(1, parseInt(searchParams.get('pageSize') || String(PAGINATION.DEFAULT_PAGE_SIZE), 10)))
@@ -46,7 +45,6 @@ export async function GET(request: Request) {
 
     const [bots, total] = await Promise.all([
       db.bot.findMany({
-        // P0-1 OPT: Only select fields needed for list view, exclude heavy columns
         select: BOT_LIST_SELECT,
         orderBy: { updatedAt: 'desc' },
         skip,
@@ -55,13 +53,29 @@ export async function GET(request: Request) {
       db.bot.count(),
     ])
 
-    // P0-1 OPT: Use lightweight list serializer — skips envVar decryption and token validation
     const parsed = bots.map((bot) => serializeBotListResponse(bot))
+    
     return NextResponse.json({
-      bots: parsed,
-      pagination: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) },
+      data: parsed,
+      pagination: {
+        page,
+        pageSize,
+        total,
+        totalPages: Math.ceil(total / pageSize),
+        hasNextPage: page * pageSize < total,
+        hasPrevPage: page > 1,
+      },
+      meta: {
+        timestamp: new Date().toISOString(),
+      },
     }, {
-      headers: { 'Cache-Control': 'private, no-store, no-cache, must-revalidate' },
+      headers: { 
+        'Cache-Control': 'private, no-store, no-cache, must-revalidate',
+        'X-Total-Count': String(total),
+        'X-Page': String(page),
+        'X-Page-Size': String(pageSize),
+        'X-Total-Pages': String(Math.ceil(total / pageSize)),
+      },
     })
   } catch (error) {
     console.error('GET /api/bots error:', error)

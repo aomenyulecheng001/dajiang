@@ -36,10 +36,14 @@ export const LANGUAGE_LABELS: Record<string, string> = {
 
 /**
  * Pagination defaults for API list endpoints.
- * - DEFAULT_PAGE_SIZE: standard list page size
+ * - DEFAULT_PAGE_SIZE: standard list page size for UI display
  * - MAX_PAGE_SIZE: upper limit to prevent unbounded queries
+ * - HYDRATION_PAGE_SIZE: page size for initial data hydration (balances performance vs memory)
+ * - INFINITE_SCROLL_PAGE_SIZE: page size for incremental loading (when user scrolls)
  */
 export const PAGINATION = {
   DEFAULT_PAGE_SIZE: 20,
-  MAX_PAGE_SIZE: 10000,
+  MAX_PAGE_SIZE: 1000,
+  HYDRATION_PAGE_SIZE: 100,
+  INFINITE_SCROLL_PAGE_SIZE: 50,
 } as const
