@@ -175,6 +175,9 @@ export async function PUT(
         where: { id },
         data: updateData,
       })
+    }, {
+      maxWait: 10000,
+      timeout: 30000,
     })
 
     // P1 OPT: Emit status event to event bus for instant SSE push
@@ -292,7 +295,15 @@ export async function PATCH(
           }
           return incoming
         })
-        const processedEnvVars = await encryptEnvVarsOnSaveAsync(mergedEnvVars)
+        // PERF FIX: Only re-encrypt vars whose values actually changed.
+        const needsReEncrypt = mergedEnvVars.filter(
+          (v) => !existingEnvVars.some(
+            (e) => e.key === v.key && e.value === v.value && v.isEncrypted,
+          ),
+        )
+        const processedEnvVars = needsReEncrypt.length > 0
+          ? await encryptEnvVarsOnSaveAsync(mergedEnvVars)
+          : mergedEnvVars
         updateData.envVars = JSON.stringify(processedEnvVars)
       }
       if ('config' in body) {
@@ -325,6 +336,9 @@ export async function PATCH(
         where: { id },
         data: updateData,
       })
+    }, {
+      maxWait: 10000,
+      timeout: 30000,
     })
 
     // P1 OPT: Emit status event to event bus for instant SSE push
