@@ -22,9 +22,7 @@ export const metadata: Metadata = {
   description: "Build, manage, and monitor your Telegram bots with Bot Factory. Create intelligent chatbots with visual code editor, real-time monitoring, and powerful analytics.",
   keywords: ["Bot Factory", "Telegram", "Bot Management", "Chatbot", "No-Code"],
   icons: {
-    // HTTP/HTTPS COMPAT: Use protocol-relative URL so the icon loads correctly
-    // whether deployed on HTTP or HTTPS. Browsers resolve // to the current protocol.
-    icon: "//z-cdn.chatglm.cn/z-ai/static/logo.svg",
+    icon: "/logo.svg",
   },
 };
 
