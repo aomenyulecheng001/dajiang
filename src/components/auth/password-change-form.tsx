@@ -97,7 +97,7 @@ export function PasswordChangeForm({ onSuccess, submitLabel }: PasswordChangeFor
         toast.success(t('common.passwordChanged'))
         resetForm()
         onSuccess?.()
-        setTimeout(() => { logout() }, 1500)
+        logout()
       } else {
         if (data.error?.toLowerCase().includes('current') || data.error?.toLowerCase().includes('incorrect') || data.error?.toLowerCase().includes('invalid')) {
           setError(t('common.currentPasswordWrong'))
