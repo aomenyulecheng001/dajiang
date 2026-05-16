@@ -360,7 +360,7 @@ function persistEnvVarsToServer(botId: string) {
           const serverEnvVars = (updated.envVars || b.envVars) as EnvVar[]
           const mergedEnvVars = serverEnvVars.map((sv: EnvVar) => {
             const existing = b.envVars.find((ev: EnvVar) => ev.key === sv.key)
-            return { ...sv, id: existing?.id || sv.id || crypto.randomUUID() }
+            return { ...sv, id: existing?.id || sv.id || genId() }
           })
           return { ...b, envVars: mergedEnvVars }
         }),
