@@ -21,8 +21,6 @@ export const ResourceMonitor = React.memo(function ResourceMonitor({ botId }: { 
     requestAnimationFrame(() => setMounted(true))
   }, [])
 
-  if (!mounted || !connected) return null
-
   const status = botStatuses.get(botId)
   const resource = resourceData.get(botId)
 

@@ -259,13 +259,7 @@ export function LogsTab({ isVisible = true }: LogsTabProps) {
 
   // ─── Render ──────────────────────────────────────────────────────────
 
-  if (!bot) return null
-
   const isSimulationActive = simEnabled && isBotRunning && isVisible
-
-  // PERF FIX: Memoize all derived log computations to avoid redundant work
-  // on every render (e.g., when parent state changes but logs didn't).
-  // Previously, these ran on EVERY render — up to ~1200 array operations/cycle.
 
   const filteredLogs = useMemo(() =>
     activeFilter === 'All'
@@ -300,6 +294,8 @@ export function LogsTab({ isVisible = true }: LogsTabProps) {
     }
     return counts
   }, [logs])
+
+  if (!bot) return null
 
   return (
     <div className="space-y-3">
