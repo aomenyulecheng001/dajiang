@@ -62,14 +62,6 @@ function isPublicRoute(pathname: string): boolean {
   return PUBLIC_ROUTES.some(r => pathname === r) || isWebhookRoute(pathname)
 }
 
-/** Generate a cryptographically random nonce for CSP.
- *  Uses Web Crypto API for Edge Runtime compatibility.
- */
-function generateNonce(): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(16))
-  return btoa(String.fromCharCode(...bytes))
-}
-
 export const config = {
   // SECURITY FIX: Expanded matcher to include all routes (not just API).
   // This allows per-request CSP nonce generation for page routes.
@@ -80,25 +72,6 @@ export const config = {
 export async function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl
 
-  // ─── Per-request CSP nonce for page routes ───────────────────────────
-  // SECURITY FIX: Generate a unique nonce per request to make CSP effective.
-  // Previously, the nonce was generated once at server startup in next.config.ts,
-  // making it static and useless. Now we generate it here (per-request) and
-  // replace the {NONCE} placeholder in the CSP header.
-  if (!pathname.startsWith('/api/') && !pathname.startsWith('/_next/')) {
-    const nonce = generateNonce()
-    const response = NextResponse.next()
-    // Replace the {NONCE} placeholder in the CSP header set by next.config.ts
-    const csp = response.headers.get('Content-Security-Policy')
-    if (csp) {
-      response.headers.set('Content-Security-Policy', csp.replace(/{NONCE}/g, nonce))
-    }
-    // Expose nonce to server components via a custom header
-    response.headers.set('X-CSP-Nonce', nonce)
-    return response
-  }
-
-  // ─── API route handling ──────────────────────────────────────────────
   if (!pathname.startsWith('/api/')) {
     return NextResponse.next()
   }

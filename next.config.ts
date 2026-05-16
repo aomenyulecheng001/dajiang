@@ -5,13 +5,6 @@ const connectSrc = isProd
   ? "'self' ws: wss: https:"
   : "'self' ws: wss: http://localhost:* https:"
 
-// SECURITY FIX: Removed generateNonce() from next.config.ts.
-// Next.js headers() config function is evaluated at server startup, not per-request.
-// This means the nonce was static across all requests, defeating its purpose.
-// Instead, we use a {NONCE} placeholder that gets replaced per-request in middleware.
-// The middleware (middleware.ts) generates a fresh nonce for each request and
-// replaces the placeholder in the CSP header.
-
 const securityHeaders = [
   {
     key: 'X-Content-Type-Options',
@@ -39,9 +32,7 @@ const securityHeaders = [
     key: 'Content-Security-Policy',
     value: [
       "default-src 'self'",
-      isProd
-        ? "script-src 'self' 'nonce-{NONCE}'"
-        : "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+      "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
       "style-src 'self' 'unsafe-inline'",
       "img-src 'self' data: blob: http: https:",
       "font-src 'self' data:",
