@@ -63,7 +63,7 @@ async function cleanupOldRecords(): Promise<void> {
     })
     if (logResult.count > 0 || msgResult.count > 0) {
       console.log(`[DB-Cleanup] Deleted ${logResult.count} logs, ${msgResult.count} messages older than ${LOG_RETENTION_DAYS} days`)
-      await db.$executeRawUnsafe('PRAGMA wal_checkpoint(TRUNCATE)')
+      await db.$queryRawUnsafe('PRAGMA wal_checkpoint(TRUNCATE)')
     }
   } catch {
     // Non-fatal: cleanup will retry on next interval
