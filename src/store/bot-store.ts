@@ -1333,29 +1333,7 @@ export const useBotStore = create<BotStore>((set, get) => ({
         }
       }),
     }))
-    const updatedBot = get().bots.find(b => b.id === botId)
-    if (updatedBot) {
-      const existingSnapshot = botSnapshots.get(botId)
-      if (existingSnapshot) {
-        botSnapshots.set(botId, {
-          ...existingSnapshot,
-          status: updatedBot.status,
-          health: updatedBot.health,
-          lastRunnerStatus: updatedBot.lastRunnerStatus,
-          lastDeployedAt: updatedBot.lastDeployedAt,
-          codeDirty: updatedBot.codeDirty,
-          updatedAt: updatedBot.updatedAt,
-        })
-      }
-    }
-    const patchBot = get().bots.find(b => b.id === botId)
-    const patchSnapshot = botSnapshots.get(botId)
-    if (patchBot && patchSnapshot) {
-      const diff = computePatchDiff(patchBot, patchSnapshot)
-      if (diff) {
-        schedulePatch(botId, () => get().bots.find(b => b.id === botId))
-      }
-    }
+    schedulePatch(botId, () => get().bots.find(b => b.id === botId))
   },
 
   // ─── Stats Fetch ───────────────────────────────────────────────────────
