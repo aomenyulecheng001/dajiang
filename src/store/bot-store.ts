@@ -126,7 +126,7 @@ const logDedupKeys = new Map<string, Set<string>>()
 const lastLogFetchTime = new Map<string, string>()
 
 /** Fields to exclude from PATCH body (handled separately, read-only, or auto-managed by DB) */
-const PATCH_EXCLUDE_FIELDS = new Set(['id', 'createdAt', 'logs', 'stats', 'updatedAt', 'envVars', 'codeDirty'])
+const PATCH_EXCLUDE_FIELDS = new Set(['id', 'createdAt', 'logs', 'stats', 'updatedAt', 'codeDirty'])
 
 const REF_EQUAL_FIELDS = new Set(['projectFiles', 'code', 'codeBlocks', 'logs', 'stats'])
 
@@ -251,6 +251,9 @@ async function executePatch(botId: string, _retryCount = 0): Promise<boolean> {
   if (!bot) { persistTimers.delete(botId); return false }
   const patchData = computePatchDiff(bot, botSnapshots.get(botId))
   if (!patchData) { persistTimers.delete(botId); return false }
+  if (patchData.envVars) {
+    patchData.envVars = (patchData.envVars as EnvVar[]).map(({ id: _id, ...rest }) => rest)
+  }
   try {
     const res = await authFetch(`/api/bots/${botId}`, {
       method: 'PATCH',
@@ -277,7 +280,22 @@ async function executePatch(botId: string, _retryCount = 0): Promise<boolean> {
     const updated = await res.json()
     const currentBot = useBotStore.getState().bots.find(b => b.id === botId)
     if (currentBot) {
-      botSnapshots.set(botId, createFilteredSnapshot(currentBot))
+      if (updated.envVars && Array.isArray(updated.envVars)) {
+        const mergedEnvVars = (updated.envVars as EnvVar[]).map((sv: EnvVar) => {
+          const existing = currentBot.envVars.find((ev: EnvVar) => ev.key === sv.key)
+          return { ...sv, id: existing?.id || sv.id || genId() }
+        })
+        useBotStore.setState((state) => ({
+          bots: state.bots.map((b) => {
+            if (b.id !== botId) return b
+            return { ...b, envVars: mergedEnvVars }
+          }),
+        }))
+      }
+      const latestBot = useBotStore.getState().bots.find(b => b.id === botId)
+      if (latestBot) {
+        botSnapshots.set(botId, createFilteredSnapshot(latestBot))
+      }
     }
     persistTimers.delete(botId)
     return true
@@ -287,6 +305,11 @@ async function executePatch(botId: string, _retryCount = 0): Promise<boolean> {
       return executePatch(botId, _retryCount + 1)
     }
     console.error(`[BotStore] PATCH /api/bots/${botId} error:`, error)
+    showErrorToastWithCooldown(botId)
+    const currentBot = useBotStore.getState().bots.find(b => b.id === botId)
+    if (currentBot) {
+      botSnapshots.set(botId, createFilteredSnapshot(currentBot))
+    }
     persistTimers.delete(botId)
     return false
   }
@@ -312,16 +335,6 @@ async function flushPendingPatch(botId: string, _getBot?: () => Bot | undefined)
   return result
 }
 
-/**
- * SECURITY: Dedicated envVars persistence function.
- * Sends ONLY envVars to the server via PATCH, ensuring the merge logic
- * in the PATCH handler preserves existing encrypted values.
- * This avoids the risk of schedulePatch sending masked placeholders (••••••••••••)
- * that would destroy real encrypted secrets.
- */
-const pendingEnvVarRequests = new Map<string, Promise<void>>()
-const envVarRetryCount = new Map<string, number>()
-const ENV_VAR_MAX_RETRIES = 2
 const errorToastCooldown = new Map<string, number>()
 const ERROR_TOAST_COOLDOWN_MS = 30_000
 
@@ -333,66 +346,6 @@ function showErrorToastWithCooldown(botId: string) {
   const locale = useI18nStore.getState().locale
   const t = (key: string, params?: Record<string, string | number>) => getTranslation(locale, key as any, params)
   toast.error(t('common.saveFailed'), { description: t('common.saveFailedDesc') })
-}
-
-function persistEnvVarsToServer(botId: string) {
-  if (pendingEnvVarRequests.has(botId)) return
-  const retries = envVarRetryCount.get(botId) || 0
-  if (retries >= ENV_VAR_MAX_RETRIES) {
-    console.warn(`[BotStore] Max retries reached for env var persist of bot ${botId}, giving up`)
-    envVarRetryCount.delete(botId)
-    return
-  }
-  const state = useBotStore.getState()
-  const bot = state.bots.find(b => b.id === botId)
-  if (!bot) return
-  const envVarsForServer = bot.envVars.map(({ id: _id, ...rest }) => rest)
-  const promise = authFetch(`/api/bots/${botId}`, {
-    method: 'PATCH',
-    body: JSON.stringify({ envVars: envVarsForServer }),
-  }).then(async (res) => {
-    if (res.ok) {
-      envVarRetryCount.delete(botId)
-      const updated = await res.json()
-      useBotStore.setState((state) => ({
-        bots: state.bots.map((b) => {
-          if (b.id !== botId) return b
-          const serverEnvVars = (updated.envVars || b.envVars) as EnvVar[]
-          const mergedEnvVars = serverEnvVars.map((sv: EnvVar) => {
-            const existing = b.envVars.find((ev: EnvVar) => ev.key === sv.key)
-            return { ...sv, id: existing?.id || sv.id || genId() }
-          })
-          return { ...b, envVars: mergedEnvVars }
-        }),
-      }))
-      const currentBot = useBotStore.getState().bots.find(b => b.id === botId)
-      if (currentBot) {
-        botSnapshots.set(botId, createFilteredSnapshot(currentBot))
-      }
-    } else {
-      envVarRetryCount.set(botId, retries + 1)
-      showErrorToastWithCooldown(botId)
-    }
-  }).catch((e) => {
-    envVarRetryCount.set(botId, retries + 1)
-    console.warn(`Failed to persist env vars for bot ${botId}:`, e)
-  }).finally(() => {
-    pendingEnvVarRequests.delete(botId)
-    const latestRetries = envVarRetryCount.get(botId) || 0
-    if (latestRetries < ENV_VAR_MAX_RETRIES) {
-      const latestBot = useBotStore.getState().bots.find(b => b.id === botId)
-      if (latestBot && !pendingEnvVarRequests.has(botId)) {
-        const prev = botSnapshots.get(botId)
-        const currentEnvVars = latestBot.envVars.map(({ id: _id, ...rest }) => rest)
-        const prevEnvVars = (prev?.envVars || []) as EnvVar[]
-        const prevForCompare = prevEnvVars.map(({ id: _id, ...rest }) => rest)
-        if (JSON.stringify(currentEnvVars) !== JSON.stringify(prevForCompare)) {
-          persistEnvVarsToServer(botId)
-        }
-      }
-    }
-  })
-  pendingEnvVarRequests.set(botId, promise)
 }
 
 /**
@@ -531,7 +484,6 @@ export function resetHydration() {
   persistTimers.clear()
   botSnapshots.clear()
   dbBotIds.clear()
-  pendingEnvVarRequests.clear()
   lastLogFetchTime.clear()
   logDedupKeys.clear()
 }
@@ -945,9 +897,7 @@ export const useBotStore = create<BotStore>((set, get) => ({
         }
       }),
     }))
-    // SECURITY: Use dedicated envVars persist instead of schedulePatch
-    // to avoid sending masked placeholders that destroy encrypted secrets
-    persistEnvVarsToServer(botId)
+    schedulePatch(botId)
   },
 
   updateEnvVar: (botId, envVarId, updates) => {
@@ -963,7 +913,7 @@ export const useBotStore = create<BotStore>((set, get) => ({
         }
       }),
     }))
-    persistEnvVarsToServer(botId)
+    schedulePatch(botId)
   },
 
   removeEnvVar: (botId, envVarId) => {
@@ -977,7 +927,7 @@ export const useBotStore = create<BotStore>((set, get) => ({
         }
       }),
     }))
-    persistEnvVarsToServer(botId)
+    schedulePatch(botId)
   },
 
   addLogEntry: (botId, entry) => {
