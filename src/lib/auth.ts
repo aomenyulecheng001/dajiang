@@ -148,14 +148,6 @@ export async function resetPassword(
     return { success: false, message: 'New password must contain at least one number' }
   }
 
-  if (!/[A-Z]/.test(newPassword)) {
-    return { success: false, message: 'New password must contain at least one uppercase letter' }
-  }
-
-  if (!/[^a-zA-Z0-9]/.test(newPassword)) {
-    return { success: false, message: 'New password must contain at least one special character' }
-  }
-
   const hashedPassword = await bcrypt.hash(newPassword, 12)
 
   // SECURITY FIX (SEC-22): Use a single atomic DB update to ensure password

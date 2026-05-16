@@ -62,14 +62,6 @@ export function PasswordChangeForm({ onSuccess, submitLabel }: PasswordChangeFor
       setError(t('common.passwordNeedsDigit'))
       return
     }
-    if (!/[A-Z]/.test(newPassword)) {
-      setError(t('common.passwordNeedsUppercase'))
-      return
-    }
-    if (!/[^a-zA-Z0-9]/.test(newPassword)) {
-      setError(t('common.passwordNeedsSpecial'))
-      return
-    }
     if (newPassword !== confirmPassword) {
       setError(t('common.passwordMismatch'))
       return
