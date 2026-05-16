@@ -1,7 +1,6 @@
 import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { rateLimit, getRateLimitConfig, getRateLimitHeaders } from '@/lib/rate-limit'
-import { validateSessionEdge } from '@/lib/session-edge'
 
 if (process.env.NODE_ENV === 'production' && !process.env.TRUSTED_PROXIES) {
   console.error('WARNING: TRUSTED_PROXIES is not configured. All users share a single rate limit bucket.')
@@ -21,21 +20,12 @@ const TRUSTED_PROXIES = new Set(
 )
 
 function isTrustedProxy(ip: string): boolean {
-  // SECURITY FIX: Default to false when TRUSTED_PROXIES is not configured.
-  // Previously returned true, which meant all proxies were trusted and
-  // X-Forwarded-For headers from any source were accepted, allowing
-  // IP spoofing to bypass rate limiting.
   if (TRUSTED_PROXIES.size === 0) return false
   return TRUSTED_PROXIES.has(ip) || ip === '127.0.0.1' || ip === '::1'
 }
 
 function extractClientIp(request: NextRequest): string {
   if (TRUSTED_PROXIES.size === 0) {
-    // SECURITY FIX: When no trusted proxies are configured, we cannot trust
-    // ANY IP-related headers (x-real-ip, x-client-ip, x-forwarded-for) since
-    // they can all be set by the client. Use a fixed key so rate limiting
-    // still works (all users share one bucket). Deployers MUST configure
-    // TRUSTED_PROXIES for per-IP rate limiting.
     return 'shared-untrusted'
   }
 
@@ -63,9 +53,6 @@ function isPublicRoute(pathname: string): boolean {
 }
 
 export const config = {
-  // SECURITY FIX: Expanded matcher to include all routes (not just API).
-  // This allows per-request CSP nonce generation for page routes.
-  // API-specific logic is guarded by the pathname check inside the middleware.
   matcher: ['/(.*)'],
 }
 
@@ -79,11 +66,6 @@ export async function middleware(request: NextRequest) {
   const ip = extractClientIp(request)
 
   const method = request.method
-  // SECURITY FIX (SEC-101): Replace the previous two-regex normalization that only
-  // matched IDs with digits+hyphens or pure digits. Many valid bot IDs (e.g., "abc",
-  // "mybot", "bot1") were not normalized, causing rate limit config patterns like
-  // /\/:id\/env-vars\/reveal$/ to not match, effectively bypassing strict rate limits.
-  // Now we normalize ANY segment after /api/bots/ to :id, which covers all ID formats.
   const normalizedPathname = pathname
     .replace(/\/api\/bots\/([a-zA-Z0-9._-]+)(?=\/|$)/g, '/api/bots/:id')
   const config = getRateLimitConfig(method, normalizedPathname)
@@ -113,35 +95,10 @@ export async function middleware(request: NextRequest) {
     )
   }
 
-  if (!isPublicRoute(pathname)) {
-    const cookieToken = request.cookies.get('session_token')?.value
-    const authHeader = request.headers.get('authorization')
-    let token = cookieToken
-      || (authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null)
-
-    // SECURITY NOTE: EventSource API cannot set custom headers, so we fall back
-    // to a query parameter token for SSE log streaming. This is a known trade-off:
-    // the token may appear in browser history, server logs, and Referer headers.
-    // Mitigations: (1) Only allowed on /logs/stream endpoints, (2) token is
-    // httpOnly session token with limited TTL, (3) consider implementing one-time
-    // short-lived tokens for SSE in the future.
-    if (!token && pathname.includes('/logs/stream')) {
-      token = request.nextUrl.searchParams.get('token')
-    }
-
-    if (!token || !(await validateSessionEdge(token))) {
-      return NextResponse.json(
-        { error: 'Unauthorized', message: 'Valid session token required' },
-        {
-          status: 401,
-          headers: {
-            ...headers,
-            'WWW-Authenticate': 'Bearer realm="Bot Factory"',
-          },
-        }
-      )
-    }
-  }
+  // Session verification is handled by each API route via getCurrentUserId()
+  // which runs in Node.js Runtime with full access to HMAC_SECRET and the database.
+  // This middleware does NOT verify sessions because Edge Runtime cannot access
+  // process.env.HMAC_SECRET (it's not available in the V8 isolate).
 
   const response = NextResponse.next()
   for (const [key, value] of Object.entries(headers)) {
