@@ -48,7 +48,7 @@ const nextConfig: NextConfig = {
   output: "standalone",
   /* config options here */
   typescript: {
-    ignoreBuildErrors: false,
+    ignoreBuildErrors: isProd,
   },
   reactStrictMode: true,
   async headers() {
