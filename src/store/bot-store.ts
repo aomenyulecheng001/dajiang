@@ -263,7 +263,15 @@ async function executePatch(botId: string, _retryCount = 0): Promise<boolean> {
         await new Promise(r => setTimeout(r, 1000 * Math.pow(2, _retryCount)))
         return executePatch(botId, _retryCount + 1)
       }
-      console.error(`[BotStore] PATCH /api/bots/${botId} failed:`, res.status)
+      const errorBody = await res.text().catch(() => '')
+      console.error(`[BotStore] PATCH /api/bots/${botId} failed: ${res.status}`, errorBody)
+      if (res.status === 404) {
+        const currentBot = useBotStore.getState().bots.find(b => b.id === botId)
+        if (currentBot) {
+          botSnapshots.set(botId, createFilteredSnapshot(currentBot))
+        }
+        persistTimers.delete(botId)
+      }
       return false
     }
     const updated = await res.json()
@@ -299,9 +307,7 @@ async function flushPendingPatch(botId: string, _getBot?: () => Bot | undefined)
   }
   const result = await executePatch(botId)
   if (!result) {
-    const locale = useI18nStore.getState().locale
-    const t = (key: string, params?: Record<string, string | number>) => getTranslation(locale, key as any, params)
-    toast.error(t('common.saveFailed'), { description: t('common.saveFailedDesc') })
+    showErrorToastWithCooldown(botId)
   }
   return result
 }
@@ -314,9 +320,29 @@ async function flushPendingPatch(botId: string, _getBot?: () => Bot | undefined)
  * that would destroy real encrypted secrets.
  */
 const pendingEnvVarRequests = new Map<string, Promise<void>>()
+const envVarRetryCount = new Map<string, number>()
+const ENV_VAR_MAX_RETRIES = 2
+const errorToastCooldown = new Map<string, number>()
+const ERROR_TOAST_COOLDOWN_MS = 30_000
+
+function showErrorToastWithCooldown(botId: string) {
+  const now = Date.now()
+  const lastShown = errorToastCooldown.get(botId) || 0
+  if (now - lastShown < ERROR_TOAST_COOLDOWN_MS) return
+  errorToastCooldown.set(botId, now)
+  const locale = useI18nStore.getState().locale
+  const t = (key: string, params?: Record<string, string | number>) => getTranslation(locale, key as any, params)
+  toast.error(t('common.saveFailed'), { description: t('common.saveFailedDesc') })
+}
 
 function persistEnvVarsToServer(botId: string) {
   if (pendingEnvVarRequests.has(botId)) return
+  const retries = envVarRetryCount.get(botId) || 0
+  if (retries >= ENV_VAR_MAX_RETRIES) {
+    console.warn(`[BotStore] Max retries reached for env var persist of bot ${botId}, giving up`)
+    envVarRetryCount.delete(botId)
+    return
+  }
   const state = useBotStore.getState()
   const bot = state.bots.find(b => b.id === botId)
   if (!bot) return
@@ -326,6 +352,7 @@ function persistEnvVarsToServer(botId: string) {
     body: JSON.stringify({ envVars: envVarsForServer }),
   }).then(async (res) => {
     if (res.ok) {
+      envVarRetryCount.delete(botId)
       const updated = await res.json()
       useBotStore.setState((state) => ({
         bots: state.bots.map((b) => {
@@ -343,22 +370,25 @@ function persistEnvVarsToServer(botId: string) {
         botSnapshots.set(botId, createFilteredSnapshot(currentBot))
       }
     } else {
-      const locale = useI18nStore.getState().locale
-      const t = (key: string, params?: Record<string, string | number>) => getTranslation(locale, key as any, params)
-      toast.error(t('common.saveFailed'), { description: t('common.saveFailedDesc') })
+      envVarRetryCount.set(botId, retries + 1)
+      showErrorToastWithCooldown(botId)
     }
   }).catch((e) => {
+    envVarRetryCount.set(botId, retries + 1)
     console.warn(`Failed to persist env vars for bot ${botId}:`, e)
   }).finally(() => {
     pendingEnvVarRequests.delete(botId)
-    const latestBot = useBotStore.getState().bots.find(b => b.id === botId)
-    if (latestBot && pendingEnvVarRequests.has(botId) === false) {
-      const prev = botSnapshots.get(botId)
-      const currentEnvVars = latestBot.envVars.map(({ id: _id, ...rest }) => rest)
-      const prevEnvVars = (prev?.envVars || []) as EnvVar[]
-      const prevForCompare = prevEnvVars.map(({ id: _id, ...rest }) => rest)
-      if (JSON.stringify(currentEnvVars) !== JSON.stringify(prevForCompare)) {
-        persistEnvVarsToServer(botId)
+    const latestRetries = envVarRetryCount.get(botId) || 0
+    if (latestRetries < ENV_VAR_MAX_RETRIES) {
+      const latestBot = useBotStore.getState().bots.find(b => b.id === botId)
+      if (latestBot && !pendingEnvVarRequests.has(botId)) {
+        const prev = botSnapshots.get(botId)
+        const currentEnvVars = latestBot.envVars.map(({ id: _id, ...rest }) => rest)
+        const prevEnvVars = (prev?.envVars || []) as EnvVar[]
+        const prevForCompare = prevEnvVars.map(({ id: _id, ...rest }) => rest)
+        if (JSON.stringify(currentEnvVars) !== JSON.stringify(prevForCompare)) {
+          persistEnvVarsToServer(botId)
+        }
       }
     }
   })
@@ -558,7 +588,21 @@ export const useBotStore = create<BotStore>((set, get) => ({
           if (hasMore && allBots.length > 0) {
             console.warn(`[BotStore] Partial hydration: got ${allBots.length} bots, more pages available`)
           }
-          set({ bots: allBots })
+          const currentBots = get().bots
+          const mergedBots = allBots.map((dbBot) => {
+            const liveBot = currentBots.find(b => b.id === dbBot.id)
+            if (liveBot && liveBot.lastRunnerStatus && liveBot.lastRunnerStatus !== 'stopped') {
+              return {
+                ...dbBot,
+                status: liveBot.status,
+                health: liveBot.health,
+                lastRunnerStatus: liveBot.lastRunnerStatus,
+                lastDeployedAt: liveBot.lastDeployedAt || dbBot.lastDeployedAt,
+              }
+            }
+            return dbBot
+          })
+          set({ bots: mergedBots })
           dbBotIds.clear()
           allBots.forEach((b: { id: string }) => dbBotIds.add(b.id))
           for (const [timerBotId, timer] of persistTimers.entries()) {
@@ -1302,11 +1346,16 @@ export const useBotStore = create<BotStore>((set, get) => ({
           codeDirty: updatedBot.codeDirty,
           updatedAt: updatedBot.updatedAt,
         })
-      } else {
-        // Don't create snapshot — it should be created by fetchBotDetail
       }
     }
-    schedulePatch(botId, () => get().bots.find(b => b.id === botId))
+    const patchBot = get().bots.find(b => b.id === botId)
+    const patchSnapshot = botSnapshots.get(botId)
+    if (patchBot && patchSnapshot) {
+      const diff = computePatchDiff(patchBot, patchSnapshot)
+      if (diff) {
+        schedulePatch(botId, () => get().bots.find(b => b.id === botId))
+      }
+    }
   },
 
   // ─── Stats Fetch ───────────────────────────────────────────────────────
