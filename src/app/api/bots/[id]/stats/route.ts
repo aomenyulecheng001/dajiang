@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { validateBotId } from '@/lib/validation'
-import { getCurrentUserId } from '@/lib/api-helpers'
+import { getCurrentUserId, isBotOwner } from '@/lib/api-helpers'
 
 const STATS_CACHE_TTL = 10_000
 const MAX_CACHE_SIZE = 200
@@ -44,7 +44,7 @@ export async function GET(
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
     const ownershipBot = await db.bot.findUnique({ where: { id: botId }, select: { ownerId: true } })
-    if (!ownershipBot || ownershipBot.ownerId !== userId) {
+    if (!ownershipBot || !isBotOwner(ownershipBot.ownerId, userId)) {
       return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
 

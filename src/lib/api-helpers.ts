@@ -121,6 +121,11 @@ export function safeJsonParse<T>(str: string | null | undefined, fallback: T): T
   }
 }
 
+export function isBotOwner(ownerId: string | null | undefined, userId: string): boolean {
+  if (!ownerId || ownerId === 'migrate-pending') return true
+  return ownerId === userId
+}
+
 /** Server-side bot token format validation.
  * Same logic as the client-side isValidBotToken, but runs on the server
  * after decryption so it validates the actual plaintext token.

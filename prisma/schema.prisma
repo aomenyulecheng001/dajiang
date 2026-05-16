@@ -42,7 +42,7 @@ model Bot {
   createdAt       DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
-  ownerId       String
+  ownerId       String   @default("migrate-pending")
   owner         Account  @relation(fields: [ownerId], references: [id], onDelete: Cascade)
 
   logEntries    BotLog[]

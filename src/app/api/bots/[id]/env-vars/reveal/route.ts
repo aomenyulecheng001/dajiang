@@ -12,7 +12,7 @@
  */
 import { db } from '@/lib/db'
 import { NextResponse } from 'next/server'
-import { safeJsonParse, getCurrentUserId } from '@/lib/api-helpers'
+import { safeJsonParse, getCurrentUserId, isBotOwner } from '@/lib/api-helpers'
 import { validateBotId } from '@/lib/validation'
 import { decryptEnvVarsAsync } from '@/lib/crypto'
 
@@ -68,7 +68,7 @@ export async function GET(
     }
 
     const ownershipBot = await db.bot.findUnique({ where: { id }, select: { ownerId: true } })
-    if (!ownershipBot || ownershipBot.ownerId !== userId) {
+    if (!ownershipBot || !isBotOwner(ownershipBot.ownerId, userId)) {
       return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
 

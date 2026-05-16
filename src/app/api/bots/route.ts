@@ -56,7 +56,7 @@ export async function GET(request: Request) {
     const pageSize = Math.min(PAGINATION.MAX_PAGE_SIZE, Math.max(1, parseInt(searchParams.get('pageSize') || String(PAGINATION.DEFAULT_PAGE_SIZE), 10) || PAGINATION.DEFAULT_PAGE_SIZE))
     const skip = (page - 1) * pageSize
 
-    const where = { ownerId: userId }
+    const where = { OR: [{ ownerId: userId }, { ownerId: 'migrate-pending' }] }
 
     const [bots, total] = await Promise.all([
       db.bot.findMany({

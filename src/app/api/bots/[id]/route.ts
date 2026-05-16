@@ -2,7 +2,7 @@ import { db } from '@/lib/db'
 import { eventBus } from '@/lib/event-bus'
 import { NextResponse } from 'next/server'
 import { readFile, rm } from 'fs/promises'
-import { safeJsonParse, serializeBotResponse, getCurrentUserId } from '@/lib/api-helpers'
+import { safeJsonParse, serializeBotResponse, getCurrentUserId, isBotOwner } from '@/lib/api-helpers'
 import { resolveFromProjectRoot } from '@/lib/project-root'
 import { validateBotId, validateBotUpdate, validateBotPatch, sanitizeBotName, sanitizeBotDescription, sanitizeEmoji, sanitizeCustomIcon, VALID_BOT_STATUSES, VALID_BOT_HEALTHS } from '@/lib/validation'
 import type { BotStatus, BotHealth } from '@/types/bot'
@@ -18,17 +18,13 @@ async function checkOwnership(request: Request, botId: string): Promise<{ author
   // before the ownerId feature was added). Auto-claim is only allowed when
   // ALLOW_BOT_AUTO_CLAIM is explicitly set to 'true' (single-user dev mode).
   // For multi-tenant deployments, orphaned bots require admin assignment.
-  if (bot.ownerId === null) {
+  if (bot.ownerId === null || bot.ownerId === 'migrate-pending') {
     if (process.env.ALLOW_BOT_AUTO_CLAIM === 'true') {
-      // SECURITY FIX (SEC-21): Use ownerId: null to match unclaimed bots.
-      // This is the Prisma-idiomatic way to match NULL values and is
-      // guaranteed to work correctly, unlike NOT: { ownerId: { not: '' } }
-      // which relies on double-negation logic that may behave unexpectedly.
-      // Type assertion needed because Prisma schema defines ownerId as String
-      // (non-nullable), but the database has NULL values from before the field
-      // was added (migration scenario).
+      const whereClause = bot.ownerId === 'migrate-pending'
+        ? { id: botId, ownerId: 'migrate-pending' }
+        : { id: botId, ownerId: null as unknown as string }
       const result = await db.bot.updateMany({
-        where: { id: botId, ownerId: null as unknown as string },
+        where: whereClause,
         data: { ownerId: userId },
       })
       if (result.count === 0) {
@@ -39,7 +35,7 @@ async function checkOwnership(request: Request, botId: string): Promise<{ author
     console.warn(`[Security] Bot ${botId} has no ownerId — access denied. Set ALLOW_BOT_AUTO_CLAIM=true or assign ownerId manually.`)
     return { authorized: false, userId }
   }
-  return { authorized: bot.ownerId === userId, userId }
+  return { authorized: isBotOwner(bot.ownerId, userId), userId }
 }
 
 /** P1 FIX: Read the runner secret for authenticating with bot-runner cleanup endpoint */

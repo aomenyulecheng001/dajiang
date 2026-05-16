@@ -1,7 +1,7 @@
 import { db } from '@/lib/db'
 import { NextResponse } from 'next/server'
 import { validateBotId } from '@/lib/validation'
-import { getCurrentUserId } from '@/lib/api-helpers'
+import { getCurrentUserId, isBotOwner } from '@/lib/api-helpers'
 
 /**
  * GET /api/bots/[id]/logs/stream
@@ -119,7 +119,7 @@ export async function GET(
     }), { status: 429, headers: { 'Content-Type': 'application/json', 'Retry-After': '30' } })
   }
   activeSSEConnectionsByUser.set(userId, userConns + 1)
-  if (!ownershipBot || ownershipBot.ownerId !== userId) {
+  if (!ownershipBot || !isBotOwner(ownershipBot.ownerId, userId)) {
     activeSSEConnections--
     const uc = activeSSEConnectionsByUser.get(userId) || 1
     activeSSEConnectionsByUser.set(userId, Math.max(0, uc - 1))

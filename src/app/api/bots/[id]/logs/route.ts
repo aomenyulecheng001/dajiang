@@ -1,7 +1,7 @@
 import { db } from '@/lib/db'
 import { NextResponse } from 'next/server'
 import { validateBotId } from '@/lib/validation'
-import { getCurrentUserId } from '@/lib/api-helpers'
+import { getCurrentUserId, isBotOwner } from '@/lib/api-helpers'
 
 const MAX_MESSAGE_LENGTH = 10000
 const MAX_SOURCE_LENGTH = 200
@@ -32,7 +32,7 @@ export async function POST(
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
     const ownershipBot = await db.bot.findUnique({ where: { id }, select: { ownerId: true } })
-    if (!ownershipBot || ownershipBot.ownerId !== userId) {
+    if (!ownershipBot || !isBotOwner(ownershipBot.ownerId, userId)) {
       return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
 
@@ -125,7 +125,7 @@ export async function GET(
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
     const ownershipBot = await db.bot.findUnique({ where: { id }, select: { ownerId: true } })
-    if (!ownershipBot || ownershipBot.ownerId !== userId) {
+    if (!ownershipBot || !isBotOwner(ownershipBot.ownerId, userId)) {
       return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
 
