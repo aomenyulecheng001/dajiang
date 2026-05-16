@@ -23,13 +23,14 @@ export function getSecureClientIp(request: NextRequest): string {
 }
 
 export function isSecureRequest(request: NextRequest): boolean {
-  if (request.nextUrl.protocol === 'http:') return false
-  if (request.nextUrl.protocol === 'https:') return true
   if (process.env.PROTOCOL === 'https') return true
   if (process.env.TRUST_FORWARDED_HEADERS === 'true') {
     const forwarded = request.headers.get('x-forwarded-proto')
     if (forwarded === 'https') return true
+    if (forwarded === 'http') return false
   }
+  if (request.nextUrl.protocol === 'https:') return true
+  if (request.nextUrl.protocol === 'http:') return false
   return false
 }
 
