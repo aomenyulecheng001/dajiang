@@ -2,6 +2,8 @@ import { spawn } from 'child_process'
 import { NextRequest, NextResponse } from 'next/server'
 import { readdir, stat, readFile, rm, mkdir } from 'fs/promises'
 import { join } from 'path'
+import { lookup } from 'dns/promises'
+import { getCurrentUserId } from '@/lib/api-helpers'
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
@@ -33,53 +35,45 @@ const MAX_GIT_OUTPUT_SIZE = 1 * 1024 * 1024  // 1MB
 
 function isValidGitUrl(url: string): boolean {
   // HTTPS URLs: https://github.com/user/repo, https://gitlab.com/user/repo
-  const httpsPattern = /^https:\/\/[a-zA-Z0-9][-a-zA-Z0-9]*(\.[a-zA-Z0-9][-a-zA-Z0-9]*)+\/[^\s]+\.git\/?$/
+  const httpsPattern = /^https:\/\/(github\.com|gitlab\.com|bitbucket\.org)\/[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+\.git\/?$/
   // HTTPS URLs without .git: https://github.com/user/repo
   const httpsShortPattern = /^https:\/\/(github\.com|gitlab\.com|bitbucket\.org)\/[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+\/?$/
   // SSH URLs: git@github.com:user/repo.git
-  const sshPattern = /^git@[a-zA-Z0-9][-a-zA-Z0-9]*(\.[a-zA-Z0-9][-a-zA-Z0-9]*)+:[^\s]+\.git$/
+  const sshPattern = /^git@(github\.com|gitlab\.com|bitbucket\.org):[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+\.git$/
 
   // SSRF FIX (Enhanced): Block private/internal IP ranges and cloud metadata endpoints.
-  // Prevents Server-Side Request Forgery by rejecting URLs that point to
-  // internal network resources.
-  //
-  // Attack vectors mitigated:
-  // - IPv4 private ranges: 10.x, 172.16-31.x, 192.168.x
-  // - Loopback: 127.x.x.x, localhost
-  // - Link-local: 169.254.x.x (AWS metadata)
-  // - IPv6 loopback: [::1], [::ffff:127.0.0.1]
-  // - Octal notation: 0177.0.0.1 (= 127.0.0.1)
-  // - Hexadecimal notation: 0x7f.0.0.1 (= 127.0.0.1)
-  // - Numeric-only hostnames (DNS rebinding risk)
   try {
+    let hostname = ''
+
     const httpsMatch = url.match(/^https:\/\/([^\/]+)/)
     if (httpsMatch) {
-      const hostname = httpsMatch[1].toLowerCase().replace(/^\[(.*)\]$/, '$1') // Strip IPv6 brackets
+      hostname = httpsMatch[1].toLowerCase().replace(/^\[(.*)\]$/, '$1')
+    }
 
-      // Block known internal hostnames
+    const sshMatch = url.match(/^git@([^:]+):/)
+    if (sshMatch) {
+      hostname = sshMatch[1].toLowerCase()
+    }
+
+    if (hostname) {
       if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname.endsWith('.local') || hostname.endsWith('.internal')) {
         return false
       }
 
-      // Block cloud metadata endpoints
       if (hostname === '169.254.169.254' || hostname === 'metadata.google.internal') {
         return false
       }
 
-      // Check for IPv6 addresses (contains colons, not a port)
       if (hostname.includes(':')) {
-        // IPv6 loopback and link-local
         if (hostname === '::1' || hostname === '::ffff:127.0.0.1' || hostname.startsWith('fe80:') || hostname.startsWith('fc00:') || hostname.startsWith('fd00:')) {
           return false
         }
-        // IPv6 mapped IPv4 ::ffff:x.x.x.x — extract and check the IPv4 part
         const v6MappedMatch = hostname.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/)
         if (v6MappedMatch && isPrivateIPv4(v6MappedMatch[1])) {
           return false
         }
       }
 
-      // Check for IPv4 dotted-decimal
       const ipMatch = hostname.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)/)
       if (ipMatch) {
         if (isPrivateIPv4(hostname)) {
@@ -87,19 +81,14 @@ function isValidGitUrl(url: string): boolean {
         }
       }
 
-      // Block octal-looking IPs (e.g., 0177.0.0.1, 0000.0.0.0)
       if (/^0\d+\./.test(hostname)) {
         return false
       }
 
-      // Block hex-looking IPs (e.g., 0x7f.0.0.1, 0x0.0.0.0)
       if (/^0x[\da-f]+\./i.test(hostname)) {
         return false
       }
 
-      // Block numeric-only hostnames (potential DNS rebinding vectors)
-      // Allow: github.com, gitlab.com, etc. (contains letters)
-      // Block: 127.0.0.1.nip.io, 2130706433 (decimal IP), etc.
       if (/^[\d.]+$/.test(hostname) && !ipMatch) {
         return false
       }
@@ -114,16 +103,49 @@ function isValidGitUrl(url: string): boolean {
 /** Check if an IPv4 address is in a private/reserved range */
 function isPrivateIPv4(ip: string): boolean {
   const parts = ip.split('.').map(Number)
-  if (parts.length !== 4 || parts.some(p => isNaN(p) || p < 0 || p > 255)) return true // Invalid = block
+  if (parts.length !== 4 || parts.some(p => isNaN(p) || p < 0 || p > 255)) return true
   const [a, b] = parts
-  if (a === 10) return true                          // 10.0.0.0/8
-  if (a === 172 && b >= 16 && b <= 31) return true   // 172.16.0.0/12
-  if (a === 192 && b === 168) return true           // 192.168.0.0/16
-  if (a === 169 && b === 254) return true           // 169.254.0.0/16 (link-local)
-  if (a === 127) return true                        // 127.0.0.0/8 (loopback)
-  if (a === 0) return true                          // 0.0.0.0/8
-  if (a >= 224) return true                         // Multicast + reserved
+  if (a === 10) return true
+  if (a === 172 && b >= 16 && b <= 31) return true
+  if (a === 192 && b === 168) return true
+  if (a === 169 && b === 254) return true
+  if (a === 127) return true
+  if (a === 0) return true
+  if (a >= 224) return true
   return false
+}
+
+function isPrivateIP(ip: string): boolean {
+  if (ip === '127.0.0.1' || ip === '::1' || ip === '0.0.0.0') return true
+  if (ip.startsWith('fe80:') || ip.startsWith('fc00:') || ip.startsWith('fd00:')) return true
+  const v6MappedMatch = ip.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/)
+  if (v6MappedMatch && isPrivateIPv4(v6MappedMatch[1])) return true
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(ip) && isPrivateIPv4(ip)) return true
+  return false
+}
+
+async function validateResolvedHostname(hostname: string): Promise<boolean> {
+  try {
+    const result = await lookup(hostname)
+    const ips = Array.isArray(result) ? result : [result]
+    for (const addr of ips) {
+      const ip = typeof addr === 'string' ? addr : addr.address
+      if (isPrivateIP(ip) || ip === '127.0.0.1' || ip === '::1' || ip.startsWith('fe80:') || ip === '0.0.0.0') {
+        return false
+      }
+    }
+    return true
+  } catch {
+    return false
+  }
+}
+
+function extractHostname(url: string): string {
+  const httpsMatch = url.match(/^https:\/\/([^\/]+)/)
+  if (httpsMatch) return httpsMatch[1].toLowerCase().replace(/^\[(.*)\]$/, '$1')
+  const sshMatch = url.match(/^git@([^:]+):/)
+  if (sshMatch) return sshMatch[1].toLowerCase()
+  return ''
 }
 
 /**
@@ -267,6 +289,14 @@ async function getRemoteBranches(url: string, workDir: string): Promise<string[]
 // ─── GET Handler: Fetch available branches ──────────────────────────────────
 
 export async function GET(request: NextRequest) {
+  // SECURITY FIX (SEC-105): Defense-in-depth auth check independent of middleware.
+  // git clone is resource-intensive; if middleware is ever misconfigured, this
+  // prevents unauthenticated users from triggering git operations.
+  const userId = await getCurrentUserId(request as unknown as Request)
+  if (!userId) {
+    return NextResponse.json({ success: false, error: 'Unauthorized' }, { status: 401 })
+  }
+
   const { searchParams } = new URL(request.url)
   const url = searchParams.get('url')
 
@@ -278,6 +308,14 @@ export async function GET(request: NextRequest) {
   }
 
   if (!isValidGitUrl(url)) {
+    return NextResponse.json(
+      { success: false, error: 'Invalid Git repository URL' },
+      { status: 400 },
+    )
+  }
+
+  const hostname = extractHostname(url)
+  if (hostname && !(await validateResolvedHostname(hostname))) {
     return NextResponse.json(
       { success: false, error: 'Invalid Git repository URL' },
       { status: 400 },
@@ -310,6 +348,12 @@ export async function GET(request: NextRequest) {
 // ─── POST Handler: Clone and read repo ──────────────────────────────────────
 
 export async function POST(request: NextRequest) {
+  // SECURITY FIX (SEC-105): Defense-in-depth auth check independent of middleware.
+  const postUserId = await getCurrentUserId(request as unknown as Request)
+  if (!postUserId) {
+    return NextResponse.json({ success: false, error: 'Unauthorized' }, { status: 401 })
+  }
+
   try {
     // P1-FIX: Read body as text first with size limit to prevent memory exhaustion
     const bodyText = await request.text()
@@ -345,12 +389,45 @@ export async function POST(request: NextRequest) {
       )
     }
 
+    const postHostname = extractHostname(url)
+    if (postHostname && !(await validateResolvedHostname(postHostname))) {
+      return NextResponse.json(
+        { success: false, error: 'Invalid Git repository URL' },
+        { status: 400 },
+      )
+    }
+
     // Validate branch
     if (branch && typeof branch !== 'string') {
       return NextResponse.json(
         { success: false, error: 'Branch must be a string' },
         { status: 400 },
       )
+    }
+    // SECURITY FIX (SEC-103): Validate branch name format to prevent unexpected
+    // git behavior. While spawn() prevents shell injection, malicious branch names
+    // could still cause git errors or resource consumption.
+    if (branch) {
+      if (branch.length > 200) {
+        return NextResponse.json(
+          { success: false, error: 'Branch name too long (max 200 characters)' },
+          { status: 400 },
+        )
+      }
+      // Only allow safe characters in branch names
+      if (!/^[a-zA-Z0-9._\-/]+$/.test(branch)) {
+        return NextResponse.json(
+          { success: false, error: 'Branch name contains invalid characters' },
+          { status: 400 },
+        )
+      }
+      // Prevent branch names that look like git options
+      if (branch.startsWith('-')) {
+        return NextResponse.json(
+          { success: false, error: 'Branch name cannot start with a dash' },
+          { status: 400 },
+        )
+      }
     }
 
     // P3-3 FIX: Use crypto.randomUUID() for collision-safe temp directory names

@@ -13,25 +13,37 @@ model Bot {
   description   String
   emoji         String   @default("🤖")
   customIcon    String   @default("")
+  /// Bot status: "inactive" | "active" | "deploying" | "error" (validated at app layer)
   status        String   @default("inactive")
+  /// Bot health: "unknown" | "healthy" | "degraded" | "unhealthy" (validated at app layer)
   health        String   @default("unknown")
+  /// Bot language: "javascript" | "typescript" | "python" (validated at app layer)
   language      String   @default("typescript")
   template      String   @default("custom")
   version       String   @default("1.0.0")
   code          String   @default("")
+  /// JSON-encoded CodeBlock[] — SQLite has no native JSON type
   codeBlocks    String   @default("[]")
+  /// JSON-encoded string[] — SQLite has no native JSON type
   dependencies  String   @default("[]")
+  /// JSON-encoded EnvVar[] — SQLite has no native JSON type
   envVars       String   @default("[]")
+  /// JSON-encoded BotConfig — SQLite has no native JSON type
   config        String   @default("{}")
+  /// JSON-encoded BotStats — SQLite has no native JSON type
   stats         String   @default("{}")
+  /// JSON-encoded ProjectFile[] — SQLite has no native JSON type
   projectFiles  String   @default("[]")
   entryPoint      String   @default("")
   lastRunnerStatus String   @default("")
+  /// ISO-8601 datetime string — SQLite has no native DateTime type
   lastDeployedAt   String   @default("")
-  /// P1 OPT: Extracted from config JSON — avoids JSON.parse on every webhook hit
   webhookSecret  String   @default("")
   createdAt       DateTime @default(now())
   updatedAt     DateTime @updatedAt
+
+  ownerId       String
+  owner         Account  @relation(fields: [ownerId], references: [id], onDelete: Cascade)
 
   logEntries    BotLog[]
   messages      BotMessage[]
@@ -39,6 +51,8 @@ model Bot {
   @@index([status])
   @@index([updatedAt])
   @@index([createdAt])
+  @@index([name])
+  @@index([ownerId])
 }
 
 model BotLog {
@@ -46,6 +60,7 @@ model BotLog {
   botId     String
   bot       Bot      @relation(fields: [botId], references: [id], onDelete: Cascade)
   timestamp DateTime @default(now())
+  /// Log level: "info" | "warn" | "error" | "debug" | "critical" (validated at app layer)
   level     String   @default("info")
   message   String
   source    String   @default("")
@@ -78,4 +93,5 @@ model Account {
   tokenVersion Int      @default(0)
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
+  bots         Bot[]
 }

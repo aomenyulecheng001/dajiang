@@ -1,6 +1,7 @@
 import { db } from '@/lib/db'
 import { NextResponse } from 'next/server'
 import { validateBotId } from '@/lib/validation'
+import { getCurrentUserId } from '@/lib/api-helpers'
 
 const MAX_MESSAGE_LENGTH = 10000
 const MAX_SOURCE_LENGTH = 200
@@ -26,8 +27,12 @@ export async function POST(
       return NextResponse.json({ error: idErrors[0].message }, { status: 400 })
     }
 
-    const bot = await db.bot.findUnique({ where: { id }, select: { id: true } })
-    if (!bot) {
+    const userId = await getCurrentUserId(request)
+    if (!userId) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+    const ownershipBot = await db.bot.findUnique({ where: { id }, select: { ownerId: true } })
+    if (!ownershipBot || ownershipBot.ownerId !== userId) {
       return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
 
@@ -37,7 +42,10 @@ export async function POST(
       if (!text.trim()) {
         return NextResponse.json({ error: 'Request body is empty' }, { status: 400 })
       }
-      if (text.length > 1_000_000) {
+      // BUG FIX (QUALITY-1): Use Buffer.byteLength() instead of text.length.
+      // text.length counts UTF-16 code units, not actual bytes.
+      // Consistent with login/route.ts and bots/route.ts.
+      if (Buffer.byteLength(text, 'utf-8') > 1_000_000) {
         return NextResponse.json({ error: 'Request body too large' }, { status: 413 })
       }
       body = JSON.parse(text)
@@ -112,14 +120,19 @@ export async function GET(
       return NextResponse.json({ error: idErrors[0].message }, { status: 400 })
     }
 
-    const bot = await db.bot.findUnique({ where: { id }, select: { id: true } })
-    if (!bot) {
+    const userId = await getCurrentUserId(request)
+    if (!userId) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+    const ownershipBot = await db.bot.findUnique({ where: { id }, select: { ownerId: true } })
+    if (!ownershipBot || ownershipBot.ownerId !== userId) {
       return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
 
     const { searchParams } = new URL(request.url)
     const limit = Math.min(1000, Math.max(1, parseInt(searchParams.get('limit') || '200', 10) || 200))
     const levelFilter = searchParams.get('level')
+    const includeTotal = searchParams.get('includeTotal') === 'true'
     // PERF FIX: Support `since` parameter for incremental log fetching.
     // When provided, only returns logs with timestamp > since (ISO 8601 string).
     // This enables the frontend to poll for new logs without re-fetching the entire set.
@@ -142,25 +155,31 @@ export async function GET(
       }
     }
 
-    const [total, logs] = await Promise.all([
-      db.botLog.count({ where }),
-      db.botLog.findMany({
-        where,
-        orderBy: { timestamp: 'desc' },
-        take: limit,
-      }),
-    ])
+    const logs = await db.botLog.findMany({
+      where,
+      orderBy: { timestamp: 'desc' },
+      take: limit,
+    })
+
+    const formattedLogs = logs.map(l => ({
+      id: l.id,
+      botId: l.botId,
+      level: l.level,
+      message: l.message,
+      source: l.source,
+      timestamp: l.timestamp.toISOString(),
+    }))
+
+    if (includeTotal) {
+      const total = await db.botLog.count({ where })
+      return NextResponse.json({
+        logs: formattedLogs,
+        total,
+      })
+    }
 
     return NextResponse.json({
-      logs: logs.map(l => ({
-        id: l.id,
-        botId: l.botId,
-        level: l.level,
-        message: l.message,
-        source: l.source,
-        timestamp: l.timestamp.toISOString(),
-      })),
-      total,
+      logs: formattedLogs,
     })
   } catch (error) {
     console.error(`GET /api/bots/${id}/logs error:`, error)

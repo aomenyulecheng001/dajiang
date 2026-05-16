@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import { useTheme } from 'next-themes'
 import dynamic from 'next/dynamic'
 import { toast } from 'sonner'
@@ -415,7 +415,7 @@ function CodeDisplay({
         </div>
       ) : (
         <div className="flex items-center justify-center min-h-[300px] bg-muted/20 text-muted-foreground">
-          {t('codeTab.loadingHighlighter', 'Loading syntax highlighter...')}
+          {t('codeTab.loadingHighlighter')}
         </div>
       )}
     </div>
@@ -642,7 +642,7 @@ function ProjectFilesSection({ files, entryPoint, botId, isBotRunning }: { files
 
 // ─── CodeBlockItem ──────────────────────────────────────────────────────────
 
-function CodeBlockItem({ botId, block, isBotRunning }: { botId: string; block: CodeBlock; isBotRunning: boolean }) {
+const CodeBlockItem = React.memo(function CodeBlockItem({ botId, block, isBotRunning }: { botId: string; block: CodeBlock; isBotRunning: boolean }) {
   const [expanded, setExpanded] = useState(false)
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false)
   const toggleCodeBlock = useBotStore((s) => s.toggleCodeBlock)
@@ -740,7 +740,7 @@ function CodeBlockItem({ botId, block, isBotRunning }: { botId: string; block: C
       />
     </>
   )
-}
+})
 
 // ─── AddBlockDialog ─────────────────────────────────────────────────────────
 

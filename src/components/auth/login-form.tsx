@@ -97,7 +97,7 @@ export function LoginForm() {
             Bot Factory
           </h1>
           <p className="mt-2 text-sm text-muted-foreground">
-            Telegram Bot Management Platform
+            {t('auth.subtitle')}
           </p>
         </motion.div>
 

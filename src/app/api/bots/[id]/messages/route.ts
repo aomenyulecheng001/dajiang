@@ -1,6 +1,7 @@
 import { db } from '@/lib/db'
 import { NextResponse } from 'next/server'
 import { validateBotId } from '@/lib/validation'
+import { getCurrentUserId } from '@/lib/api-helpers'
 
 const MAX_TEXT_LENGTH = 5000
 const MAX_USER_ID_LENGTH = 200
@@ -28,12 +29,16 @@ export async function POST(
       return NextResponse.json({ error: idErrors[0].message }, { status: 400 })
     }
 
-    const bot = await db.bot.findUnique({ where: { id }, select: { id: true } })
-    if (!bot) {
+    const userId = await getCurrentUserId(request)
+    if (!userId) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+    const ownershipBot = await db.bot.findUnique({ where: { id }, select: { ownerId: true } })
+    if (!ownershipBot || ownershipBot.ownerId !== userId) {
       return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
 
-    let body: { userId?: unknown; userName?: unknown; text?: unknown; command?: unknown }
+    let body: { userId?: unknown; userName?: unknown; text?: unknown; command?: unknown; messages?: unknown }
     try {
       const text = await request.text()
       if (!text.trim()) {
@@ -51,23 +56,40 @@ export async function POST(
       return NextResponse.json({ error: 'Request body must be a JSON object' }, { status: 400 })
     }
 
-    // Validate required fields
+    if (Array.isArray(body.messages)) {
+      const msgs = body.messages as Array<Record<string, unknown>>
+      if (msgs.length === 0) {
+        return NextResponse.json({ created: 0 }, { status: 201 })
+      }
+      if (msgs.length > 100) {
+        return NextResponse.json({ error: 'Batch size exceeds 100 messages' }, { status: 400 })
+      }
+
+      const data = msgs.map(m => ({
+        botId: id,
+        userId: typeof m.userId === 'string' ? m.userId.slice(0, MAX_USER_ID_LENGTH) : '',
+        userName: typeof m.userName === 'string' ? m.userName.slice(0, MAX_USER_NAME_LENGTH) : '',
+        text: typeof m.text === 'string' ? m.text.slice(0, MAX_TEXT_LENGTH) : '',
+        command: typeof m.command === 'string' && m.command.trim() ? m.command.slice(0, MAX_COMMAND_LENGTH) : null,
+      }))
+
+      const result = await db.botMessage.createMany({ data })
+      return NextResponse.json({ created: result.count }, { status: 201 })
+    }
+
     if (!body.userId || typeof body.userId !== 'string') {
       return NextResponse.json({ error: 'userId is required and must be a string' }, { status: 400 })
     }
 
-    const userId = (body.userId as string).slice(0, MAX_USER_ID_LENGTH)
+    const msgUserId = (body.userId as string).slice(0, MAX_USER_ID_LENGTH)
     const userName = typeof body.userName === 'string' ? (body.userName as string).slice(0, MAX_USER_NAME_LENGTH) : ''
     const messageText = typeof body.text === 'string' ? (body.text as string).slice(0, MAX_TEXT_LENGTH) : ''
     const command = typeof body.command === 'string' && body.command.trim() ? (body.command as string).slice(0, MAX_COMMAND_LENGTH) : null
 
-    // NOTE: Old message cleanup is handled by a scheduled task, not on every write.
-    // This avoids unnecessary DB load on high-frequency message endpoints.
-
     const message = await db.botMessage.create({
       data: {
         botId: id,
-        userId,
+        userId: msgUserId,
         userName,
         text: messageText,
         command,
@@ -108,8 +130,12 @@ export async function GET(
       return NextResponse.json({ error: idErrors[0].message }, { status: 400 })
     }
 
-    const bot = await db.bot.findUnique({ where: { id }, select: { id: true } })
-    if (!bot) {
+    const userId = await getCurrentUserId(request)
+    if (!userId) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+    const ownershipBot = await db.bot.findUnique({ where: { id }, select: { ownerId: true } })
+    if (!ownershipBot || ownershipBot.ownerId !== userId) {
       return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
 

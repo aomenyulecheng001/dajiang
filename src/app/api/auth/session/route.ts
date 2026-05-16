@@ -1,8 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { validateSessionAsync } from '@/lib/session'
 import { db } from '@/lib/db'
-
-const COOKIE_NAME = 'session_token'
+import { extractToken } from '@/lib/api-helpers'
 
 export async function GET(request: NextRequest) {
   try {
@@ -34,7 +33,6 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({
       valid: true,
       username: account.username,
-      userId: account.id,
     })
   } catch {
     return NextResponse.json(
@@ -42,12 +40,4 @@ export async function GET(request: NextRequest) {
       { status: 500 }
     )
   }
-}
-
-function extractToken(request: NextRequest): string | null {
-  const cookieToken = request.cookies.get(COOKIE_NAME)?.value
-  if (cookieToken) return cookieToken
-  const authHeader = request.headers.get('Authorization')
-  if (authHeader?.startsWith('Bearer ')) return authHeader.slice(7)
-  return null
 }

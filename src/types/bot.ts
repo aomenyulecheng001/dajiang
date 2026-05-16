@@ -72,6 +72,7 @@ export interface ProjectFile {
 
 export interface Bot {
   id: string
+  ownerId?: string
   name: string
   description: string
   emoji: string

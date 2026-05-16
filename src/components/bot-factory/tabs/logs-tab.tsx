@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { ChevronDown, ChevronRight, Activity, Search, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
@@ -34,30 +34,6 @@ const levelBorderColors: Record<string, string> = {
 // ─── Simulation Data ──────────────────────────────────────────────────────
 
 type SimLevel = 'debug' | 'info' | 'warn' | 'error'
-
-const zhMessages = [
-  '消息处理完成',
-  '用户 #4521 发起会话',
-  'API 请求成功',
-  '缓存已刷新',
-  '数据库查询耗时 45ms',
-  'Webhook 推送成功',
-  '新订阅用户加入',
-  '命令 /help 被调用',
-  '定时任务执行完成',
-]
-
-const enMessages = [
-  'Message processed',
-  'User #3842 started session',
-  'API request succeeded',
-  'Cache refreshed',
-  'DB query took 32ms',
-  'Webhook push successful',
-  'New subscriber added',
-  'Command /help invoked',
-  'Scheduled task completed',
-]
 
 const sourceFiles = ['handler.ts', 'middleware.ts', 'api.ts', 'cache.ts', 'scheduler.ts', 'bot.ts']
 
@@ -99,7 +75,7 @@ function formatTimestamp(ts: string, locale: string): string {
 
 // ─── Log Item Component ───────────────────────────────────────────────────
 
-function LogItem({ entry, locale }: { entry: LogEntry; locale: string }) {
+const LogItem = React.memo(function LogItem({ entry, locale }: { entry: LogEntry; locale: string }) {
   const [expanded, setExpanded] = useState(false)
 
   return (
@@ -156,7 +132,7 @@ function LogItem({ entry, locale }: { entry: LogEntry; locale: string }) {
       </div>
     </div>
   )
-}
+})
 
 // ─── Filter Config ────────────────────────────────────────────────────────
 
@@ -213,14 +189,9 @@ export function LogsTab({ isVisible = true }: LogsTabProps) {
   useEffect(() => {
     if (!bot?.id || !isVisible) return
 
-    // Always fetch initial logs (to show historical logs)
-    fetchBotLogs(bot.id)
-
-    // Only keep polling when bot is running
     if (!isBotRunning) return
 
     const timer = setInterval(() => {
-      // Re-check running status inside interval — if bot stopped, clear polling
       if (!isBotRunningRef.current) {
         clearInterval(timer)
         return
@@ -233,13 +204,11 @@ export function LogsTab({ isVisible = true }: LogsTabProps) {
     }
   }, [bot?.id, isVisible, fetchBotLogs, isBotRunning])
 
-  // ─── Simulation Logic ─────────────────────────────────────────────────
-
   const generateLog = useCallback(() => {
     if (!bot) return
 
     const level = pickRandomLevel()
-    const messages = locale === 'zh' ? zhMessages : enMessages
+    const messages = Array.from({ length: 9 }, (_, i) => t(`logsTab.simMsg.${i}` as any))
     const message = pickRandom(messages)
     const source = pickRandom(sourceFiles)
 
@@ -250,11 +219,10 @@ export function LogsTab({ isVisible = true }: LogsTabProps) {
       source,
     })
     setSimCount((c) => c + 1)
-  }, [bot, locale])
+  }, [bot, t])
 
   useEffect(() => {
-    // Only run simulation when: enabled, bot is active, tab is visible
-    if (!simEnabled || !bot || bot.status !== 'active' || !isVisible) {
+    if (!simEnabled || !bot || !isBotRunning || !isVisible) {
       if (timerRef.current) {
         clearTimeout(timerRef.current)
         timerRef.current = null
@@ -277,7 +245,7 @@ export function LogsTab({ isVisible = true }: LogsTabProps) {
         timerRef.current = null
       }
     }
-  }, [simEnabled, bot?.id, bot?.status, isVisible, generateLog])  
+  }, [simEnabled, bot?.id, isBotRunning, isVisible, generateLog])  
 
   const handleToggleSim = (checked: boolean) => {
     setSimEnabled(checked)
@@ -293,7 +261,7 @@ export function LogsTab({ isVisible = true }: LogsTabProps) {
 
   if (!bot) return null
 
-  const isSimulationActive = simEnabled && bot.status === 'active' && isVisible
+  const isSimulationActive = simEnabled && isBotRunning && isVisible
 
   // PERF FIX: Memoize all derived log computations to avoid redundant work
   // on every render (e.g., when parent state changes but logs didn't).
@@ -318,8 +286,8 @@ export function LogsTab({ isVisible = true }: LogsTabProps) {
 
   const sortedLogs = useMemo(() => {
     if (searchedLogs.length <= 1) return searchedLogs
-    return [...searchedLogs].sort(
-      (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
+    return [...searchedLogs].sort((a, b) =>
+      new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
     )
   }, [searchedLogs])
 
@@ -424,6 +392,12 @@ export function LogsTab({ isVisible = true }: LogsTabProps) {
 
       {/* Log Entries */}
       <div className="rounded-lg border overflow-hidden border-border/20">
+        {!isBotRunning && logs.length > 0 && (
+          <div className="flex items-center gap-2 px-3 py-2 bg-muted/50 border border-border/50 rounded-md text-sm text-muted-foreground m-3">
+            <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+            {t('logsTab.pollingPaused')}
+          </div>
+        )}
         <ScrollArea className="h-[480px]">
           <div className="p-4 space-y-1.5">
             {sortedLogs.length === 0 ? (

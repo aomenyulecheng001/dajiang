@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, useEffect, useRef, useMemo } from 'react'
+import dynamic from 'next/dynamic'
 import { useAuthStore, verifySession } from '@/store/auth-store'
 import { useBotStore, resetHydration } from '@/store/bot-store'
 import { Header } from '@/components/bot-factory/header'
@@ -14,9 +15,9 @@ import { CommandPalette } from '@/components/bot-factory/command-palette'
 import { EmptyState } from '@/components/bot-factory/empty-state'
 import { BotListSkeleton } from '@/components/bot-factory/bot-list-skeleton'
 import { LoginForm } from '@/components/auth/login-form'
-import { useBotRunner } from '@/lib/bot-runner-context'
+import { useBotRunnerConnection } from '@/lib/bot-runner-context'
 
-import { motion, AnimatePresence } from 'framer-motion'
+const { motion, AnimatePresence } = await import('framer-motion')
 import { Bot, Plus, ArrowUpDown, ChevronLeftIcon, ChevronRightIcon } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
@@ -41,11 +42,23 @@ import { PAGINATION } from '@/lib/bot-constants'
 
 export default function Home() {
   const { isAuthenticated, isLoading: isAuthLoading, setAuth, setLoading } = useAuthStore()
-  const { viewMode, selectedBotId, bots, sortBy, sortOrder, setSortBy, setSortOrder, searchQuery, statusFilter, currentPage, pageSize, setCurrentPage, resetPagination } = useBotStore()
+  const viewMode = useBotStore(s => s.viewMode)
+  const selectedBotId = useBotStore(s => s.selectedBotId)
+  const bots = useBotStore(s => s.bots)
+  const sortBy = useBotStore(s => s.sortBy)
+  const sortOrder = useBotStore(s => s.sortOrder)
+  const setSortBy = useBotStore(s => s.setSortBy)
+  const setSortOrder = useBotStore(s => s.setSortOrder)
+  const searchQuery = useBotStore(s => s.searchQuery)
+  const statusFilter = useBotStore(s => s.statusFilter)
+  const currentPage = useBotStore(s => s.currentPage)
+  const pageSize = useBotStore(s => s.pageSize)
+  const setCurrentPage = useBotStore(s => s.setCurrentPage)
+  const resetPagination = useBotStore(s => s.resetPagination)
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
   const searchInputRef = useRef<HTMLInputElement>(null)
   const t = useT()
-  const { connected: runnerConnected, reconnecting: runnerReconnecting } = useBotRunner()
+  const { connected: runnerConnected, reconnecting: runnerReconnecting } = useBotRunnerConnection()
   // PERF FIX: Memoize filtered bots list to avoid recomputation when unrelated
   // state changes (e.g., viewMode, selectedBotId) trigger a re-render.
   // Uses useBotStore.getState() instead of the destructured filteredBots getter
@@ -56,16 +69,10 @@ export default function Home() {
   const filteredBotsList = useMemo(() => useBotStore.getState().filteredBots(), [bots, searchQuery, statusFilter, sortBy, sortOrder])
   const hasBots = bots.length > 0
   
-  // CLIENT-SIDE PAGINATION: Slice filteredBotsList based on currentPage and pageSize
   const paginatedBots = useMemo(() => {
     const start = (currentPage - 1) * pageSize
     return filteredBotsList.slice(start, start + pageSize)
   }, [filteredBotsList, currentPage, pageSize])
-  
-  // Reset to page 1 when search/filter/sort changes
-  useEffect(() => {
-    setCurrentPage(1)
-  }, [searchQuery, statusFilter, sortBy, sortOrder])
 
   // FIX: Show skeleton only while hydration is still in progress.
   // Previously checked `bots.length === 0` which meant the skeleton showed
@@ -115,6 +122,13 @@ export default function Home() {
       store.hydrateFromDB()
     }
   }, [isAuthenticated])
+
+  useEffect(() => {
+    const totalPages = Math.ceil(filteredBotsList.length / pageSize)
+    if (totalPages > 0 && currentPage > totalPages) {
+      setCurrentPage(totalPages)
+    }
+  }, [filteredBotsList.length, pageSize, currentPage, setCurrentPage])
 
   // Show auth loading screen
   if (isAuthLoading) {
@@ -285,11 +299,11 @@ export default function Home() {
                         {/* Left: Page Info */}
                         <div className="text-xs text-muted-foreground">
                           <span className="font-medium">
-                            第 {currentPage} 页
+                            {t('pagination.page')} {currentPage}
                           </span>
                           <span className="mx-1 text-muted-foreground/40">·</span>
                           <span>
-                            共 {filteredBotsList.length} 个
+                            {filteredBotsList.length} {t('pagination.items')}
                           </span>
                         </div>
 
@@ -320,7 +334,7 @@ export default function Home() {
                           )}
 
                           {/* Pagination */}
-                          <div className="flex items-center gap-0.5">
+                          <nav aria-label={t('pagination.navigation')} role="navigation" className="flex items-center gap-0.5">
                             <button
                               onClick={() => currentPage > 1 && setCurrentPage(currentPage - 1)}
                               disabled={currentPage <= 1}
@@ -368,6 +382,7 @@ export default function Home() {
                                         ? 'bg-primary text-primary-foreground' 
                                         : 'text-muted-foreground hover:bg-muted'
                                     )}
+                                    aria-current={p === currentPage ? 'page' : undefined}
                                   >
                                     {p}
                                   </button>
@@ -389,7 +404,7 @@ export default function Home() {
                             >
                               <ChevronRightIcon className="size-3.5" />
                             </button>
-                          </div>
+                          </nav>
                         </div>
                       </div>
                     )}

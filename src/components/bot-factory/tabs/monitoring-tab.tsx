@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect } from 'react'
+import React, { useEffect } from 'react'
 import { BarChart3 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { formatNumber } from '@/lib/utils'
@@ -12,7 +12,7 @@ import { HourlyChart as SharedHourlyChart } from '@/components/bot-factory/chart
 
 // ─── Hourly Activity Chart (wraps shared component) ──────────────────────────
 
-function HourlyChart({
+const HourlyChart = React.memo(function HourlyChart({
   data,
   t,
 }: {
@@ -40,7 +40,7 @@ function HourlyChart({
       </CardContent>
     </Card>
   )
-}
+})
 
 // ─── Daily Messages Trend ───────────────────────────────────────────────────
 
@@ -64,7 +64,7 @@ function fillMissingDays(data: { date: string; count: number }[]): { date: strin
   return result
 }
 
-function DailyTrend({
+const DailyTrend = React.memo(function DailyTrend({
   data,
   locale,
   t,
@@ -107,6 +107,8 @@ function DailyTrend({
                   <div
                     className="w-full rounded-t-md bg-teal-500/80 hover:bg-teal-500 transition-colors min-h-[4px]"
                     style={{ height: `${heightPct}%` }}
+                    role="img"
+                    aria-label={`${day.date}: ${formatNumber(day.count)} messages`}
                   />
                 </div>
                 <span className="text-[11px] text-muted-foreground leading-none truncate w-full text-center">
@@ -124,11 +126,11 @@ function DailyTrend({
       </CardContent>
     </Card>
   )
-}
+})
 
 // ─── Top Commands ───────────────────────────────────────────────────────────
 
-function TopCommands({
+const TopCommands = React.memo(function TopCommands({
   commands,
   t,
 }: {
@@ -167,11 +169,11 @@ function TopCommands({
       </CardContent>
     </Card>
   )
-}
+})
 
 // ─── Monitoring Tab (Main Export) ───────────────────────────────────────────
 
-export function MonitoringTab() {
+export function MonitoringTab({ isVisible = true }: { isVisible?: boolean }) {
   const selectedBotId = useBotStore((s) => s.selectedBotId)
   const bot = useBotStore((s) => s.bots.find((b) => b.id === selectedBotId))
   const fetchBotStats = useBotStore((s) => s.fetchBotStats)
@@ -180,12 +182,16 @@ export function MonitoringTab() {
 
   // Refresh stats when this tab is mounted, with periodic refresh while visible
   useEffect(() => {
+    if (!isVisible) return
     if (bot?.id) {
       fetchBotStats(bot.id)
-      const interval = setInterval(() => fetchBotStats(bot.id), 30000) // 30s refresh
+      const interval = setInterval(() => {
+        const currentBotId = useBotStore.getState().selectedBotId
+        if (currentBotId) fetchBotStats(currentBotId)
+      }, 30000)
       return () => clearInterval(interval)
     }
-  }, [bot?.id, fetchBotStats])
+  }, [bot?.id, fetchBotStats, isVisible])
 
   if (!bot) return null
 

@@ -29,7 +29,6 @@ export function AccountSettingsDialog({ open, onOpenChange }: AccountSettingsDia
   // Previously, destructuring the entire store caused re-renders whenever
   // isAuthenticated or isLoading changed — fields this component doesn't use.
   const username = useAuthStore((s) => s.username)
-  const token = useAuthStore((s) => s.token)
   const updateUsername = useAuthStore((s) => s.updateUsername)
   const t = useT()
 
@@ -85,12 +84,6 @@ export function AccountSettingsDialog({ open, onOpenChange }: AccountSettingsDia
       if (res.ok && data.success) {
         toast.success(t('auth.usernameChanged'))
         updateUsername(data.username)
-        // H2 FIX: Update the stored token with the new one returned by the server.
-        // The old token was revoked; without updating, subsequent API calls would fail.
-        if (data.newToken) {
-          const { setAuth } = useAuthStore.getState()
-          setAuth(true, data.username, data.newToken)
-        }
         setNewUsername('')
         onOpenChange(false)
       } else {

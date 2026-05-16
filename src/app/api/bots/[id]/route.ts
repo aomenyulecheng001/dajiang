@@ -2,12 +2,45 @@ import { db } from '@/lib/db'
 import { eventBus } from '@/lib/event-bus'
 import { NextResponse } from 'next/server'
 import { readFile, rm } from 'fs/promises'
-import { safeJsonParse, serializeBotResponse } from '@/lib/api-helpers'
+import { safeJsonParse, serializeBotResponse, getCurrentUserId } from '@/lib/api-helpers'
 import { resolveFromProjectRoot } from '@/lib/project-root'
 import { validateBotId, validateBotUpdate, validateBotPatch, sanitizeBotName, sanitizeBotDescription, sanitizeEmoji, sanitizeCustomIcon, VALID_BOT_STATUSES, VALID_BOT_HEALTHS } from '@/lib/validation'
 import type { BotStatus, BotHealth } from '@/types/bot'
 import { decryptEnvVarsMaskedAsync, decryptEnvVarsAsync, encryptEnvVarsOnSaveAsync, ENCRYPTED_PLACEHOLDER } from '@/lib/crypto'
 import { BOT_RUNNER_URL } from '@/lib/bot-runner-url'
+
+async function checkOwnership(request: Request, botId: string): Promise<{ authorized: boolean; userId: string | null }> {
+  const userId = await getCurrentUserId(request)
+  if (!userId) return { authorized: false, userId: null }
+  const bot = await db.bot.findUnique({ where: { id: botId }, select: { ownerId: true } })
+  if (!bot) return { authorized: false, userId }
+  // SECURITY FIX: Handle migration scenario where ownerId is null (bots created
+  // before the ownerId feature was added). Auto-claim is only allowed when
+  // ALLOW_BOT_AUTO_CLAIM is explicitly set to 'true' (single-user dev mode).
+  // For multi-tenant deployments, orphaned bots require admin assignment.
+  if (bot.ownerId === null) {
+    if (process.env.ALLOW_BOT_AUTO_CLAIM === 'true') {
+      // SECURITY FIX (SEC-21): Use ownerId: null to match unclaimed bots.
+      // This is the Prisma-idiomatic way to match NULL values and is
+      // guaranteed to work correctly, unlike NOT: { ownerId: { not: '' } }
+      // which relies on double-negation logic that may behave unexpectedly.
+      // Type assertion needed because Prisma schema defines ownerId as String
+      // (non-nullable), but the database has NULL values from before the field
+      // was added (migration scenario).
+      const result = await db.bot.updateMany({
+        where: { id: botId, ownerId: null as unknown as string },
+        data: { ownerId: userId },
+      })
+      if (result.count === 0) {
+        return { authorized: false, userId }
+      }
+      return { authorized: true, userId }
+    }
+    console.warn(`[Security] Bot ${botId} has no ownerId — access denied. Set ALLOW_BOT_AUTO_CLAIM=true or assign ownerId manually.`)
+    return { authorized: false, userId }
+  }
+  return { authorized: bot.ownerId === userId, userId }
+}
 
 /** P1 FIX: Read the runner secret for authenticating with bot-runner cleanup endpoint */
 async function getRunnerSecret(): Promise<string> {
@@ -29,7 +62,7 @@ function isPrismaNotFoundError(error: unknown): boolean {
 }
 
 export async function GET(
-  _request: Request,
+  request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
   let id: string = 'unknown'
@@ -37,10 +70,14 @@ export async function GET(
     const resolved = await params
     id = resolved.id
 
-    // Validate bot ID format
     const idErrors = validateBotId(id)
     if (idErrors.length > 0) {
       return NextResponse.json({ error: idErrors[0].message }, { status: 400 })
+    }
+
+    const { authorized } = await checkOwnership(request, id)
+    if (!authorized) {
+      return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
 
     const bot = await db.bot.findUnique({ where: { id } })
@@ -68,10 +105,14 @@ export async function PUT(
     const resolved = await params
     id = resolved.id
 
-    // Validate bot ID format
     const idErrors = validateBotId(id)
     if (idErrors.length > 0) {
       return NextResponse.json({ error: idErrors[0].message }, { status: 400 })
+    }
+
+    const { authorized } = await checkOwnership(request, id)
+    if (!authorized) {
+      return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
 
     // Parse request body with size limit protection
@@ -199,10 +240,14 @@ export async function PATCH(
     const resolved = await params
     id = resolved.id
 
-    // Validate bot ID format
     const idErrors = validateBotId(id)
     if (idErrors.length > 0) {
       return NextResponse.json({ error: idErrors[0].message }, { status: 400 })
+    }
+
+    const { authorized } = await checkOwnership(request, id)
+    if (!authorized) {
+      return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
 
     // Parse request body with size limit protection (outside transaction to avoid holding it open)
@@ -349,7 +394,7 @@ export async function PATCH(
 }
 
 export async function DELETE(
-  _request: Request,
+  request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
   let id: string = 'unknown'
@@ -357,16 +402,23 @@ export async function DELETE(
     const resolved = await params
     id = resolved.id
 
-    // Validate bot ID format
     const idErrors = validateBotId(id)
     if (idErrors.length > 0) {
       return NextResponse.json({ error: idErrors[0].message }, { status: 400 })
+    }
+
+    const { authorized, userId: deleteUserId } = await checkOwnership(request, id)
+    if (!authorized) {
+      return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
 
     // P0-3 OPT: Removed redundant findUnique before delete.
     // Directly attempt delete — if record doesn't exist, Prisma throws P2025.
     // This saves 1 DB query per DELETE request.
     await db.bot.delete({ where: { id } })
+
+    // SECURITY FIX (SEC-86): Audit log for bot deletion
+    console.info(`[Audit] Bot deleted: id=${id}, owner=${deleteUserId || 'unknown'}`)
 
     // P1 OPT: Emit deleted event so SSE clients disconnect gracefully
     eventBus.emit(`bot:${id}`, 'deleted', { botId: id })
@@ -378,11 +430,20 @@ export async function DELETE(
       const botDir = resolveFromProjectRoot('mini-services', 'bot-runner', 'bots', id)
       const logFile = resolveFromProjectRoot('mini-services', 'bot-runner', 'logs', `${id}.log`)
       const configFile = resolveFromProjectRoot('mini-services', 'bot-runner', 'config', `${id}.json`)
-      await Promise.all([
-        rm(botDir, { recursive: true, force: true }),
-        rm(logFile, { force: true }),
-        rm(configFile, { force: true }),
-      ])
+      // SECURITY FIX (SEC-77): Verify resolved paths stay within expected directories.
+      // Prevents path traversal via botId containing '..' from deleting unintended directories.
+      const expectedBotsDir = resolveFromProjectRoot('mini-services', 'bot-runner', 'bots')
+      const expectedLogsDir = resolveFromProjectRoot('mini-services', 'bot-runner', 'logs')
+      const expectedConfigDir = resolveFromProjectRoot('mini-services', 'bot-runner', 'config')
+      if (!botDir.startsWith(expectedBotsDir) || !logFile.startsWith(expectedLogsDir) || !configFile.startsWith(expectedConfigDir)) {
+        console.error(`[SECURITY] Path traversal detected in bot delete: id=${id}, botDir=${botDir}`)
+      } else {
+        await Promise.all([
+          rm(botDir, { recursive: true, force: true }),
+          rm(logFile, { force: true }),
+          rm(configFile, { force: true }),
+        ])
+      }
     } catch (err) {
       console.warn(`[DELETE] File cleanup warning for bot ${id}:`, err instanceof Error ? err.message : err)
     }

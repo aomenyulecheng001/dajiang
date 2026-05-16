@@ -49,12 +49,25 @@ export function PasswordChangeForm({ onSuccess, submitLabel }: PasswordChangeFor
       setError(t('common.passwordTooShort'))
       return
     }
+    // SECURITY FIX (SEC-86): Client-side validation aligned with server-side requirements
+    if (newPassword.length > 128) {
+      setError(t('common.passwordTooLong'))
+      return
+    }
     if (!/[a-zA-Z]/.test(newPassword)) {
       setError(t('common.passwordNeedsLetter'))
       return
     }
     if (!/[0-9]/.test(newPassword)) {
       setError(t('common.passwordNeedsDigit'))
+      return
+    }
+    if (!/[A-Z]/.test(newPassword)) {
+      setError(t('common.passwordNeedsUppercase'))
+      return
+    }
+    if (!/[^a-zA-Z0-9]/.test(newPassword)) {
+      setError(t('common.passwordNeedsSpecial'))
       return
     }
     if (newPassword !== confirmPassword) {

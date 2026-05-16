@@ -20,6 +20,8 @@ interface Subscription {
 
 class EventBus {
   private handlers = new Map<string, Set<EventHandler>>()
+  private static MAX_SUBSCRIBERS_PER_CHANNEL = 50
+  private static MAX_CHANNELS = 500
 
   /**
    * Emit an event to all subscribers of a channel.
@@ -44,8 +46,16 @@ class EventBus {
   subscribe(channel: string, handler: EventHandler): Subscription {
     let handlers = this.handlers.get(channel)
     if (!handlers) {
+      if (this.handlers.size >= EventBus.MAX_CHANNELS) {
+        console.warn(`[EventBus] Max channels (${EventBus.MAX_CHANNELS}) reached, rejecting subscription to "${channel}"`)
+        return { unsubscribe: () => {} }
+      }
       handlers = new Set()
       this.handlers.set(channel, handlers)
+    }
+    if (handlers.size >= EventBus.MAX_SUBSCRIBERS_PER_CHANNEL) {
+      console.warn(`[EventBus] Max subscribers (${EventBus.MAX_SUBSCRIBERS_PER_CHANNEL}) reached for channel "${channel}"`)
+      return { unsubscribe: () => {} }
     }
     handlers.add(handler)
 

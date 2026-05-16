@@ -22,7 +22,8 @@ import type { Bot } from '@/types/bot'
 
 /** Inner form that re-mounts on every bot change via key={bot.id} */
 function EditBotForm({ bot, onClose }: { bot: Bot; onClose: () => void }) {
-  const { updateBot, updateBotEmoji } = useBotStore()
+  const updateBot = useBotStore(s => s.updateBot)
+  const updateBotEmoji = useBotStore(s => s.updateBotEmoji)
   const t = useT()
 
   // These useState initializers run on mount, so they get the correct bot data
@@ -140,8 +141,13 @@ function EditBotForm({ bot, onClose }: { bot: Bot; onClose: () => void }) {
 }
 
 export function EditBotDialog() {
-  const { editBotId, setEditBotId, bots } = useBotStore()
-  const bot = bots.find((b) => b.id === editBotId)
+  const editBotId = useBotStore(s => s.editBotId)
+  const setEditBotId = useBotStore(s => s.setEditBotId)
+  // PERF FIX: Use targeted selector instead of subscribing to entire s.bots array.
+  // Previously: const bots = useBotStore(s => s.bots) + bots.find() — re-rendered on ANY bot change.
+  // Now: selector returns the specific bot object; Zustand's Object.is comparison skips
+  // re-renders when other bots change (same reference returned by .find() for unchanged bot).
+  const bot = useBotStore(s => editBotId ? s.bots.find((b) => b.id === editBotId) : undefined)
   const isOpen = editBotId !== null
   const t = useT()
 

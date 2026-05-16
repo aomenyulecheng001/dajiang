@@ -2,20 +2,11 @@ import { NextRequest, NextResponse } from 'next/server'
 import { updateUsername } from '@/lib/auth'
 import { validateSessionAsync } from '@/lib/session'
 import { db } from '@/lib/db'
+import { extractToken, isSecureRequest } from '@/lib/api-helpers'
 
-/**
- * POST /api/auth/update-account
- *
- * Update the currently authenticated user's account details.
- * Supports changing the username. Returns a new session token if the
- * username is changed (the old token is revoked).
- */
 export async function POST(request: NextRequest) {
   try {
-    // Validate session
-    const cookieToken = request.cookies.get('session_token')?.value
-    const authHeader = request.headers.get('authorization')
-    const token = cookieToken || (authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null)
+    const token = extractToken(request)
     if (!token) {
       return NextResponse.json(
         { error: 'Authorization required' },
@@ -33,7 +24,11 @@ export async function POST(request: NextRequest) {
 
     // Parse request body
     const text = await request.text()
-    if (text.length > 10_000) {
+    // BUG FIX (QUALITY-1): Use Buffer.byteLength() instead of text.length.
+    // text.length counts UTF-16 code units, not actual bytes.
+    // For multi-byte content (Chinese usernames, etc.), the actual size
+    // could be 2-3x the character count. Consistent with login/route.ts.
+    if (Buffer.byteLength(text, 'utf-8') > 10_000) {
       return NextResponse.json(
         { error: 'Request body too large' },
         { status: 413 }
@@ -88,12 +83,24 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    return NextResponse.json({
+    const response = NextResponse.json({
       success: true,
       message: result.message,
       username: result.username,
-      newToken: result.newToken,
     })
+
+    if (result.newToken) {
+      const isHttps = isSecureRequest(request)
+      response.cookies.set('session_token', result.newToken, {
+        httpOnly: true,
+        secure: isHttps,
+        sameSite: 'lax',
+        path: '/',
+        maxAge: 7 * 24 * 60 * 60,
+      })
+    }
+
+    return response
   } catch (error) {
     console.error('[Auth] Update account error:', error)
     return NextResponse.json(

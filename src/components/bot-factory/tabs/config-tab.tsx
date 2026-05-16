@@ -47,10 +47,11 @@ export function ConfigTab() {
   const showRestartHint = (description?: string) => {
     if (isRunning) {
       toast.success(description || t('configTab.saved'), {
+        id: 'config-changed',
         description: t('configTab.restartRequired') || 'Changes will take effect after restart',
       })
     } else {
-      toast.success(description || t('configTab.saved'))
+      toast.success(description || t('configTab.saved'), { id: 'config-changed' })
     }
   }
 

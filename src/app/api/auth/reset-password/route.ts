@@ -1,19 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { resetPassword } from '@/lib/auth'
 import { validateSessionAsync } from '@/lib/session'
+import { extractToken } from '@/lib/api-helpers'
 
-/**
- * POST /api/auth/reset-password
- *
- * Change password for the currently authenticated user.
- * Requires a valid session token and the current password.
- */
 export async function POST(request: NextRequest) {
   try {
-    // Validate session
-    const cookieToken = request.cookies.get('session_token')?.value
-    const authHeader = request.headers.get('authorization')
-    const token = cookieToken || (authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null)
+    const token = extractToken(request)
     if (!token) {
       return NextResponse.json(
         { error: 'Authorization required' },
@@ -31,7 +23,10 @@ export async function POST(request: NextRequest) {
 
     // Parse request body
     const text = await request.text()
-    if (text.length > 10_000) {
+    // BUG FIX (QUALITY-1): Use Buffer.byteLength() instead of text.length.
+    // text.length counts UTF-16 code units, not actual bytes.
+    // Consistent with login/route.ts.
+    if (Buffer.byteLength(text, 'utf-8') > 10_000) {
       return NextResponse.json(
         { error: 'Request body too large' },
         { status: 413 }
@@ -53,6 +48,16 @@ export async function POST(request: NextRequest) {
     if (!currentPassword || !newPassword) {
       return NextResponse.json(
         { error: 'Current password and new password are required' },
+        { status: 400 }
+      )
+    }
+
+    // SECURITY FIX (SEC-109): Runtime type validation for password fields.
+    // The `as` type assertion doesn't provide runtime safety. Non-string values
+    // could cause unexpected behavior in bcrypt.compare or bypass validation.
+    if (typeof currentPassword !== 'string' || typeof newPassword !== 'string') {
+      return NextResponse.json(
+        { error: 'Invalid input types' },
         { status: 400 }
       )
     }

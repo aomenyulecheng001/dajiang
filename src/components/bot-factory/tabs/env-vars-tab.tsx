@@ -18,10 +18,11 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { useBotStore } from '@/store/bot-store'
+import { useBotStore, authFetch } from '@/store/bot-store'
 import { useT } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
 import { SENSITIVE_KEY_PATTERNS } from '@/lib/bot-constants'
+import { ConfirmDialog } from '@/components/bot-factory/confirm-dialog'
 
 // Client-side heuristic matching the server-side isSensitiveKey in crypto.ts
 // Uses shared SENSITIVE_KEY_PATTERNS from bot-constants.ts (single source of truth)
@@ -51,6 +52,11 @@ export function EnvVarsTab() {
   const [bulkText, setBulkText] = useState('')
   const t = useT()
   const editInputRef = useRef<HTMLInputElement>(null)
+
+  const [confirmOpen, setConfirmOpen] = useState(false)
+  const [pendingRemoveId, setPendingRemoveId] = useState<string | null>(null)
+  const [pendingRemoveKey, setPendingRemoveKey] = useState('')
+  const [pendingRemoveIsSensitive, setPendingRemoveIsSensitive] = useState(false)
 
   // Revealed (decrypted) values fetched from the server-side reveal API
   // Keyed by envVar.id → plaintext value
@@ -124,7 +130,7 @@ export function EnvVarsTab() {
   const fetchRevealedValues = useCallback(async () => {
     if (!bot) return
     try {
-      const res = await fetch(`/api/bots/${bot.id}/env-vars/reveal`, { credentials: 'include' })
+      const res = await authFetch(`/api/bots/${bot.id}/env-vars/reveal`)
       if (!res.ok) throw new Error('Failed to reveal')
       const data = await res.json()
       const vars: Record<string, string> = {}
@@ -134,6 +140,7 @@ export function EnvVarsTab() {
       setRevealedValues(vars)
     } catch {
       toast.error(t('envTab.revealFailed') || 'Failed to reveal values')
+      throw new Error('Reveal failed')
     }
   }, [bot?.id, t])
 
@@ -194,6 +201,8 @@ export function EnvVarsTab() {
         try {
           await fetchRevealedValues()
           setRevealedIds((prev) => new Set(prev).add(id))
+        } catch {
+          setAutoRevealEditId(null)
         } finally {
           setRevealingIds((prev) => {
             const next = new Set(prev)
@@ -252,7 +261,8 @@ export function EnvVarsTab() {
   }
 
   const saveEditing = (envVarId: string) => {
-    if (!editValue.trim()) {
+    const envVar = bot.envVars.find(v => v.id === envVarId)
+    if (editValue === '' && envVar && isSensitiveKey(envVar.key)) {
       toast.error(t('envTab.valueRequired'))
       return
     }
@@ -303,7 +313,7 @@ export function EnvVarsTab() {
       toast.error(t('envTab.nameRequired'))
       return
     }
-    if (!value.trim()) {
+    if (value === '' && isSensitiveKey(key.trim().toUpperCase())) {
       toast.error(t('envTab.valueRequired'))
       return
     }
@@ -333,9 +343,22 @@ export function EnvVarsTab() {
     setDialogOpen(false)
   }
 
-  const handleRemove = (envVarId: string, envKey: string) => {
-    removeEnvVar(bot.id, envVarId)
-    toast.success(t('envTab.removed', { key: envKey }))
+  const handleRemoveClick = (envVarId: string, envKey: string, isSensitive: boolean) => {
+    setPendingRemoveId(envVarId)
+    setPendingRemoveKey(envKey)
+    setPendingRemoveIsSensitive(isSensitive)
+    setConfirmOpen(true)
+  }
+
+  const handleConfirmRemove = () => {
+    if (pendingRemoveId) {
+      removeEnvVar(bot.id, pendingRemoveId)
+      toast.success(t('envTab.removed', { key: pendingRemoveKey }))
+    }
+    setConfirmOpen(false)
+    setPendingRemoveId(null)
+    setPendingRemoveKey('')
+    setPendingRemoveIsSensitive(false)
   }
 
   function parseEnvText(text: string): { key: string; value: string }[] {
@@ -360,8 +383,13 @@ export function EnvVarsTab() {
       toast.error(t('envTab.valueRequired'))
       return
     }
+    const validEntries = parsed.filter(({ value }) => value.trim())
+    if (validEntries.length === 0) {
+      toast.error(t('envTab.valueRequired'))
+      return
+    }
     let imported = 0
-    parsed.forEach(({ key: parsedKey, value: parsedValue }) => {
+    validEntries.forEach(({ key: parsedKey, value: parsedValue }) => {
       const existing = bot.envVars.find((v) => v.key === parsedKey)
       if (existing) {
         updateEnvVar(bot.id, existing.id, { value: parsedValue })
@@ -548,7 +576,7 @@ export function EnvVarsTab() {
                           </div>
                         ) : (
                           <code
-                            className="text-[15px] bg-muted px-2.5 py-1 rounded-md font-mono text-foreground/80 break-all cursor-pointer hover:bg-muted/80 transition-colors"
+                            className="text-[15px] bg-muted px-2.5 py-1 rounded-md font-mono text-foreground/80 break-all cursor-pointer hover:bg-muted/80 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:ring-offset-1"
                             onClick={() => startEditing(envVar.id, getEditValue(envVar))}
                             title={t('envTab.clickToEdit')}
                             role="button"
@@ -592,7 +620,7 @@ export function EnvVarsTab() {
                       variant="ghost"
                       size="icon"
                       className="size-8 text-muted-foreground hover:text-destructive shrink-0 mt-0.5"
-                      onClick={() => handleRemove(envVar.id, envVar.key)}
+                      onClick={() => handleRemoveClick(envVar.id, envVar.key, shouldMask)}
                       aria-label={t('common.removeItem', { name: envVar.key })}
                     >
                       <Trash2 className="size-3.5" />
@@ -715,6 +743,16 @@ export function EnvVarsTab() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <ConfirmDialog
+        open={confirmOpen}
+        onOpenChange={setConfirmOpen}
+        title={t('envTab.removeConfirmTitle')}
+        description={t(pendingRemoveIsSensitive ? 'envTab.removeConfirmDescSensitive' : 'envTab.removeConfirmDesc', { key: pendingRemoveKey })}
+        confirmText={t('common.delete')}
+        variant="destructive"
+        onConfirm={handleConfirmRemove}
+      />
     </div>
   )
 }

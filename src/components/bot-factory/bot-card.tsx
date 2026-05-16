@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useRef } from 'react'
+import React, { useState, useEffect, useRef, useMemo } from 'react'
 import { toast } from 'sonner'
 import { Play, Square, Pencil, Trash2, Loader2, Clock, Package, Code2 } from 'lucide-react'
 import { Card, CardHeader, CardContent } from '@/components/ui/card'
@@ -12,13 +12,14 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import type { Bot } from '@/types/bot'
 import { useBotStore } from '@/store/bot-store'
 import { ConfirmDialog } from './confirm-dialog'
-import { useBotRunner } from '@/lib/bot-runner-context'
+import { useBotRunnerConnection, useBotRunnerActions } from '@/lib/bot-runner-context'
+import { fetchRevealEnvVars, hasMaskedEnvVars, buildEnvVarsFallback, buildDeployConfig } from '@/lib/deploy-utils'
 import { BotAvatar } from './bot-avatar'
 
 /* ============================================
    OPT-7: SEARCH KEYWORD HIGHLIGHTING
    ============================================ */
-function HighlightText({ text, query }: { text: string; query: string }) {
+const HighlightText = React.memo(function HighlightText({ text, query }: { text: string; query: string }) {
   if (!query.trim()) return <>{text}</>
 
   const terms = query.toLowerCase().trim().split(/\s+/).filter(Boolean)
@@ -68,21 +69,25 @@ function HighlightText({ text, query }: { text: string; query: string }) {
   }
 
   return <>{parts}</>
-}
+})
 
 interface BotCardProps {
   bot: Bot
   viewMode: 'grid' | 'list'
 }
 
-export function BotCard({ bot, viewMode }: BotCardProps) {
-  const { setSelectedBotId, deleteBot, setEditBotId, searchQuery } = useBotStore()
+export const BotCard = React.memo(function BotCard({ bot, viewMode }: BotCardProps) {
+  const setSelectedBotId = useBotStore(s => s.setSelectedBotId)
+  const deleteBot = useBotStore(s => s.deleteBot)
+  const setEditBotId = useBotStore(s => s.setEditBotId)
+  const searchQuery = useBotStore(s => s.searchQuery)
   const t = useT()
   const locale = useLocale()
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
   const [isDeleting, setIsDeleting] = useState(false)
   const [localPending, setLocalPending] = useState<'starting' | 'stopping' | null>(null)
-  const { connected, getBotStatus, deployBot, stopBot } = useBotRunner()
+  const { connected } = useBotRunnerConnection()
+  const { getBotStatus, deployBot, stopBot } = useBotRunnerActions()
   const pendingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // Safety timeout: clear localPending after 30s if runner never responded
@@ -103,10 +108,18 @@ export function BotCard({ bot, viewMode }: BotCardProps) {
   const nameDotClass = bot.status === 'inactive' && bot.lastRunnerStatus === 'stopped'
     ? 'bg-amber-500'
     : status.dotClass
-  const statusLabel = getStatusLabel(bot.status, locale)
-
-  // Bot runner status
+  // FIX: Override status label when runner reports a transitional state that
+  // maps to 'deploying' in the store but has a different semantic meaning.
+  // 'stopping' maps to BotStatus 'deploying', but the user should see "停止中"
+  // not "部署中". 'starting' also maps to 'deploying', show "启动中" instead.
+  // Bot runner status (used for label override and action buttons)
   const runnerStatus = getBotStatus(bot.id)
+  const statusLabel = runnerStatus?.status === 'stopping'
+    ? t('runtime.stopping')
+    : runnerStatus?.status === 'starting'
+      ? t('runtime.startingCompact')
+      : getStatusLabel(bot.status, locale)
+  const statusWithLabel = useMemo(() => ({ ...status, label: statusLabel }), [status, statusLabel])
   const isBotRunning = runnerStatus?.status === 'running'
   const isBotDeploying = runnerStatus?.status === 'starting'
   const isBotStopping = runnerStatus?.status === 'stopping'
@@ -117,8 +130,9 @@ export function BotCard({ bot, viewMode }: BotCardProps) {
   // in the useEffect above will eventually clear the raw localPending.
   const effectiveLocalPending = (() => {
     // Only clear 'starting' when runner confirms it's actually starting/running,
-    // not when a stale status from a previous run exists
-    if (localPending === 'starting' && runnerStatus && (runnerStatus.status === 'starting' || runnerStatus.status === 'running')) return null
+    // not when a stale status from a previous run exists.
+    // Also clear on error — deploy failed, no longer starting.
+    if (localPending === 'starting' && runnerStatus && (runnerStatus.status === 'starting' || runnerStatus.status === 'running' || runnerStatus.status === 'error')) return null
     // Clear 'stopping' when runner confirms the bot is no longer running
     // BUG FIX: Also clear when runnerStatus is null (bot fully stopped, no runner status)
     if (localPending === 'stopping' && (!runnerStatus || runnerStatus.status !== 'running')) return null
@@ -152,15 +166,9 @@ export function BotCard({ bot, viewMode }: BotCardProps) {
 
     setLocalPending('starting')
 
-    // BUG FIX: Fetch full bot detail before deploying from the list view.
-    // The list API excludes projectFiles, code, and envVars for performance.
-    // Without this, bots with projectFiles (ZIP/Git imports) deploy with
-    // empty projectFiles, causing them to fail at startup.
-    // Also fetches decrypted env vars via the reveal API.
     let realEnvVarsMap: Record<string, string> = {}
     let realBotToken = botToken
 
-    // Fetch full bot data first (includes projectFiles, code, etc.)
     try {
       await useBotStore.getState().fetchBotDetail(bot.id)
     } catch {
@@ -169,61 +177,26 @@ export function BotCard({ bot, viewMode }: BotCardProps) {
       return
     }
 
-    // Now read the updated bot from the store
     const fullBot = useBotStore.getState().bots.find(b => b.id === bot.id) || bot
 
-    try {
-      const res = await fetch(`/api/bots/${bot.id}/env-vars/reveal`, { credentials: 'include' })
-      if (res.ok) {
-        const data = await res.json()
-        for (const v of data.envVars || []) {
-          realEnvVarsMap[v.key] = v.value
-        }
-        const realTokenEntry = [realEnvVarsMap.BOT_TOKEN, realEnvVarsMap.TELEGRAM_BOT_TOKEN].filter(Boolean).slice(-1)[0]
-        if (realTokenEntry) realBotToken = realTokenEntry
-      } else {
-        // Reveal API failed — check if we have encrypted vars with masked values
-        const hasMaskedVars = fullBot.envVars.some(v => v.isEncrypted && v.value.includes('•'))
-        if (hasMaskedVars) {
-          toast.error(t('runtime.envRevealFailed'))
-          setLocalPending(null)
-          return
-        }
-        // Fallback: use store values (safe for non-encrypted vars)
-        fullBot.envVars.forEach((v) => { realEnvVarsMap[v.key] = v.value })
-      }
-    } catch {
-      // Network error — check if we have encrypted vars with masked values
-      const hasMaskedVars = fullBot.envVars.some(v => v.isEncrypted && v.value.includes('•'))
-      if (hasMaskedVars) {
+    const revealed = await fetchRevealEnvVars(bot.id)
+    if (revealed) {
+      realEnvVarsMap = revealed.envVarsMap
+      realBotToken = revealed.botToken
+    } else {
+      if (hasMaskedEnvVars(fullBot.envVars)) {
         toast.error(t('runtime.envRevealFailed'))
         setLocalPending(null)
         return
       }
-      // Fallback: use store values (safe for non-encrypted vars)
-      fullBot.envVars.forEach((v) => { realEnvVarsMap[v.key] = v.value })
+      realEnvVarsMap = buildEnvVarsFallback(fullBot.envVars)
     }
 
-    // Build dependencies list from fullBot.dependencies (updated after fetchBotDetail)
-    const depsList = fullBot.dependencies.map(d => d.version ? `${d.name}@${d.version}` : d.name)
-
-    deployBot({
-      botId: bot.id,
-      config: {
-        name: fullBot.name,
-        botToken: realBotToken,
-        language: fullBot.language as 'javascript' | 'typescript' | 'python',
-        templateId: fullBot.template || 'custom',
-        envVars: realEnvVarsMap,
-        // Skip customCode when projectFiles exist (same logic as RuntimeControl)
-        customCode: fullBot.projectFiles?.length ? undefined : (fullBot.codeBlocks?.filter(b => b.isActive !== false).map(b => b.code).join('\n\n') || fullBot.code || undefined),
-        dependencies: depsList.length > 0 ? depsList : undefined,
-        projectFiles: fullBot.projectFiles?.length
-          ? fullBot.projectFiles.map((f) => ({ path: f.path, content: f.content }))
-          : undefined,
-        entryPoint: fullBot.entryPoint || undefined,
-      },
-    })
+    const deploySuccess = deployBot(buildDeployConfig(bot.id, fullBot, realEnvVarsMap, realBotToken))
+    if (!deploySuccess) {
+      setLocalPending(null)
+      return
+    }
     toast.success(t('botCard.starting', { name: bot.name }))
   }
 
@@ -261,7 +234,7 @@ export function BotCard({ bot, viewMode }: BotCardProps) {
 
   const sharedProps = {
     bot,
-    status: { ...status, label: statusLabel },
+    status: statusWithLabel,
     health,
     locale,
     searchQuery,
@@ -313,25 +286,12 @@ export function BotCard({ bot, viewMode }: BotCardProps) {
       />
     </>
   )
-}
+})
 
 /* ============================================
    ACTION BUTTONS (shared between Grid & List)
    ============================================ */
-function CardActions({
-  bot: _bot,
-  onEdit,
-  onStart,
-  onStop,
-  onDelete,
-  isBotRunning,
-  isBotDeploying,
-  isBotStopping = false,
-  isLocalStarting = false,
-  isLocalStopping = false,
-  hasValidToken,
-  compact = false,
-}: {
+interface CardActionsProps {
   bot: Bot
   onEdit: (_e: React.MouseEvent) => void
   onStart: () => void
@@ -344,7 +304,22 @@ function CardActions({
   isLocalStopping?: boolean
   hasValidToken: boolean
   compact?: boolean
-}) {
+}
+
+const CardActions = React.memo(function CardActions({
+  bot: _bot,
+  onEdit,
+  onStart,
+  onStop,
+  onDelete,
+  isBotRunning,
+  isBotDeploying,
+  isBotStopping = false,
+  isLocalStarting = false,
+  isLocalStopping = false,
+  hasValidToken,
+  compact = false,
+}: CardActionsProps) {
   const t = useT()
   const size = compact ? 'size-8' : 'size-9'
   const iconSize = compact ? 'size-3.5' : 'size-4'
@@ -459,13 +434,13 @@ function CardActions({
       </TooltipProvider>
     </div>
   )
-}
+})
 
 /* ============================================
    GRID MODE CARD
    ============================================ */
 
-function GridModeCard({
+const GridModeCard = React.memo(function GridModeCard({
   bot,
   status,
   health,
@@ -601,13 +576,13 @@ function GridModeCard({
       </CardContent>
     </Card>
   )
-}
+})
 
 /* ============================================
    LIST MODE — Table Row
    ============================================ */
 
-function ListModeCard({
+const ListModeCard = React.memo(function ListModeCard({
   bot,
   status,
   health: _health,
@@ -733,4 +708,4 @@ function ListModeCard({
       </td>
     </tr>
   )
-}
+})

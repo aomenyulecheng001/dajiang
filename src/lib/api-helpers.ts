@@ -1,3 +1,77 @@
+import { NextRequest } from 'next/server'
+import { validateSessionAsync } from '@/lib/session'
+
+const SESSION_COOKIE_NAME = 'session_token'
+
+export function getSecureClientIp(request: NextRequest): string {
+  const trustedProxies = (process.env.TRUSTED_PROXIES || '').split(',').map(s => s.trim()).filter(Boolean)
+  if (trustedProxies.length === 0) {
+    return 'shared-untrusted'
+  }
+  const isTrusted = (ip: string) => trustedProxies.includes(ip) || ip === '127.0.0.1' || ip === '::1'
+  const directIp = request.headers.get('x-real-ip') || request.headers.get('x-client-ip') || '127.0.0.1'
+  if (isTrusted(directIp)) {
+    const forwarded = request.headers.get('x-forwarded-for')
+    if (forwarded) {
+      const ips = forwarded.split(',').map(s => s.trim())
+      for (let i = ips.length - 1; i >= 0; i--) {
+        if (!isTrusted(ips[i])) return ips[i]
+      }
+    }
+  }
+  return directIp
+}
+
+export function isSecureRequest(request: NextRequest): boolean {
+  if (process.env.PROTOCOL === 'https') return true
+  if (process.env.TRUST_FORWARDED_HEADERS === 'true') {
+    const forwarded = request.headers.get('x-forwarded-proto')
+    if (forwarded === 'https') return true
+  }
+  if (request.nextUrl.protocol === 'https:') return true
+  if (process.env.NODE_ENV === 'production') {
+    console.warn('[Security] Cookie secure flag is false in production. Set PROTOCOL=https or TRUST_FORWARDED_HEADERS=true')
+  }
+  return false
+}
+
+export function extractToken(request: NextRequest): string | null {
+  const cookieToken = request.cookies.get(SESSION_COOKIE_NAME)?.value
+  if (cookieToken) return cookieToken
+  const authHeader = request.headers.get('authorization')
+  if (authHeader?.startsWith('Bearer ')) return authHeader.slice(7)
+  return null
+}
+
+export async function getCurrentUserId(request: Request): Promise<string | null> {
+  try {
+    const cookieToken = (request as NextRequest).cookies?.get?.(SESSION_COOKIE_NAME)?.value
+    const authHeader = request.headers.get('authorization')
+    let token = cookieToken
+      || (authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null)
+
+    // SECURITY FIX (SEC-80): Support query parameter token for SSE endpoints,
+    // consistent with middleware.ts authentication logic. EventSource API cannot
+    // set custom headers, so SSE endpoints fall back to ?token= query parameter.
+    if (!token) {
+      try {
+        const url = new URL(request.url)
+        if (url.pathname.includes('/logs/stream')) {
+          token = url.searchParams.get('token')
+        }
+      } catch {
+        // URL parsing may fail for some request types
+      }
+    }
+
+    if (!token) return null
+    const session = await validateSessionAsync(token)
+    return session?.userId ?? null
+  } catch {
+    return null
+  }
+}
+
 /**
  * P0-1 OPT: Lightweight bot serializer for list views.
  * Skips expensive operations:

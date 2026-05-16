@@ -22,7 +22,10 @@ export async function GET() {
     return NextResponse.json({
       status: 'ok',
       timestamp: new Date().toISOString(),
-      uptime: Math.floor(process.uptime()),
+      // SECURITY FIX (SEC-104): Removed uptime field to prevent information
+      // leakage. Server uptime could help attackers determine when in-memory
+      // security state (rate limit counters, lockout state, HMAC fallback)
+      // was last reset, enabling timed attacks after server restarts.
       responseTimeMs: Date.now() - startTime,
     }, {
       headers: {
@@ -33,7 +36,6 @@ export async function GET() {
     return NextResponse.json({
       status: 'degraded',
       timestamp: new Date().toISOString(),
-      uptime: Math.floor(process.uptime()),
       responseTimeMs: Date.now() - startTime,
       error: 'Database connection failed',
     }, { status: 503 })

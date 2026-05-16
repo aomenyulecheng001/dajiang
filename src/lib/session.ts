@@ -27,7 +27,12 @@ function getHmacSecret(): string {
   if (typeof process !== 'undefined' && process.env && process.env.HMAC_SECRET) {
     return process.env.HMAC_SECRET
   }
-  console.error('')
+  const isBuildPhase = typeof process !== 'undefined' && (process.env.NEXT_PHASE === 'phase-production-build' || process.env.NEXT_PHASE === 'phase-export')
+  if (typeof process !== 'undefined' && process.env && process.env.NODE_ENV === 'production' && !isBuildPhase) {
+    console.error('FATAL: HMAC_SECRET environment variable is required for production.')
+    console.error('Generate one with: openssl rand -hex 32')
+    process.exit(1)
+  }
   console.error('╔══════════════════════════════════════════════════════════════╗')
   console.error('║  [FATAL] HMAC_SECRET environment variable is not set!      ║')
   console.error('║  Session token signing requires a secure secret.           ║')
@@ -35,10 +40,40 @@ function getHmacSecret(): string {
   console.error('║  Example: HMAC_SECRET=$(openssl rand -hex 32)              ║')
   console.error('╚══════════════════════════════════════════════════════════════╝')
   console.error('')
-  // SECURITY FIX: Instead of a predictable fallback string that allows token forgery,
-  // generate a random per-process secret. Tokens signed with this won't survive
-  // process restarts (which is acceptable for a fallback), and more importantly,
-  // they CANNOT be forged by attackers who know the fallback value.
+  // BUG FIX (BUG-104): When HMAC_SECRET is not set, the Edge Runtime
+  // (session-edge.ts) and Node.js Runtime (session.ts) run in separate
+  // isolates and would each generate their own random secret. Tokens
+  // signed by one runtime cannot be verified by the other, breaking the
+  // entire auth system. To fix this, we derive the fallback secret from
+  // a shared file (.hmac-secret) so both runtimes use the same value.
+  // SECURITY: This is still less secure than setting HMAC_SECRET explicitly
+  // (the file may be readable by other processes), but it prevents the
+  // cross-runtime mismatch that would silently break all auth.
+  try {
+    const fs = require('fs') as typeof import('fs')
+    const path = require('path') as typeof import('path')
+    const secretFile = path.join(
+      process.env.PROJECT_ROOT || process.cwd(),
+      '.hmac-secret'
+    )
+    if (fs.existsSync(secretFile)) {
+      const existing = fs.readFileSync(secretFile, 'utf-8').trim()
+      if (existing.length >= 32) return existing
+    }
+    // Generate and persist a new random secret
+    const bytes = crypto.getRandomValues(new Uint8Array(32))
+    const secret = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('')
+    try {
+      fs.writeFileSync(secretFile, secret + '\n', { mode: 0o600 })
+    } catch {
+      // Write may fail (read-only filesystem, permissions, etc.)
+      // The secret is still usable in memory for this process
+    }
+    return secret
+  } catch {
+    // require('fs') may not be available in Edge Runtime.
+    // Fall through to pure random (Edge Runtime should have HMAC_SECRET set).
+  }
   const bytes = crypto.getRandomValues(new Uint8Array(32))
   return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('')
 }
@@ -64,6 +99,58 @@ interface RevocationEntry {
 
 const revokedTokenSignatures = new Map<string, RevocationEntry>()
 
+let revocationsLoaded = false
+
+import { appendFile, readFile as fsReadFile, mkdir, writeFile } from 'fs/promises'
+import { existsSync } from 'fs'
+import { resolveFromProjectRoot } from '@/lib/project-root'
+
+const REVOCATION_FILE = resolveFromProjectRoot('.revoked-tokens')
+
+async function persistRevocation(tokenHash: string, expiresAt: number): Promise<void> {
+  try {
+    await appendFile(REVOCATION_FILE, `${tokenHash}:${expiresAt}\n`)
+  } catch (error) {
+    console.error('[Session] CRITICAL: Failed to persist token revocation to disk. Revocation is in-memory only and will be lost on restart.', error instanceof Error ? error.message : 'unknown')
+  }
+}
+
+async function loadRevocations(): Promise<void> {
+  try {
+    if (!existsSync(REVOCATION_FILE)) { revocationsLoaded = true; return }
+    const content = await fsReadFile(REVOCATION_FILE, 'utf-8')
+    const now = Date.now()
+    const lines = content.split('\n').filter(Boolean)
+    for (const line of lines) {
+      const [hash, expires] = line.split(':')
+      if (hash && Number(expires) > now) {
+        revokedTokenSignatures.set(hash, { expiresAt: Number(expires) })
+      }
+    }
+  } catch { /* ignore */ }
+  revocationsLoaded = true
+}
+
+loadRevocations().catch(() => { /* ignore */ })
+
+const tokenVersionCache = new Map<string, { version: number; cachedAt: number }>()
+const TOKEN_VERSION_CACHE_TTL_MS = 10 * 1000
+
+// SECURITY FIX (SEC-89): Reduced cleanup interval from 60 minutes to 5 minutes.
+// Cache TTL is 30 seconds, so a 60-minute cleanup interval means expired entries
+// consume memory for up to 60 minutes unnecessarily.
+const _tokenVersionCleanupInterval = setInterval(() => {
+  const now = Date.now()
+  for (const [key, entry] of tokenVersionCache) {
+    if (now - entry.cachedAt > TOKEN_VERSION_CACHE_TTL_MS) {
+      tokenVersionCache.delete(key)
+    }
+  }
+}, 5 * 60 * 1000)
+if (typeof (_tokenVersionCleanupInterval as ReturnType<typeof setInterval> & { unref?: () => void }).unref === 'function') {
+  (_tokenVersionCleanupInterval as ReturnType<typeof setInterval> & { unref: () => void }).unref()
+}
+
 // Periodic cleanup of expired revocation entries (every hour)
 // SECURITY FIX: Instead of clearing ALL entries when size exceeds threshold
 // (which allowed attackers to invalidate the revocation list), only remove
@@ -71,16 +158,14 @@ const revokedTokenSignatures = new Map<string, RevocationEntry>()
 // BUG FIX: Call .unref() on the timer so it doesn't prevent graceful shutdown.
 // Edge Runtime compatibility: .unref() is only available in Node.js, not in Edge.
 // Guard the call with a typeof check.
-const revocationCleanupInterval = setInterval(() => {
+const revocationCleanupInterval = setInterval(async () => {
   const now = Date.now()
   for (const [sig, entry] of revokedTokenSignatures) {
-    // Remove entries whose tokens have already expired naturally
     if (now > entry.expiresAt) {
       revokedTokenSignatures.delete(sig)
     }
   }
   // Safety cap: if somehow the list grows beyond 50000, prune oldest entries
-  // (This should never happen in normal operation since tokens expire after 7 days)
   if (revokedTokenSignatures.size > 50000) {
     const entries = [...revokedTokenSignatures.entries()]
       .sort((a, b) => a[1].expiresAt - b[1].expiresAt)
@@ -89,6 +174,17 @@ const revocationCleanupInterval = setInterval(() => {
       revokedTokenSignatures.delete(sig)
     }
     console.warn('[Session] Pruned revocation list (size exceeded 50000)')
+  }
+  try {
+    const validEntries: string[] = []
+    for (const [hash, entry] of revokedTokenSignatures) {
+      if (entry.expiresAt > now) {
+        validEntries.push(`${hash}:${entry.expiresAt}`)
+      }
+    }
+    await writeFile(REVOCATION_FILE, validEntries.join('\n') + (validEntries.length > 0 ? '\n' : ''), 'utf-8')
+  } catch (error) {
+    console.error('[Session] Failed to compact revocation file:', error instanceof Error ? error.message : 'unknown')
   }
 }, 60 * 60 * 1000)
 // Only call .unref() in Node.js runtime (not available in Edge Runtime)
@@ -228,8 +324,11 @@ export async function validateSessionAsync(token: string): Promise<{ userId: str
     // Check revocation list (in-memory for immediate revocation)
     // SECURITY FIX: hashSignature now uses Web Crypto API (consistent across Edge/Node)
     const hashedSig = await hashSignature(signature)
-    if (revokedTokenSignatures.has(hashedSig)) {
+    if (revocationsLoaded && revokedTokenSignatures.has(hashedSig)) {
       return null
+    }
+    if (!revocationsLoaded) {
+      console.warn('[Session] Revocation list not yet loaded, skipping revocation check')
     }
 
     // Decode payload
@@ -245,68 +344,32 @@ export async function validateSessionAsync(token: string): Promise<{ userId: str
     // When password is changed, tokenVersion is incremented in the Account table.
     // Any token created before the increment will have an outdated tokenVersion
     // and will be rejected — even after server restart (unlike in-memory Map).
-    if (payload.tokenVersion !== undefined && payload.userId) {
+    if (payload.userId) {
       try {
-        const { db } = await import('@/lib/db')
-        const account = await db.account.findUnique({
-          where: { id: payload.userId },
-          select: { tokenVersion: true }
-        })
-        if (account && account.tokenVersion !== payload.tokenVersion) {
+        const now = Date.now()
+        const cached = tokenVersionCache.get(payload.userId)
+        let dbVersion: number | undefined
+
+        if (cached && now - cached.cachedAt < TOKEN_VERSION_CACHE_TTL_MS) {
+          dbVersion = cached.version
+        } else {
+          const { db } = await import('@/lib/db')
+          const account = await db.account.findUnique({
+            where: { id: payload.userId },
+            select: { tokenVersion: true }
+          })
+          if (!account) return null
+          dbVersion = account.tokenVersion
+          tokenVersionCache.set(payload.userId, { version: dbVersion, cachedAt: now })
+        }
+
+        if (payload.tokenVersion === undefined || dbVersion !== payload.tokenVersion) {
           return null
         }
       } catch {
-        // DB unavailable — fail closed: reject token when we cannot verify tokenVersion.
-        // An attacker could exploit DB pressure to bypass token revocation.
         console.error('[Session] DB unavailable during tokenVersion check — rejecting token for safety')
         return null
       }
-    }
-
-    return { userId: payload.userId, username: payload.username }
-  } catch {
-    return null
-  }
-}
-
-/**
- * Synchronous session validation for backward compatibility.
- * Only works in Node.js runtime (not Edge).
- * DEPRECATED: Use validateSessionAsync() instead.
- */
-export function validateSession(token: string): { userId: string; username: string } | null {
-  try {
-    const dotIndex = token.indexOf('.')
-    if (dotIndex === -1) return null
-
-    const payloadB64 = token.slice(0, dotIndex)
-    const signature = token.slice(dotIndex + 1)
-
-    // Sync HMAC verification (Node.js only)
-    let expected: string
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const nodeCrypto = require('crypto')
-      expected = nodeCrypto.createHmac('sha256', HMAC_SECRET).update(payloadB64).digest('hex')
-    } catch {
-      return null // Can't verify in this runtime
-    }
-
-    // Timing-safe comparison
-    if (expected.length !== signature.length) return null
-    let result = 0
-    for (let i = 0; i < expected.length; i++) {
-      result |= expected.charCodeAt(i) ^ signature.charCodeAt(i)
-    }
-    if (result !== 0) return null
-
-    // Decode payload
-    const payloadStr = base64UrlDecode(payloadB64)
-    const payload: SessionPayload = JSON.parse(payloadStr)
-
-    // Check expiration
-    if (Date.now() - payload.createdAt > SESSION_TTL_MS) {
-      return null
     }
 
     return { userId: payload.userId, username: payload.username }
@@ -329,10 +392,14 @@ export async function deleteSession(token: string): Promise<boolean> {
     const payload: SessionPayload = JSON.parse(payloadStr)
     const signature = token.slice(dotIndex + 1)
 
+    const valid = await hmacVerify(token.slice(0, dotIndex), signature)
+    if (!valid) return false
+
     // Add to revocation list with TTL-based expiration
     const hashedSig = await hashSignature(signature)
     const expiresAt = payload.createdAt + SESSION_TTL_MS
     revokedTokenSignatures.set(hashedSig, { expiresAt })
+    await persistRevocation(hashedSig, expiresAt)
 
     // Remove from recentSessions
     const idx = recentSessions.findIndex(
@@ -351,15 +418,36 @@ export async function deleteSession(token: string): Promise<boolean> {
  * Increment the tokenVersion for an account, invalidating all existing tokens.
  * This is persistent (stored in DB) and survives server restarts.
  * Called when: password is changed, account security action is taken.
+ *
+ * SECURITY FIX (SEC-22): No longer silently swallows errors. If the DB update
+ * fails, the error propagates to the caller so it can handle the failure
+ * appropriately (e.g., roll back the password change). Previously, a silent
+ * failure meant old session tokens from other devices remained valid after a
+ * password change, violating the user's security expectation.
  */
-export async function incrementTokenVersion(userId: string): Promise<void> {
+export async function incrementTokenVersion(userId: string): Promise<number> {
+  tokenVersionCache.delete(userId)
   try {
     const { db } = await import('@/lib/db')
-    await db.account.update({
+    const result = await db.account.update({
       where: { id: userId },
-      data: { tokenVersion: { increment: 1 } }
+      data: { tokenVersion: { increment: 1 } },
+      select: { tokenVersion: true },
     })
-  } catch (err) {
-    console.error('[Session] Failed to increment tokenVersion:', err instanceof Error ? err.message : err)
+    tokenVersionCache.set(userId, { version: result.tokenVersion, cachedAt: Date.now() })
+    return result.tokenVersion
+  } catch (error) {
+    console.error('[Session] Failed to increment tokenVersion:', error)
+    tokenVersionCache.delete(userId)
+    throw error
   }
+}
+
+/**
+ * Invalidate the tokenVersion cache entry for a user.
+ * Called when tokenVersion is updated externally (e.g., in a combined DB update
+ * with password change) to ensure the next validation query fetches the fresh value.
+ */
+export function invalidateTokenVersionCache(userId: string): void {
+  tokenVersionCache.delete(userId)
 }

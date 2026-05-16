@@ -1,5 +1,5 @@
-import { createCipheriv, createDecipheriv, createHash, randomBytes, pbkdf2Sync } from 'crypto'
-import { access, readFile, writeFile, mkdir } from 'fs/promises'
+import { createCipheriv, createDecipheriv, createHash, randomBytes, pbkdf2Sync, pbkdf2 } from 'crypto'
+import { access, readFile, writeFile, mkdir, chmod, open } from 'fs/promises'
 import { join, dirname } from 'path'
 import { resolveFromProjectRoot } from '@/lib/project-root'
 import { SENSITIVE_KEY_PATTERNS } from '@/lib/bot-constants'
@@ -53,10 +53,26 @@ async function getKeyAsync(): Promise<Buffer> {
         // File doesn't exist
       }
       if (!keySource || keySource.length === 0) {
+          const isBuildPhase = process.env.NEXT_PHASE === 'phase-production-build' || process.env.NEXT_PHASE === 'phase-export'
+          if (process.env.NODE_ENV === 'production' && !isBuildPhase) {
+            console.error('FATAL: ENCRYPTION_KEY is not set in production. Encrypted data will be lost on restart!')
+            process.exit(1)
+          }
         keySource = randomBytes(32).toString('hex').slice(0, 32)
         try {
           await mkdir(dirname(keyFile), { recursive: true })
-          await writeFile(keyFile, keySource, 'utf-8')
+          try {
+            const fd = await open(keyFile, 'wx', 0o600)
+            await fd.writeFile(keySource, 'utf-8')
+            await fd.close()
+          } catch (e: any) {
+            if (e.code === 'EEXIST') {
+              keySource = (await readFile(keyFile, 'utf-8')).trim()
+            } else {
+              throw e
+            }
+          }
+          try { await chmod(keyFile, 0o600) } catch { /* Windows may not support chmod */ }
         } catch {
           // Ignore write errors — key is still usable in memory
         }
@@ -78,10 +94,13 @@ async function getKeyAsync(): Promise<Buffer> {
       console.warn('')
     }
 
-    // P2-API-10 FIX: Use PBKDF2 for proper key derivation
-    // H6 FIX: Use per-key salt derived from keySource for stronger security
     const salt = getPBKDF2Salt(keySource)
-    const derivedKey = pbkdf2Sync(keySource, salt, PBKDF2_ITERATIONS, 32, 'sha256')
+    const derivedKey = await new Promise<Buffer>((resolve, reject) => {
+      pbkdf2(keySource, salt, PBKDF2_ITERATIONS, 32, 'sha256', (err, key) => {
+        if (err) reject(err)
+        else resolve(key)
+      })
+    })
     _keyVersion = 2
     _cachedKey = derivedKey
     return _cachedKey
@@ -93,46 +112,26 @@ async function getKeyAsync(): Promise<Buffer> {
 /**
  * Get the AES-256 encryption key (sync version for backward compat).
  *
- * P3-1 FIX: This function no longer does sync fs reads. It only works if:
- * 1. The key was already cached by a prior call to getKeyAsync(), OR
- * 2. The ENCRYPTION_KEY env var is set, OR
- * 3. The .encryption-key file was read by getKeyAsync() at startup
- *
- * If none of these conditions are met, it falls back to generating a
- * temporary in-memory key (not persisted). This prevents blocking the
- * event loop with sync fs operations.
+ * IMPORTANT: This uses pbkdf2Sync which blocks the event loop for ~100ms.
+ * It should only be called when the key is already cached (from a prior
+ * getKeyAsync() call at startup). If the key is not cached, it throws
+ * rather than blocking the event loop.
  *
  * Prefer getKeyAsync() in all new code.
  */
 function getKey(): Buffer {
   if (_cachedKey) return _cachedKey
 
-  // Try to use env var directly (no fs read needed)
   let keySource = process.env.ENCRYPTION_KEY
-  let isGenerated = false
 
   if (!keySource || keySource.length === 0) {
-    // P3-1 FIX: Instead of sync fs reads, generate a temporary key.
-    // This key will NOT persist across restarts — callers should use
-    // getKeyAsync() for proper initialization.
-    keySource = randomBytes(32).toString('hex').slice(0, 32)
-    isGenerated = true
-
-    // Log warning about missing key
-    console.warn('')
-    console.warn('╔══════════════════════════════════════════════════════════════╗')
-    console.warn('║  [SECURITY WARNING] ENCRYPTION_KEY environment variable   ║')
-    console.warn('║  is not set and no cached key is available. A temporary   ║')
-    console.warn('║  in-memory key was generated.                             ║')
-    console.warn('║                                                           ║')
-    console.warn('║  ⚠  Use getKeyAsync() for proper key initialization!     ║')
-    console.warn('║  ⚠  This temporary key will NOT persist across restarts!  ║')
-    console.warn('╚══════════════════════════════════════════════════════════════╝')
-    console.warn('')
+    throw new Error(
+      '[crypto] ENCRYPTION_KEY is not set and no cached key is available. ' +
+      'Call getKeyAsync() first at startup, or set the ENCRYPTION_KEY env var. ' +
+      'Sync getKey() no longer generates temporary keys to prevent data loss.'
+    )
   }
 
-  // P2-API-10 FIX: Use PBKDF2 for proper key derivation
-  // H6 FIX: Use per-key salt derived from keySource for stronger security
   const salt = getPBKDF2Salt(keySource)
   _cachedKey = pbkdf2Sync(keySource, salt, PBKDF2_ITERATIONS, 32, 'sha256')
   _keyVersion = 2
@@ -144,8 +143,13 @@ function getKey(): Buffer {
  * Returns format: ENC1:iv:authTag:encrypted (prefix + all hex)
  * The ENC1: prefix allows definitive detection of encrypted values
  * (vs the legacy iv:authTag:encrypted format that relied on heuristics).
+ *
+ * @deprecated Use encryptAsync() instead. This function blocks the event loop during key derivation.
  */
 export function encrypt(text: string): string {
+  if (typeof process !== 'undefined' && process.env?.NODE_ENV !== 'production') {
+    console.warn('[crypto] Synchronous encryption function called. Use the async version to avoid blocking the event loop.')
+  }
   const iv = randomBytes(16)
   const key = getKey()
   const cipher = createCipheriv(ALGORITHM, key, iv)
@@ -188,8 +192,13 @@ function parseEncryptedText(encryptedText: string): [string, string, string] {
  *
  * NOTE: This sync version reads the key via sync fs on first call.
  * Prefer decryptAsync() in API route handlers to avoid blocking the event loop.
+ *
+ * @deprecated Use decryptAsync() instead. This function blocks the event loop during key derivation.
  */
 export function decrypt(encryptedText: string): string {
+  if (typeof process !== 'undefined' && process.env?.NODE_ENV !== 'production') {
+    console.warn('[crypto] Synchronous encryption function called. Use the async version to avoid blocking the event loop.')
+  }
   const [ivHex, authTagHex, encrypted] = parseEncryptedText(encryptedText)
   const iv = Buffer.from(ivHex, 'hex')
   const authTag = Buffer.from(authTagHex, 'hex')
@@ -321,10 +330,15 @@ export function isSensitiveKey(key: string): boolean {
 
 /**
  * Process env vars: encrypt sensitive values that aren't already encrypted.
+ *
+ * @deprecated Use the async version instead. This function blocks the event loop during key derivation.
  */
 export function encryptEnvVars<T extends { key: string; value: string; isEncrypted?: boolean }>(
   envVars: T[]
 ): T[] {
+  if (typeof process !== 'undefined' && process.env?.NODE_ENV !== 'production') {
+    console.warn('[crypto] Synchronous encryption function called. Use the async version to avoid blocking the event loop.')
+  }
   return envVars.map(envVar => {
     if (!isSensitiveKey(envVar.key)) return envVar
     if (envVar.isEncrypted && isEncrypted(envVar.value)) return envVar
@@ -341,10 +355,15 @@ export function encryptEnvVars<T extends { key: string; value: string; isEncrypt
  *
  * NOTE: This sync version calls encrypt() which may do sync fs on first call.
  * Prefer encryptEnvVarsOnSaveAsync() in API route handlers.
+ *
+ * @deprecated Use encryptEnvVarsOnSaveAsync() instead. This function blocks the event loop during key derivation.
  */
 export function encryptEnvVarsOnSave<T extends { key: string; value: string; isEncrypted?: boolean }>(
   envVars: T[]
 ): T[] {
+  if (typeof process !== 'undefined' && process.env?.NODE_ENV !== 'production') {
+    console.warn('[crypto] Synchronous encryption function called. Use the async version to avoid blocking the event loop.')
+  }
   return envVars.map(envVar => {
     if (isEncrypted(envVar.value)) {
       return { ...envVar, isEncrypted: true }
@@ -389,10 +408,15 @@ export const ENCRYPTED_PLACEHOLDER = '••••••••••••'
  *
  * NOTE: This sync version calls decrypt() which may do sync fs on first call.
  * Prefer decryptEnvVarsMaskedAsync() in API route handlers.
+ *
+ * @deprecated Use decryptEnvVarsMaskedAsync() instead. This function blocks the event loop during key derivation.
  */
 export function decryptEnvVarsMasked<T extends { key: string; value: string; isEncrypted?: boolean }>(
   envVars: T[]
 ): T[] {
+  if (typeof process !== 'undefined' && process.env?.NODE_ENV !== 'production') {
+    console.warn('[crypto] Synchronous encryption function called. Use the async version to avoid blocking the event loop.')
+  }
   return envVars.map(envVar => {
     // Encrypted sensitive values → replace with placeholder
     if ((envVar.isEncrypted || isEncrypted(envVar.value)) && isSensitiveKey(envVar.key)) {
@@ -468,10 +492,15 @@ export async function decryptEnvVarsMaskedAsync<T extends { key: string; value: 
  *
  * NOTE: This sync version calls decrypt() which may do sync fs on first call.
  * Prefer decryptEnvVarsAsync() in API route handlers.
+ *
+ * @deprecated Use decryptEnvVarsAsync() instead. This function blocks the event loop during key derivation.
  */
 export function decryptEnvVars<T extends { key: string; value: string; isEncrypted?: boolean }>(
   envVars: T[]
 ): T[] {
+  if (typeof process !== 'undefined' && process.env?.NODE_ENV !== 'production') {
+    console.warn('[crypto] Synchronous encryption function called. Use the async version to avoid blocking the event loop.')
+  }
   return envVars.map(envVar => {
     if (envVar.isEncrypted && isEncrypted(envVar.value)) {
       try {

@@ -14,6 +14,7 @@ export const en = {
     processing: 'Processing...',
     loading: 'Loading...',
     noDescription: 'No description provided',
+    tabError: 'This section encountered an error',
     bot: 'bot',
     bots: 'bots',
     name: 'Name',
@@ -68,8 +69,12 @@ export const en = {
     saving: 'Saving...',
     dep: 'dep',
     deps: 'deps',
+    sessionExpired: 'Session expired',
+    pleaseLoginAgain: 'Please log in again.',
+    tooManyRequests: 'Too many requests. Please try again later.',
   },
   auth: {
+    subtitle: 'Telegram Bot Management Platform',
     signIn: 'Sign In',
     signingIn: 'Signing in...',
     enterUsername: 'Enter your username',
@@ -115,6 +120,11 @@ export const en = {
     title: 'Bot Factory',
     switchLanguage: 'Switch language',
     searchResults: '{n} results',
+  },
+  pagination: {
+    navigation: 'Pagination',
+    page: 'Page',
+    items: 'items',
   },
   page: {
     yourBots: 'Your Bots',
@@ -414,6 +424,18 @@ export const en = {
     realtimeLogs: 'Real-time Logs',
     searchPlaceholder: 'Search logs...',
     searchResults: '{n} matches',
+    pollingPaused: 'Log polling paused — bot is not running',
+    simMsg: {
+      0: 'Message processed',
+      1: 'User #3842 started session',
+      2: 'API request succeeded',
+      3: 'Cache refreshed',
+      4: 'DB query took 32ms',
+      5: 'Webhook push successful',
+      6: 'New subscriber added',
+      7: 'Command /help invoked',
+      8: 'Scheduled task completed',
+    },
   },
   codeTab: {
     title: 'Source Code',
@@ -502,6 +524,8 @@ export const en = {
     duplicateDep: 'Dependency "{name}" already exists',
     editItem: 'Edit {name}',
     removeItem: 'Remove {name}',
+    removeConfirmTitle: 'Remove Dependency',
+    removeConfirmDesc: 'Are you sure you want to remove "{name}"? This action cannot be undone.',
   },
   envTab: {
     title: 'Environment Variables',
@@ -540,6 +564,9 @@ export const en = {
     bulkImportSuccess: 'Imported {n} variables',
     revealFailed: 'Failed to reveal encrypted value, please try again',
     autoRevealForEdit: 'Decrypting for editing...',
+    removeConfirmTitle: 'Remove Variable',
+    removeConfirmDesc: 'Are you sure you want to remove "{key}"? This action cannot be undone.',
+    removeConfirmDescSensitive: 'Are you sure you want to remove the sensitive/encrypted variable "{key}"? This will permanently delete the stored secret. This action cannot be undone.',
   },
   shortcuts: {
     title: 'Keyboard Shortcuts',
@@ -586,6 +613,8 @@ export const en = {
     running: 'Running',
     error: 'Error',
     stopped: 'Stopped',
+    notDeployed: 'Not Deployed',
+    startingCompact: 'Starting...',
     title: 'Runtime Control',
     serviceNotConnected: 'Bot Runner service not connected. Please make sure the service is started.',
     start: 'Start',
@@ -714,6 +743,9 @@ export const en = {
   },
   charts: {
     messages: '{count} messages',
+  },
+  botRunner: {
+    notConnected: 'Bot runner not connected. Please wait and try again.',
   },
 } as const;
 

@@ -1,8 +1,10 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { validateBotId } from '@/lib/validation'
+import { getCurrentUserId } from '@/lib/api-helpers'
 
 const STATS_CACHE_TTL = 10_000
+const MAX_CACHE_SIZE = 200
 const statsCache = new Map<string, { data: unknown; expiresAt: number }>()
 
 // Cleanup expired cache entries every 60 seconds
@@ -24,7 +26,7 @@ if (_cacheCleanup.unref) _cacheCleanup.unref()
  * - Hourly activity + top commands remain separate (different GROUP BY semantics)
  */
 export async function GET(
-  _request: Request,
+  request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
   let botId = 'unknown'
@@ -32,13 +34,17 @@ export async function GET(
     const resolved = await params
     botId = resolved.id
 
-    // BUG FIX: Validate bot ID format for consistency with other API routes
     const idErrors = validateBotId(botId)
     if (idErrors.length > 0) {
       return NextResponse.json({ error: idErrors[0].message }, { status: 400 })
     }
-    const bot = await db.bot.findUnique({ where: { id: botId }, select: { id: true } })
-    if (!bot) {
+
+    const userId = await getCurrentUserId(request)
+    if (!userId) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+    const ownershipBot = await db.bot.findUnique({ where: { id: botId }, select: { ownerId: true } })
+    if (!ownershipBot || ownershipBot.ownerId !== userId) {
       return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
 
@@ -47,34 +53,26 @@ export async function GET(
       return NextResponse.json(cached.data)
     }
 
-    // ── Optimized: Total Messages + Daily Messages in ONE query ──────────
-    // Previously 2 separate queries (COUNT + GROUP BY DATE).
-    // Now uses a single pass over BotMessage table.
+    // ── Optimized: Total Messages + Daily Messages in parallel queries ──
     const sevenDaysAgo = new Date()
     sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7)
-    const combinedDailyResult = await db.$queryRaw<Array<{
-      totalCount: bigint
-      date: string | null
-      dayCount: bigint
-    }>>`
-      SELECT
-        COUNT(*) AS totalCount,
-        NULL AS date,
-        0 AS dayCount
-      FROM BotMessage WHERE botId = ${botId}
-      UNION ALL
-      SELECT
-        0,
-        DATE(timestamp) AS date,
-        COUNT(*) AS dayCount
-      FROM BotMessage
-      WHERE botId = ${botId} AND timestamp >= ${sevenDaysAgo.toISOString()}
-      GROUP BY DATE(timestamp)
-    `
-    // First row has totalCount; remaining rows are daily breakdown
-    const messageCount = Number(combinedDailyResult[0]?.totalCount ?? 0)
-    const dailyMessages = combinedDailyResult.slice(1).map(r => ({
-      date: r.date!,
+
+    const [totalResult, dailyResult] = await Promise.all([
+      db.$queryRaw<Array<{ totalCount: bigint }>>`
+        SELECT COUNT(*) AS totalCount FROM BotMessage WHERE botId = ${botId}
+      `,
+      db.$queryRaw<Array<{ date: string; dayCount: bigint }>>`
+        SELECT DATE(timestamp) AS date, COUNT(*) AS dayCount
+        FROM BotMessage
+        WHERE botId = ${botId} AND timestamp >= ${sevenDaysAgo.toISOString()}
+        GROUP BY DATE(timestamp)
+        ORDER BY date DESC
+      `,
+    ])
+
+    const messageCount = Number(totalResult[0]?.totalCount ?? 0)
+    const dailyMessages = dailyResult.map(r => ({
+      date: r.date,
       count: Number(r.dayCount),
     }))
 
@@ -128,6 +126,11 @@ export async function GET(
       topCommands,
     }
 
+    if (statsCache.size >= MAX_CACHE_SIZE) {
+      const oldest = [...statsCache.entries()]
+        .sort((a, b) => a[1].expiresAt - b[1].expiresAt)[0]
+      if (oldest) statsCache.delete(oldest[0])
+    }
     statsCache.set(botId, { data: result, expiresAt: Date.now() + STATS_CACHE_TTL })
 
     return NextResponse.json(result)

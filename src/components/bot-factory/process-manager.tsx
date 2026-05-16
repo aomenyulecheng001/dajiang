@@ -1,10 +1,10 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { Server, MemoryStick, Cpu, Clock, Activity } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
-import { useBotRunner } from '@/lib/bot-runner-context'
+import { useBotRunnerConnection, useBotStatuses, useResourceData } from '@/lib/bot-runner-context'
 import { useBotStore } from '@/store/bot-store'
 import { useT } from '@/lib/i18n'
 import { cn, formatUptimeShort } from '@/lib/utils'
@@ -21,8 +21,16 @@ import {
 
 export function ProcessManager() {
   const t = useT()
-  const { connected, botStatuses, resourceData } = useBotRunner()
+  // PERF FIX: Use split contexts instead of combined useBotRunner().
+  // Previously subscribed to the combined BotRunnerContext which includes all Maps,
+  // causing re-renders on any bot's status/resource change even though we only
+  // need data for the selected bot. Split contexts allow more granular subscriptions.
+  const { connected } = useBotRunnerConnection()
+  const botStatuses = useBotStatuses()
+  const resourceData = useResourceData()
   const selectedBotId = useBotStore((s) => s.selectedBotId)
+  const botStatus = useMemo(() => botStatuses.get(selectedBotId || ''), [botStatuses, selectedBotId])
+  const botResource = useMemo(() => resourceData.get(selectedBotId || ''), [resourceData, selectedBotId])
   const [mounted, setMounted] = useState(false)
 
   useEffect(() => {
@@ -31,19 +39,20 @@ export function ProcessManager() {
 
   if (!mounted || !connected) return null
 
-  // Only show the selected bot's process info
-  const processes = Array.from(botStatuses.entries())
-    .filter(([id]) => !selectedBotId || id === selectedBotId)
-    .map(([id, status]) => ({
-      id,
-      name: status.name || id,
+  const processes = (() => {
+    if (!selectedBotId || !botStatus) return []
+    const status = botStatus
+    if (status.status !== 'running' && status.status !== 'starting' && status.status !== 'stopping' && status.status !== 'error') return []
+    return [{
+      id: selectedBotId,
+      name: status.name || selectedBotId,
       status: status.status,
       pid: status.pid,
-      resource: resourceData.get(id),
-      startedAt: (status as any).startedAt,
-      lastError: (status as any).lastError,
-    }))
-    .filter(p => p.status === 'running' || p.status === 'starting' || p.status === 'stopping' || p.status === 'error')
+      resource: botResource,
+      startedAt: status.startedAt,
+      lastError: status.lastError,
+    }]
+  })()
 
   if (processes.length === 0) {
     return null // Don't show empty card when no process

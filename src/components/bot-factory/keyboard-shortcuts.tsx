@@ -61,14 +61,12 @@ export function KeyboardShortcuts({
 }: {
   searchInputRef?: React.RefObject<HTMLInputElement | null>
 }) {
-  const {
-    selectedBotId,
-    setSelectedBotId,
-    setCreateBotDialogOpen,
-    setViewMode,
-    viewMode,
-    setSearchQuery,
-  } = useBotStore()
+  const selectedBotId = useBotStore(s => s.selectedBotId)
+  const setSelectedBotId = useBotStore(s => s.setSelectedBotId)
+  const setCreateBotDialogOpen = useBotStore(s => s.setCreateBotDialogOpen)
+  const setViewMode = useBotStore(s => s.setViewMode)
+  const viewMode = useBotStore(s => s.viewMode)
+  const setSearchQuery = useBotStore(s => s.setSearchQuery)
   const t = useT()
 
   const handleKeyDown = useCallback(

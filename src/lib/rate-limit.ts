@@ -67,6 +67,9 @@ export const RATE_LIMIT_RUNNER_TOKEN: RateLimitConfig = { max: 30, window: 60 }
 /** P2-API-12 FIX: Env-var reveal endpoint — strict limit (returns decrypted secrets) */
 export const RATE_LIMIT_REVEAL: RateLimitConfig = { max: 10, window: 60 }
 
+/** SECURITY FIX (SEC-106): Git import endpoint — strict limit (triggers resource-intensive git clone) */
+export const RATE_LIMIT_GIT_IMPORT: RateLimitConfig = { max: 3, window: 60 }
+
 /** Webhook incoming updates: 200 per minute (Telegram can send rapidly) */
 export const RATE_LIMIT_WEBHOOK: RateLimitConfig = { max: 200, window: 60 }
 
@@ -79,6 +82,11 @@ export const RATE_LIMIT_WEBHOOK: RateLimitConfig = { max: 200, window: 60 }
  * - Each key (IP address) gets a window counter
  * - When the window expires, the counter is proportionally decayed
  * - If the key exceeds max requests, it's rate-limited
+ *
+ * SECURITY NOTE (SEC-10): This in-memory rate limiter does not work in
+ * multi-instance deployments. Each instance maintains its own counter,
+ * so an attacker can multiply their allowed request rate by the number
+ * of instances. For multi-instance deployments, use Redis-backed rate limiting.
  */
 class RateLimiter {
   private store = new Map<string, WindowRecord>()
@@ -99,6 +107,10 @@ class RateLimiter {
    * @param config - Rate limit configuration
    */
   check(key: string, config: RateLimitConfig): RateLimitResult {
+    if (this.store.size > 10000) {
+      this.cleanup()
+    }
+
     const now = Math.floor(Date.now() / 1000) // seconds
     const record = this.store.get(key)
 
@@ -224,14 +236,22 @@ export const rateLimit = new RateLimiter()
  * Get the rate limit config for a given route and method
  */
 export function getRateLimitConfig(method: string, pathname: string): RateLimitConfig {
-  // P2-API-12 FIX: Runner token endpoint — strict limit (returns sensitive credential)
-  if (pathname.match(/\/:id\/env-vars\/reveal$/) || pathname === '/api/bots/:id/env-vars/reveal') {
+  // P2-API-12 FIX: Runner token endpoint — strict limit (returns decrypted secrets)
+  // SECURITY FIX (SEC-101): Use [^/]+ instead of :id literal to match any bot ID format.
+  // The middleware normalizes /api/bots/<id>/... to /api/bots/:id/..., but we also
+  // match the un-normalized form as defense-in-depth.
+  if (pathname.match(/\/api\/bots\/[^/]+\/env-vars\/reveal$/)) {
     return RATE_LIMIT_REVEAL
   }
 
   // P2-API-12 FIX: Runner token endpoint — strict limit
   if (pathname.match(/\/runner-token$/) || pathname === '/api/auth/runner-token') {
     return RATE_LIMIT_RUNNER_TOKEN
+  }
+
+  // SECURITY FIX (SEC-106): Git import — strict limit (triggers resource-intensive git clone)
+  if (pathname === '/api/git-import') {
+    return RATE_LIMIT_GIT_IMPORT
   }
 
   // Webhook incoming updates — generous limit (Telegram sends many updates)

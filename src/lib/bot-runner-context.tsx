@@ -1,9 +1,12 @@
 'use client'
 
-import React, { createContext, useContext, useEffect, useState, useRef, useCallback } from 'react'
-import { io, Socket } from 'socket.io-client'
+import React, { createContext, useContext, useEffect, useState, useRef, useCallback, useMemo } from 'react'
+import type { Socket } from 'socket.io-client'
 import { useBotStore } from '@/store/bot-store'
+import { authFetch } from '@/store/bot-store'
 import { useAuthStore } from '@/store/auth-store'
+import { useI18nStore, getTranslation } from '@/lib/i18n'
+import type { TranslationKey } from '@/lib/i18n'
 
 // ─── Types ───────────────────────────────────────────────────────────────
 
@@ -17,6 +20,7 @@ export interface BotRunnerStatus {
   stoppedAt?: string
   exitCode?: number | null
   error?: string
+  lastError?: string
   envVarKeys?: string[]
 }
 
@@ -70,15 +74,20 @@ export interface DeployConfig {
 
 // ─── Context ─────────────────────────────────────────────────────────────
 
-interface BotRunnerContextType {
+interface BotRunnerConnectionContextType {
   connected: boolean
   reconnecting: boolean
   reconnectAttempt: number
+  connectionError: string | null
+  reconnect: () => void
+}
+
+interface BotRunnerDataContextType {
   botStatuses: Map<string, BotRunnerStatus>
   deployProgresses: Map<string, DeployProgress>
   botLogs: Map<string, BotLogEntry[]>
   resourceData: Map<string, ResourceData>
-  deployBot: (_config: DeployConfig) => void
+  deployBot: (_config: DeployConfig) => boolean
   stopBot: (_botId: string) => void
   startBot: (_botId: string) => void
   restartBot: (_botId: string) => void
@@ -89,15 +98,37 @@ interface BotRunnerContextType {
   getBotLogs: (_botId: string) => BotLogEntry[]
   getResourceData: (_botId: string) => ResourceData | undefined
   subscribe: (_event: string, _callback: (..._args: unknown[]) => void) => () => void
-  reconnect: () => void
 }
 
+interface BotRunnerActionsContextType {
+  deployBot: (_config: DeployConfig) => boolean
+  stopBot: (_botId: string) => void
+  startBot: (_botId: string) => void
+  restartBot: (_botId: string) => void
+  deleteBot: (_botId: string) => void
+  requestLogs: (_botId: string) => void
+  getBotStatus: (_botId: string) => BotRunnerStatus | undefined
+  getDeployProgress: (_botId: string) => DeployProgress | undefined
+  getBotLogs: (_botId: string) => BotLogEntry[]
+  getResourceData: (_botId: string) => ResourceData | undefined
+  subscribe: (_event: string, _callback: (..._args: unknown[]) => void) => () => void
+}
+
+interface BotRunnerContextType extends BotRunnerConnectionContextType, BotRunnerDataContextType {}
+
+const BotRunnerConnectionContext = createContext<BotRunnerConnectionContextType | null>(null)
+const BotRunnerActionsContext = createContext<BotRunnerActionsContextType | null>(null)
+const BotRunnerDataContext = createContext<BotRunnerDataContextType | null>(null)
 const BotRunnerContext = createContext<BotRunnerContextType | null>(null)
+const BotStatusesContext = createContext<Map<string, BotRunnerStatus>>(new Map())
+const ResourceDataContext = createContext<Map<string, ResourceData>>(new Map())
+const DeployProgressContext = createContext<Map<string, DeployProgress>>(new Map())
+const BotLogsContext = createContext<Map<string, BotLogEntry[]>>(new Map())
 
 // ─── Provider ────────────────────────────────────────────────────────────
 
-const BOT_RUNNER_URL = (typeof window !== 'undefined' && window.__RUNNER_URL__) 
-  ? window.__RUNNER_URL__ 
+const BOT_RUNNER_URL = (typeof window !== 'undefined' && (window as unknown as Record<string, unknown>).__RUNNER_URL__)
+  ? String((window as unknown as Record<string, unknown>).__RUNNER_URL__)
   : (typeof window !== 'undefined' 
     ? `${window.location.protocol}//${window.location.hostname}:3001` 
     : `http://localhost:3001`)
@@ -114,12 +145,14 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
   const [connected, setConnected] = useState(false)
   const [reconnecting, setReconnecting] = useState(false)
   const [reconnectAttempt, setReconnectAttempt] = useState(0)
+  const [connectionError, setConnectionError] = useState<string | null>(null)
   const [botStatuses, setBotStatuses] = useState<Map<string, BotRunnerStatus>>(new Map())
   const [deployProgresses, setDeployProgresses] = useState<Map<string, DeployProgress>>(new Map())
   const [botLogs, setBotLogs] = useState<Map<string, BotLogEntry[]>>(new Map())
   const [resourceData, setResourceData] = useState<Map<string, ResourceData>>(new Map())
   const listenersRef = useRef<Map<string, Set<(..._args: unknown[]) => void>>>(new Map())
   const cancelledRef = useRef(false)
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const reconnectFnRef = useRef<() => void>(() => {})
   const deployClearTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
   // BUG FIX: Move timer refs to component level so they can be cleaned up
@@ -127,6 +160,7 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
   // causing memory leaks and duplicate API calls on reconnection.
   const logPersistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const LOG_BATCH_MAX_SIZE = 100
+  const MAX_BOTS_WITH_LOGS = 50
   const logPersistBatchRef = useRef<{ botId: string; level: string; message: string }[]>([])
   const statsRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const pendingStatsBotIdsRef = useRef<Set<string>>(new Set())
@@ -135,6 +169,13 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
   // disconnects), the UI would show a spinning "stopping" indicator forever.
   // This timer auto-resolves 'stopping' to 'stopped' after STOPPING_STATE_TIMEOUT_MS.
   const stoppingTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
+  const logSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const recentLogKeysRef = useRef<Set<string>>(new Set())
+  const messageBatchRef = useRef<Array<{ botId: string; userId: string; userName: string; text: string; command?: string }>>([])
+  const messageBatchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const MESSAGE_BATCH_MAX = 50
+  const flushLogBatchRef = useRef<() => void>(() => {})
+  const flushMessageBatchRef = useRef<() => void>(() => {})
 
   // Subscribe to custom events
   const subscribe = useCallback((event: string, callback: (..._args: unknown[]) => void) => {
@@ -177,21 +218,25 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
           if (!res.ok) {
             // Don't retry on auth failures (401) — wait for auth state change
             if (res.status === 401) return
-            // Handle rate limiting (429) — respect the retryAfter delay
             if (res.status === 429) {
               const data = await res.json().catch(() => ({ retryAfter: 15 }))
               const waitMs = (data.retryAfter || 15) * 1000
               console.warn(`[BotRunner] Rate limited, waiting ${waitMs / 1000}s before retry`)
               retryCount++
-              if (retryCount >= MAX_RETRIES) return
-              setTimeout(initSocket, waitMs)
+              if (retryCount >= MAX_RETRIES) {
+                setConnectionError('Unable to connect to bot runner service. Please check if the service is running.')
+                return
+              }
+              retryTimerRef.current = setTimeout(initSocket, waitMs)
               return
             }
-            // For other errors, fall through to retry logic
             retryCount++
-            if (retryCount >= MAX_RETRIES) return
+            if (retryCount >= MAX_RETRIES) {
+              setConnectionError('Unable to connect to bot runner service. Please check if the service is running.')
+              return
+            }
             const delay = Math.min(3000 * Math.pow(1.5, Math.floor(retryCount / 3)), 30000)
-            setTimeout(initSocket, delay)
+            retryTimerRef.current = setTimeout(initSocket, delay)
             return
           }
           const data = await res.json()
@@ -211,8 +256,8 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
           socketRef.current = null
         }
 
-        // Task 7 FIX: Set reconnectionAttempts to Infinity so Socket.IO never gives up.
-        // Keep reconnectionDelay and add reconnectionDelayMax for exponential backoff.
+        const { io } = await import('socket.io-client')
+
         const socket = io(BOT_RUNNER_URL, {
           transports: ['websocket', 'polling'],
           reconnection: true,
@@ -225,8 +270,9 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
 
         socket.on('connect', () => {
           setConnected(true)
-          setReconnecting(false) // Task 7: reset reconnecting state on connect
-          setReconnectAttempt(0) // Task 7: reset attempt counter on connect
+          setReconnecting(false)
+          setReconnectAttempt(0)
+          setConnectionError(null)
           retryCount = 0
         })
 
@@ -254,13 +300,32 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
         // Also invalidate cached token so we re-fetch on next attempt.
         socket.on('reconnect_failed', () => {
           console.warn('[BotRunner] Socket.IO reconnection failed — re-initializing in 30s')
-          cachedTokenRef.current = null  // Token may have changed, invalidate cache
+          cachedTokenRef.current = null
           setReconnecting(false)
-          setTimeout(() => {
+          socket.disconnect()
+          if (retryTimerRef.current) {
+            clearTimeout(retryTimerRef.current)
+          }
+          retryTimerRef.current = setTimeout(() => {
+            retryTimerRef.current = null
             if (!cancelledRef.current) {
               initSocket()
             }
           }, 30000)
+        })
+
+        socket.on('connect_error', (err) => {
+          const msg = err instanceof Error ? err.message : String(err)
+          if (msg.includes('token') || msg.includes('auth') || msg.includes('unauthorized') || msg.includes('forbidden') || msg.includes('401') || msg.includes('403')) {
+            console.warn('[BotRunner] Auth error on connect, refreshing token')
+            cachedTokenRef.current = null
+            socket.disconnect()
+            if (retryTimerRef.current) clearTimeout(retryTimerRef.current)
+            retryTimerRef.current = setTimeout(() => {
+              retryTimerRef.current = null
+              if (!cancelledRef.current) initSocket()
+            }, 2000)
+          }
         })
 
         socket.on('init', (data: { bots: BotRunnerStatus[] }) => {
@@ -306,22 +371,21 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
             }
           })
 
-          // BUG FIX: Prune stale entries from botLogs/botStatuses/resourceData Maps
-          // for bots that no longer exist in the store (e.g., deleted via REST API
-          // from another session). Without this, these Maps grow indefinitely.
           const currentBotIds = new Set(bots.map(b => b.id))
-          setBotLogs(prev => {
-            let changed = false
-            const next = new Map<string, BotLogEntry[]>()
-            for (const [id, logs] of prev) {
-              if (currentBotIds.has(id)) {
-                next.set(id, logs)
-              } else {
-                changed = true
-              }
+          if (logSyncTimerRef.current) {
+            clearTimeout(logSyncTimerRef.current)
+            logSyncTimerRef.current = null
+          }
+          let logsPruned = false
+          for (const id of [...botLogsRef.current.keys()]) {
+            if (!currentBotIds.has(id)) {
+              botLogsRef.current.delete(id)
+              logsPruned = true
             }
-            return changed ? next : prev
-          })
+          }
+          if (logsPruned) {
+            setBotLogs(new Map(botLogsRef.current))
+          }
         })
 
         socket.on('bot:status', (data: { botId: string; status: string; pid?: number; error?: string; exitCode?: number }) => {
@@ -450,7 +514,7 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
             }
 
             for (const [botId, logs] of byBotId) {
-              fetch(`/api/bots/${botId}/logs/batch`, {
+              authFetch(`/api/bots/${botId}/logs/batch`, {
                 method: 'POST',
                 headers,
                 body: JSON.stringify({ logs }),
@@ -460,23 +524,42 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
             // Ignore
           }
         }
+        flushLogBatchRef.current = flushLogBatch
 
         socket.on('bot:log', (data: BotLogEntry) => {
-          setBotLogs(prev => {
-            const next = new Map(prev)
-            const arr = [...(next.get(data.botId) || []), data].slice(-500)
-            next.set(data.botId, arr)
-            return next
-          })
+          const dedupKey = `${data.botId}:${data.timestamp}:${data.message}`
+          if (recentLogKeysRef.current.has(dedupKey)) return
+          recentLogKeysRef.current.add(dedupKey)
+          if (recentLogKeysRef.current.size > 2000) {
+            const entries = [...recentLogKeysRef.current]
+            recentLogKeysRef.current = new Set(entries.slice(-1000))
+          }
 
-          // FIX: Persist runner logs to BotLog table so stats (error count) work.
-          // Without this, only simulation/SSE logs are in BotLog — real runner errors are lost.
-          // Throttled to batch every 2s to avoid flooding the API on verbose bots.
+          const arr = botLogsRef.current.get(data.botId) || []
+          if (arr.length >= 200) arr.shift()
+          arr.push(data)
+          botLogsRef.current.set(data.botId, arr)
+
+          if (botLogsRef.current.size > MAX_BOTS_WITH_LOGS) {
+            const entries = [...botLogsRef.current.entries()]
+              .sort((a, b) => {
+                const aLast = a[1][a[1].length - 1]?.timestamp || ''
+                const bLast = b[1][b[1].length - 1]?.timestamp || ''
+                return aLast.localeCompare(bLast)
+              })
+            for (let i = 0; i < entries.length - MAX_BOTS_WITH_LOGS; i++) {
+              botLogsRef.current.delete(entries[i][0])
+            }
+          }
+
+          if (!logSyncTimerRef.current) {
+            logSyncTimerRef.current = setTimeout(() => {
+              logSyncTimerRef.current = null
+              setBotLogs(new Map(botLogsRef.current))
+            }, 500)
+          }
+
           logPersistBatchRef.current.push({ botId: data.botId, level: data.level, message: data.message })
-          // PERF FIX: If the batch exceeds max size, flush immediately instead of
-          // waiting for the timer. This prevents unbounded memory growth when the
-          // socket disconnects before the timer fires, or when a very verbose bot
-          // generates hundreds of log entries within the 2-second batch window.
           if (logPersistBatchRef.current.length >= LOG_BATCH_MAX_SIZE) {
             flushLogBatch()
           } else if (!logPersistTimerRef.current) {
@@ -486,37 +569,59 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
           listenersRef.current.get('bot:log')?.forEach(cb => cb(data as unknown))
         })
 
-        // FIX: Listen for bot:message events from the runner.
-        // When the runner detects a Telegram message/update from stdout patterns,
-        // it emits bot:message. We persist it to the BotMessage table via API
-        // so stats (messages, users, commands) show real data.
-        // Stats refresh is throttled to avoid excessive API calls.
-        // BUG FIX: Clear old stats timer from previous connection
         if (statsRefreshTimerRef.current) {
           clearTimeout(statsRefreshTimerRef.current)
           statsRefreshTimerRef.current = null
         }
         pendingStatsBotIdsRef.current.clear()
+        if (messageBatchTimerRef.current) {
+          clearTimeout(messageBatchTimerRef.current)
+          messageBatchTimerRef.current = null
+        }
+        messageBatchRef.current = []
 
-        socket.on('bot:message', (data: BotMessageEvent) => {
-          try {
-            const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-            fetch(`/api/bots/${data.botId}/messages`, {
-              method: 'POST',
-              headers,
-              credentials: 'include',
-              body: JSON.stringify({
-                userId: data.userId,
-                userName: data.userName,
-                text: data.text,
-                command: data.command,
-              }),
-            }).catch(() => { /* silently fail */ })
-          } catch {
-            // Ignore
+        function flushMessageBatch() {
+          if (messageBatchTimerRef.current) {
+            clearTimeout(messageBatchTimerRef.current)
+            messageBatchTimerRef.current = null
+          }
+          const batch = messageBatchRef.current.splice(0)
+          if (batch.length === 0) return
+
+          const byBot = new Map<string, typeof batch>()
+          for (const msg of batch) {
+            const arr = byBot.get(msg.botId) || []
+            arr.push(msg)
+            byBot.set(msg.botId, arr)
           }
 
-          // Throttled stats refresh — refresh at most once every 10 seconds per bot
+          for (const [botId, msgs] of byBot) {
+            authFetch(`/api/bots/${botId}/messages`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ messages: msgs }),
+            }).catch(err => {
+              console.warn(`Failed to persist ${msgs.length} messages for bot ${botId}:`, err)
+            })
+          }
+        }
+        flushMessageBatchRef.current = flushMessageBatch
+
+        socket.on('bot:message', (data: BotMessageEvent) => {
+          messageBatchRef.current.push({
+            botId: data.botId,
+            userId: data.userId,
+            userName: data.userName,
+            text: data.text,
+            command: data.command,
+          })
+
+          if (messageBatchRef.current.length >= MESSAGE_BATCH_MAX) {
+            flushMessageBatch()
+          } else if (!messageBatchTimerRef.current) {
+            messageBatchTimerRef.current = setTimeout(flushMessageBatch, 2000)
+          }
+
           pendingStatsBotIdsRef.current.add(data.botId)
           if (!statsRefreshTimerRef.current) {
             statsRefreshTimerRef.current = setTimeout(() => {
@@ -553,67 +658,58 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
         })
 
         socket.on('bot:logs', (data: { botId: string; logs: string[] }) => {
-          setBotLogs(prev => {
-            const next = new Map(prev)
-            const parsed = data.logs.map(l => {
-              try {
-                const parsed = JSON.parse(l)
-                // Ensure required fields have valid defaults
-                return {
-                  botId: data.botId,
-                  timestamp: parsed.timestamp || new Date().toISOString(),
-                  level: parsed.level || 'info',
-                  message: parsed.message || l,
-                }
-              } catch {
-                return { botId: data.botId, timestamp: new Date().toISOString(), level: 'info' as const, message: l }
+          if (logSyncTimerRef.current) {
+            clearTimeout(logSyncTimerRef.current)
+            logSyncTimerRef.current = null
+          }
+          const parsed = data.logs.map(l => {
+            try {
+              const parsed = JSON.parse(l)
+              return {
+                botId: data.botId,
+                timestamp: parsed.timestamp || new Date().toISOString(),
+                level: parsed.level || 'info',
+                message: parsed.message || l,
               }
-            })
-            next.set(data.botId, parsed)
-            return next
+            } catch {
+              return { botId: data.botId, timestamp: new Date().toISOString(), level: 'info' as const, message: l }
+            }
           })
+          botLogsRef.current.set(data.botId, parsed)
+          setBotLogs(new Map(botLogsRef.current))
         })
 
         socket.on('bot:deleted', (data: { botId: string }) => {
           setBotStatuses(prev => { const n = new Map(prev); n.delete(data.botId); return n })
-          setBotLogs(prev => { const n = new Map(prev); n.delete(data.botId); return n })
+          if (logSyncTimerRef.current) {
+            clearTimeout(logSyncTimerRef.current)
+            logSyncTimerRef.current = null
+          }
+          botLogsRef.current.delete(data.botId)
+          setBotLogs(new Map(botLogsRef.current))
           setDeployProgresses(prev => { const n = new Map(prev); n.delete(data.botId); return n })
           setResourceData(prev => { const n = new Map(prev); n.delete(data.botId); return n })
-          // Clean up stopping timer
           clearStoppingTimer(data.botId)
         })
 
         socket.on('resources:update', (data: Record<string, ResourceData>) => {
           setResourceData(prev => {
+            let changed = false
             const next = new Map(prev)
             for (const [botId, rd] of Object.entries(data)) {
-              next.set(botId, rd)
-            }
-            return next
-          })
-          // Sync uptime from runner resources to bot store stats
-          const { bots } = useBotStore.getState()
-          for (const [botId, rd] of Object.entries(data)) {
-            if (rd.uptime && rd.uptime > 0) {
-              const bot = bots.find(b => b.id === botId)
-              if (bot && bot.stats.uptime !== Math.floor(rd.uptime / 60)) {
-                useBotStore.setState((state) => ({
-                  bots: state.bots.map(b =>
-                    b.id === botId
-                      ? { ...b, stats: { ...b.stats, uptime: Math.floor(rd.uptime! / 60) } }
-                      : b
-                  ),
-                }))
+              const existing = prev.get(botId)
+              if (!existing || existing.cpuUsage !== rd.cpuUsage || existing.memoryUsageMb !== rd.memoryUsageMb || existing.status !== rd.status || existing.uptime !== rd.uptime) {
+                next.set(botId, rd)
+                changed = true
               }
             }
-          }
+            return changed ? next : prev
+          })
           listenersRef.current.get('resources:update')?.forEach(cb => cb(data as unknown))
         })
 
         socketRef.current = socket
       } catch {
-        // Failed to fetch token — retry with backoff
-        // Auto-start bot-runner service if not reachable (fire-and-forget, only once)
         if (retryCount === 0) {
           fetch('/api/bots/runner/start-service', {
             method: 'POST',
@@ -623,19 +719,21 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
         retryCount++
         if (!cancelledRef.current && retryCount < MAX_RETRIES) {
           const delay = Math.min(3000 * Math.pow(1.5, Math.floor(retryCount / 3)), 30000)
-          setTimeout(initSocket, delay)
+          retryTimerRef.current = setTimeout(initSocket, delay)
+        } else if (retryCount >= MAX_RETRIES) {
+          setConnectionError('Unable to connect to bot runner service. Please check if the service is running.')
         }
       }
     }
 
     // Store the reconnect function in a ref so it can be called externally
     reconnectFnRef.current = () => {
-      // Disconnect existing socket before reconnecting
       if (socketRef.current) {
         socketRef.current.disconnect()
         socketRef.current = null
       }
       retryCount = 0
+      setConnectionError(null)
       initSocket()
     }
 
@@ -649,15 +747,33 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
     return () => {
       cancelledRef.current = true
       socketRef.current?.disconnect()
+      if (retryTimerRef.current) {
+        clearTimeout(retryTimerRef.current)
+        retryTimerRef.current = null
+      }
       // BUG FIX: Clean up all timers on unmount
       if (logPersistTimerRef.current) {
         clearTimeout(logPersistTimerRef.current)
         logPersistTimerRef.current = null
       }
-      logPersistBatchRef.current = []
+      if (logPersistBatchRef.current.length > 0) {
+        flushLogBatchRef.current()
+      }
+      if (logSyncTimerRef.current) {
+        clearTimeout(logSyncTimerRef.current)
+        logSyncTimerRef.current = null
+      }
+      recentLogKeysRef.current = new Set()
       if (statsRefreshTimerRef.current) {
         clearTimeout(statsRefreshTimerRef.current)
         statsRefreshTimerRef.current = null
+      }
+      if (messageBatchTimerRef.current) {
+        clearTimeout(messageBatchTimerRef.current)
+        messageBatchTimerRef.current = null
+      }
+      if (messageBatchRef.current.length > 0) {
+        flushMessageBatchRef.current()
       }
       deployClearTimersRef.current.forEach((timer) => clearTimeout(timer))
       deployClearTimersRef.current.clear()
@@ -678,15 +794,46 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
       reconnectFnRef.current()
     } else {
       cachedTokenRef.current = null
+      if (retryTimerRef.current) {
+        clearTimeout(retryTimerRef.current)
+        retryTimerRef.current = null
+      }
       socketRef.current?.disconnect()
       socketRef.current = null
       setConnected(false)
       setBotStatuses(new Map())
       setDeployProgresses(new Map())
+      if (logSyncTimerRef.current) {
+        clearTimeout(logSyncTimerRef.current)
+        logSyncTimerRef.current = null
+      }
+      recentLogKeysRef.current = new Set()
+      botLogsRef.current = new Map()
       setBotLogs(new Map())
+      if (messageBatchTimerRef.current) {
+        clearTimeout(messageBatchTimerRef.current)
+        messageBatchTimerRef.current = null
+      }
+      if (messageBatchRef.current.length > 0) {
+        flushMessageBatchRef.current()
+      }
       setResourceData(new Map())
       stoppingTimersRef.current.forEach((timer) => clearTimeout(timer))
       stoppingTimersRef.current.clear()
+      if (statsRefreshTimerRef.current) {
+        clearTimeout(statsRefreshTimerRef.current)
+        statsRefreshTimerRef.current = null
+      }
+      pendingStatsBotIdsRef.current.clear()
+      if (logPersistTimerRef.current) {
+        clearTimeout(logPersistTimerRef.current)
+        logPersistTimerRef.current = null
+      }
+      if (logPersistBatchRef.current.length > 0) {
+        flushLogBatchRef.current()
+      }
+      deployClearTimersRef.current.forEach((timer) => clearTimeout(timer))
+      deployClearTimersRef.current.clear()
     }
   }, [isAuthenticated])
 
@@ -695,12 +842,26 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
     reconnectFnRef.current()
   }, [])
 
-  const deployBot = useCallback((config: DeployConfig) => {
-    socketRef.current?.emit('bot:deploy', config)
+  const deployBot = useCallback((config: DeployConfig): boolean => {
+    if (!socketRef.current || !socketRef.current.connected) {
+      console.warn('[BotRunner] Cannot deploy: socket not connected')
+      import('sonner').then(({ toast }) => {
+        const { locale } = useI18nStore.getState()
+        const t = (key: TranslationKey) => getTranslation(locale, key)
+        toast.error(t('botRunner.notConnected'))
+      }).catch(() => {})
+      return false
+    }
+    socketRef.current.emit('bot:deploy', config)
+    return true
   }, [])
 
   const stopBot = useCallback((botId: string) => {
-    socketRef.current?.emit('bot:stop', { botId })
+    if (!socketRef.current) {
+      console.warn('[BotRunner] Cannot stop: socket not connected')
+      return
+    }
+    socketRef.current.emit('bot:stop', { botId })
   }, [])
 
   const startBot = useCallback((botId: string) => {
@@ -719,35 +880,89 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
     socketRef.current?.emit('bot:logs', { botId })
   }, [])
 
-  const getBotStatus = useCallback((botId: string) => botStatuses.get(botId), [botStatuses])
-  const getDeployProgress = useCallback((botId: string) => deployProgresses.get(botId), [deployProgresses])
-  const getBotLogs = useCallback((botId: string) => botLogs.get(botId) || [], [botLogs])
-  const getResourceData = useCallback((botId: string) => resourceData.get(botId), [resourceData])
+  const botStatusesRef = useRef(botStatuses)
+  botStatusesRef.current = botStatuses
+  const deployProgressesRef = useRef(deployProgresses)
+  deployProgressesRef.current = deployProgresses
+  const botLogsRef = useRef<Map<string, BotLogEntry[]>>(new Map())
+  // REACT-102: botLogsRef mirrors the botLogs state for direct mutation without
+  // triggering re-renders. To maintain consistency, ALWAYS update botLogsRef.current
+  // BEFORE calling setBotLogs(). This ensures that any synchronous read from the ref
+  // (e.g. getBotLogs) sees the latest data before React batches the state update.
+  const resourceDataRef = useRef(resourceData)
+  resourceDataRef.current = resourceData
+
+  const getBotStatus = useCallback((botId: string) => botStatusesRef.current.get(botId), [])
+  const getDeployProgress = useCallback((botId: string) => deployProgressesRef.current.get(botId), [])
+  const getBotLogs = useCallback((botId: string) => botLogsRef.current.get(botId) || [], [])
+  const getResourceData = useCallback((botId: string) => resourceDataRef.current.get(botId), [])
+
+  const actionsValue = useMemo<BotRunnerActionsContextType>(() => ({
+    deployBot,
+    stopBot,
+    startBot,
+    restartBot,
+    deleteBot,
+    requestLogs,
+    getBotStatus,
+    getDeployProgress,
+    getBotLogs,
+    getResourceData,
+    subscribe,
+  }), [deployBot, stopBot, startBot, restartBot, deleteBot, requestLogs,
+    getBotStatus, getDeployProgress, getBotLogs, getResourceData, subscribe])
+
+  const connectionValue = useMemo<BotRunnerConnectionContextType>(() => ({
+    connected,
+    reconnecting,
+    reconnectAttempt,
+    connectionError,
+    reconnect,
+  }), [connected, reconnecting, reconnectAttempt, connectionError, reconnect])
+
+  const dataValue = useMemo<BotRunnerDataContextType>(() => ({
+    botStatuses,
+    deployProgresses,
+    botLogs,
+    resourceData,
+    deployBot,
+    stopBot,
+    startBot,
+    restartBot,
+    deleteBot,
+    requestLogs,
+    getBotStatus,
+    getDeployProgress,
+    getBotLogs,
+    getResourceData,
+    subscribe,
+  }), [botStatuses, deployProgresses, botLogs, resourceData,
+    deployBot, stopBot, startBot, restartBot, deleteBot, requestLogs,
+    getBotStatus, getDeployProgress, getBotLogs, getResourceData, subscribe])
+
+  const combinedValue = useMemo<BotRunnerContextType>(() => ({
+    ...connectionValue,
+    ...dataValue,
+  }), [connectionValue, dataValue])
 
   return (
-    <BotRunnerContext.Provider value={{
-      connected,
-      reconnecting,
-      reconnectAttempt,
-      botStatuses,
-      deployProgresses,
-      botLogs,
-      resourceData,
-      deployBot,
-      stopBot,
-      startBot,
-      restartBot,
-      deleteBot,
-      requestLogs,
-      getBotStatus,
-      getDeployProgress,
-      getBotLogs,
-      getResourceData,
-      subscribe,
-      reconnect,
-    }}>
-      {children}
-    </BotRunnerContext.Provider>
+    <BotRunnerActionsContext.Provider value={actionsValue}>
+      <BotRunnerConnectionContext.Provider value={connectionValue}>
+        <BotStatusesContext.Provider value={botStatuses}>
+          <ResourceDataContext.Provider value={resourceData}>
+            <DeployProgressContext.Provider value={deployProgresses}>
+              <BotLogsContext.Provider value={botLogs}>
+                <BotRunnerDataContext.Provider value={dataValue}>
+                  <BotRunnerContext.Provider value={combinedValue}>
+                    {children}
+                  </BotRunnerContext.Provider>
+                </BotRunnerDataContext.Provider>
+              </BotLogsContext.Provider>
+            </DeployProgressContext.Provider>
+          </ResourceDataContext.Provider>
+        </BotStatusesContext.Provider>
+      </BotRunnerConnectionContext.Provider>
+    </BotRunnerActionsContext.Provider>
   )
 }
 
@@ -757,4 +972,38 @@ export function useBotRunner() {
   const ctx = useContext(BotRunnerContext)
   if (!ctx) throw new Error('useBotRunner must be used within BotRunnerProvider')
   return ctx
+}
+
+export function useBotRunnerConnection() {
+  const ctx = useContext(BotRunnerConnectionContext)
+  if (!ctx) throw new Error('useBotRunnerConnection must be used within BotRunnerProvider')
+  return ctx
+}
+
+export function useBotRunnerActions() {
+  const ctx = useContext(BotRunnerActionsContext)
+  if (!ctx) throw new Error('useBotRunnerActions must be used within BotRunnerProvider')
+  return ctx
+}
+
+export function useBotRunnerData() {
+  const ctx = useContext(BotRunnerDataContext)
+  if (!ctx) throw new Error('useBotRunnerData must be used within BotRunnerProvider')
+  return ctx
+}
+
+export function useBotStatuses() {
+  return useContext(BotStatusesContext)
+}
+
+export function useResourceData() {
+  return useContext(ResourceDataContext)
+}
+
+export function useDeployProgress() {
+  return useContext(DeployProgressContext)
+}
+
+export function useBotLogs() {
+  return useContext(BotLogsContext)
 }

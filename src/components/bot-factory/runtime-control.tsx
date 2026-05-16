@@ -6,11 +6,12 @@ import { Play, Square, RotateCcw, WifiOff, AlertTriangle, Rocket, Info, Loader2,
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent } from '@/components/ui/card'
-import { cn, isValidBotToken } from '@/lib/utils'
-import { useBotRunner } from '@/lib/bot-runner-context'
+import { cn, isValidBotToken, formatUptimeShort } from '@/lib/utils'
+import { useBotRunnerConnection, useBotRunnerActions } from '@/lib/bot-runner-context'
 import { useBotStore } from '@/store/bot-store'
 import { useT } from '@/lib/i18n'
 import { toast } from 'sonner'
+import { fetchRevealEnvVars, hasMaskedEnvVars, buildEnvVarsFallback, buildDeployConfig } from '@/lib/deploy-utils'
 
 // ─── Runtime Control Panel (Compact Design) ────────────────────────────────────
 
@@ -21,12 +22,15 @@ export function RuntimeControl({ botId, botName, botLanguage, botTemplate }: { b
     connected,
     reconnecting,
     reconnectAttempt,
+  } = useBotRunnerConnection()
+
+  const {
     getBotStatus,
     getDeployProgress,
     deployBot,
     stopBot,
     restartBot,
-  } = useBotRunner()
+  } = useBotRunnerActions()
 
   const bot = useBotStore((s) => s.bots.find((b) => b.id === botId))
   const [mounted, setMounted] = useState(false)
@@ -44,8 +48,6 @@ export function RuntimeControl({ botId, botName, botLanguage, botTemplate }: { b
       }
     }
   }, [localPending])
-
-  const botRunnerStatus = getBotStatus(botId)?.status
 
   // Read bot token from envVars — support both BOT_TOKEN and TELEGRAM_BOT_TOKEN
   const tokenEntry = bot?.envVars.filter((v) => (v.key === 'BOT_TOKEN' || v.key === 'TELEGRAM_BOT_TOKEN') && v.value.trim()).slice(-1)[0]
@@ -101,9 +103,6 @@ export function RuntimeControl({ botId, botName, botLanguage, botTemplate }: { b
     }
     setLocalPending('starting')
 
-    // BUG FIX: Fetch full bot detail before deploying to ensure we have
-    // projectFiles, codeBlocks, and other heavy fields not included in the
-    // list API. Without this, multi-file bots deploy with empty projectFiles.
     try {
       await useBotStore.getState().fetchBotDetail(botId)
     } catch {
@@ -113,66 +112,34 @@ export function RuntimeControl({ botId, botName, botLanguage, botTemplate }: { b
     }
     const freshBot = useBotStore.getState().bots.find((b) => b.id === botId)
 
-    // FIX: Fetch decrypted env vars from the reveal API before deploying.
-    // The store only has masked values (••••••••••••) for encrypted secrets.
-    // Without this, the runner receives the placeholder instead of the real token.
     let realEnvVarsMap: Record<string, string> = {}
     let realBotToken = botToken
-    try {
-      const res = await fetch(`/api/bots/${botId}/env-vars/reveal`, { credentials: 'include' })
-      if (res.ok) {
-        const data = await res.json()
-        for (const v of data.envVars || []) {
-          realEnvVarsMap[v.key] = v.value
-        }
-        const realTokenEntry = [realEnvVarsMap.BOT_TOKEN, realEnvVarsMap.TELEGRAM_BOT_TOKEN].filter(Boolean).slice(-1)[0]
-        if (realTokenEntry) realBotToken = realTokenEntry
-      } else {
-        // Reveal API failed — check if we have encrypted vars with masked values
-        // Use freshBot (full data from fetchBotDetail) instead of potentially-stale bot
-        const envSource = freshBot || bot
-        const hasMaskedVars = envSource?.envVars.some(v => v.isEncrypted && v.value.includes('•'))
-        if (hasMaskedVars) {
-          toast.error(t('runtime.envRevealFailed'))
-          setLocalPending(null)
-          return
-        }
-        // Fallback: use store values (safe for non-encrypted vars)
-        envSource?.envVars.forEach((v) => { realEnvVarsMap[v.key] = v.value })
-      }
-    } catch {
-      // Network error — check if we have encrypted vars with masked values
+
+    const revealed = await fetchRevealEnvVars(botId)
+    if (revealed) {
+      realEnvVarsMap = revealed.envVarsMap
+      realBotToken = revealed.botToken
+    } else {
       const envSource = freshBot || bot
-      const hasMaskedVars = envSource?.envVars.some(v => v.isEncrypted && v.value.includes('•'))
-      if (hasMaskedVars) {
+      if (hasMaskedEnvVars(envSource?.envVars || [])) {
         toast.error(t('runtime.envRevealFailed'))
         setLocalPending(null)
         return
       }
-      // Fallback: use store values (safe for non-encrypted vars)
-      ;(freshBot || bot)?.envVars.forEach((v) => { realEnvVarsMap[v.key] = v.value })
+      realEnvVarsMap = buildEnvVarsFallback(envSource?.envVars || [])
     }
 
-    // Use freshBot (fetched with full data) over bot (may be partial from list API)
     const deployBot_ = freshBot || bot
-    const depsList = (deployBot_?.dependencies || []).map(d => d.version ? `${d.name}@${d.version}` : d.name)
-
-    deployBot({
-      botId,
-      config: {
-        name: botName || '',
-        botToken: realBotToken,
-        language: (botLanguage || 'javascript') as 'javascript' | 'typescript' | 'python',
-        templateId: botTemplate || 'custom',
-        envVars: realEnvVarsMap,
-        customCode: deployBot_?.projectFiles?.length ? undefined : (deployBot_?.codeBlocks?.filter(b => b.isActive !== false).map(b => b.code).join('\n\n') || deployBot_?.code || undefined),
-        dependencies: depsList.length > 0 ? depsList : undefined,
-        projectFiles: deployBot_?.projectFiles?.length
-          ? deployBot_.projectFiles.map((f) => ({ path: f.path, content: f.content }))
-          : undefined,
-        entryPoint: deployBot_?.entryPoint || undefined,
-      },
-    })
+    if (!deployBot_) {
+      toast.error(t('runtime.serviceNotConnected'))
+      setLocalPending(null)
+      return
+    }
+    const deploySuccess = deployBot(buildDeployConfig(botId, deployBot_, realEnvVarsMap, realBotToken))
+    if (!deploySuccess) {
+      // Socket was not connected — reset localPending to avoid 30s stuck state
+      setLocalPending(null)
+    }
   }
 
   const handleStop = () => {
@@ -191,8 +158,10 @@ export function RuntimeControl({ botId, botName, botLanguage, botTemplate }: { b
   const isDeployError = progress && progress.stage === 'error'
   const showProgressBar = isDeploying || isDeployCompleting || isDeployError
   const isRunning = status?.status === 'running'
+  const isStarting = status?.status === 'starting'
   const isStopping = status?.status === 'stopping'
-  const isStopped = status?.status === 'stopped' || !status
+  const isStopped = status?.status === 'stopped'
+  const isNotDeployed = !status  // bot never deployed — runner has no record of it
   const isError = status?.status === 'error'
 
   // Check if code was modified after the last deploy
@@ -229,7 +198,7 @@ export function RuntimeControl({ botId, botName, botLanguage, botTemplate }: { b
             {connected && isRunning && <span className="absolute inset-0 rounded-full bg-emerald-500 animate-ping opacity-50" />}
             <span className={cn(
               'relative rounded-full size-2',
-              connected && (isRunning || isStopping) ? (isStopping ? 'bg-amber-500' : 'bg-emerald-500') :
+              connected && (isRunning || isStopping || isStarting) ? (isStopping ? 'bg-amber-500' : isStarting ? 'bg-blue-500' : 'bg-emerald-500') :
               connected && isStopped ? 'bg-amber-500' :
               connected ? 'bg-emerald-500' :
               reconnecting ? 'bg-amber-500' : 'bg-red-500'
@@ -241,10 +210,12 @@ export function RuntimeControl({ botId, botName, botLanguage, botTemplate }: { b
             {!connected && !reconnecting && t('runtime.disconnectedCompact')}
             {connected && isDeploying && t('runtime.deploying')}
             {connected && !isDeploying && isDeployCompleting && t('runtime.stageRunning')}
-            {connected && !isDeploying && !isDeployCompleting && isStopping && t('runtime.stopping')}
-            {connected && !isDeploying && !isDeployCompleting && !isStopping && isRunning && t('runtime.connectedCompact')}
-            {connected && !isDeploying && !isDeployCompleting && !isStopping && !isRunning && isStopped && t('runtime.stopped')}
-            {connected && !isDeploying && !isDeployCompleting && !isStopping && !isRunning && isError && t('runtime.error')}
+            {connected && !isDeploying && !isDeployCompleting && isStarting && t('runtime.startingCompact')}
+            {connected && !isDeploying && !isDeployCompleting && !isStarting && isStopping && t('runtime.stopping')}
+            {connected && !isDeploying && !isDeployCompleting && !isStarting && !isStopping && isRunning && t('runtime.connectedCompact')}
+            {connected && !isDeploying && !isDeployCompleting && !isStarting && !isStopping && !isRunning && isStopped && t('runtime.stopped')}
+            {connected && !isDeploying && !isDeployCompleting && !isStarting && !isStopping && !isRunning && isNotDeployed && t('runtime.notDeployed')}
+            {connected && !isDeploying && !isDeployCompleting && !isStarting && !isStopping && !isRunning && isError && t('runtime.error')}
           </span>
           {/* PID / Uptime when running */}
           {isRunning && (
@@ -298,7 +269,7 @@ export function RuntimeControl({ botId, botName, botLanguage, botTemplate }: { b
               <span className="hidden sm:inline">{t('runtime.startServiceNow')}</span>
             </Button>
           )}
-          {connected && (isStopped || isError) && (
+          {connected && (isStopped || isError || isNotDeployed) && (
             <Button
               size="sm"
               className={cn("text-[11px] h-7 gap-1 px-2.5 text-white", showStarting ? 'bg-blue-500' : 'bg-emerald-600 hover:bg-emerald-700')}
@@ -309,7 +280,7 @@ export function RuntimeControl({ botId, botName, botLanguage, botTemplate }: { b
               {showStarting ? t('runtime.starting') : t('runtime.deployAndStartShort')}
             </Button>
           )}
-          {connected && (isRunning || isStopping) && (
+          {connected && (isRunning || isStopping || isStarting) && (
             <Button
               size="sm"
               variant="outline"
@@ -513,12 +484,12 @@ export function RuntimeControl({ botId, botName, botLanguage, botTemplate }: { b
               )}
 
               {/* Runtime Info Grid */}
-              {status && (isRunning || isStopped) && (
+              {status && (isRunning || isStopped || isStarting || isStopping || isError) && (
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
                   <div className="rounded-md bg-muted/30 p-2">
                     <div className="text-muted-foreground">{t('runtime.status')}</div>
                     <div className="font-medium mt-0.5">
-                      {status.status === 'running' ? t('runtime.runningIndicator') : status.status === 'error' ? t('runtime.errorIndicator') : t('runtime.stoppedIndicator')}
+                      {status.status === 'running' ? t('runtime.runningIndicator') : status.status === 'error' ? t('runtime.errorIndicator') : status.status === 'starting' ? t('runtime.startingCompact') : status.status === 'stopping' ? t('runtime.stopping') : t('runtime.stoppedIndicator')}
                     </div>
                   </div>
                   <div className="rounded-md bg-muted/30 p-2">
@@ -568,33 +539,15 @@ function renderTokenBadge(serverTokenStatus: string | undefined, botToken: strin
   return <Badge variant="outline" className="text-[10px] h-5 bg-zinc-50 text-zinc-500 border-zinc-200 dark:bg-zinc-800 dark:text-zinc-400 dark:border-zinc-700">{t('runtime.tokenNotSet')}</Badge>
 }
 
-function formatUptime(ms: number): string {
-  const seconds = Math.floor(ms / 1000)
-  const minutes = Math.floor(seconds / 60)
-  const hours = Math.floor(minutes / 60)
-  const days = Math.floor(hours / 24)
-  if (days > 0) return `${days}d ${hours % 24}h`
-  if (hours > 0) return `${hours}h ${minutes % 60}m`
-  if (minutes > 0) return `${minutes}m`
-  return `${seconds}s`
-}
-
 function UptimeDisplay({ startedAt }: { startedAt: string }) {
-  const [display, setDisplay] = useState(() => formatUptime(Date.now() - new Date(startedAt).getTime()))
-  const rafRef = useRef<number>(0)
-  const lastUpdateRef = useRef(0)
+  const [display, setDisplay] = useState(() => formatUptimeShort(Math.floor((Date.now() - new Date(startedAt).getTime()) / 1000)))
 
   useEffect(() => {
     const startMs = new Date(startedAt).getTime()
-    const tick = (now: number) => {
-      if (now - lastUpdateRef.current >= 1000) {
-        lastUpdateRef.current = now
-        setDisplay(formatUptime(Date.now() - startMs))
-      }
-      rafRef.current = requestAnimationFrame(tick)
-    }
-    rafRef.current = requestAnimationFrame(tick)
-    return () => cancelAnimationFrame(rafRef.current)
+    const timer = setInterval(() => {
+      setDisplay(formatUptimeShort(Math.floor((Date.now() - startMs) / 1000)))
+    }, 1000)
+    return () => clearInterval(timer)
   }, [startedAt])
 
   return <>{display}</>

@@ -26,6 +26,7 @@ import {
 } from '@/components/ui/table'
 import { useBotStore } from '@/store/bot-store'
 import { useT } from '@/lib/i18n'
+import { ConfirmDialog } from '@/components/bot-factory/confirm-dialog'
 
 export function DependenciesTab() {
   const selectedBotId = useBotStore((s) => s.selectedBotId)
@@ -45,6 +46,10 @@ export function DependenciesTab() {
   const [editVersion, setEditVersion] = useState('')
   const [editDesc, setEditDesc] = useState('')
   const [editRequired, setEditRequired] = useState(true)
+
+  const [confirmOpen, setConfirmOpen] = useState(false)
+  const [pendingRemove, setPendingRemove] = useState<string | null>(null)
+  const [pendingRemoveName, setPendingRemoveName] = useState('')
 
   const t = useT()
   const editNameRef = useRef<HTMLInputElement>(null)
@@ -122,9 +127,20 @@ export function DependenciesTab() {
     setDialogOpen(false)
   }
 
-  const handleRemove = (depId: string, depName: string) => {
-    removeDependency(bot.id, depId)
-    toast.success(t('depsTab.removed', { name: depName }))
+  const handleRemoveClick = (depId: string, depName: string) => {
+    setPendingRemove(depId)
+    setPendingRemoveName(depName)
+    setConfirmOpen(true)
+  }
+
+  const handleConfirmRemove = () => {
+    if (pendingRemove) {
+      removeDependency(bot.id, pendingRemove)
+      toast.success(t('depsTab.removed', { name: pendingRemoveName }))
+    }
+    setConfirmOpen(false)
+    setPendingRemove(null)
+    setPendingRemoveName('')
   }
 
   const startInlineEdit = (depId: string) => {
@@ -326,7 +342,7 @@ export function DependenciesTab() {
                               variant="ghost"
                               size="icon"
                               className="size-7 text-muted-foreground hover:text-destructive"
-                              onClick={() => handleRemove(dep.id, dep.name)}
+                              onClick={() => handleRemoveClick(dep.id, dep.name)}
                               aria-label={t('depsTab.removeItem', { name: dep.name })}
                             >
                               <Trash2 className="size-3.5" />
@@ -408,6 +424,16 @@ export function DependenciesTab() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <ConfirmDialog
+        open={confirmOpen}
+        onOpenChange={setConfirmOpen}
+        title={t('depsTab.removeConfirmTitle')}
+        description={t('depsTab.removeConfirmDesc', { name: pendingRemoveName })}
+        confirmText={t('common.delete')}
+        variant="destructive"
+        onConfirm={handleConfirmRemove}
+      />
     </div>
   )
 }

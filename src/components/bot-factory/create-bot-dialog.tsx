@@ -286,8 +286,12 @@ function ProjectFileTree({
 // ─── Main Component ─────────────────────────────────────────────────────────
 
 export function CreateBotDialog() {
-  const { createBotDialogOpen, createBotDialogMode, setCreateBotDialogOpen, addBot } = useBotStore()
+  const createBotDialogOpen = useBotStore(s => s.createBotDialogOpen)
+  const createBotDialogMode = useBotStore(s => s.createBotDialogMode)
+  const setCreateBotDialogOpen = useBotStore(s => s.setCreateBotDialogOpen)
+  const addBot = useBotStore(s => s.addBot)
   const [activeTab, setActiveTab] = useState<'create' | 'import' | 'git'>('create')
+  const [isCreating, setIsCreating] = useState(false)
   const t = useT()
 
   // ── Sync external mode changes ──────────────────────────────────────────
@@ -708,11 +712,13 @@ export function CreateBotDialog() {
 
   // ── Create action ───────────────────────────────────────────────────────
   function handleCreate() {
+    if (isCreating) return
     const newErrors: { name?: string } = {}
     if (!name.trim()) newErrors.name = t('createBot.nameRequired')
     setErrors(newErrors)
     if (Object.keys(newErrors).length > 0) return
 
+    setIsCreating(true)
     const botName = name.trim()
     try {
       addBot({
@@ -725,10 +731,12 @@ export function CreateBotDialog() {
       })
     } catch {
       toast.error(t('createBot.createFailed'))
+      setIsCreating(false)
       return
     }
 
     toast.success(t('createBot.created', { name: botName }), { description: t('createBot.createdDesc') })
+    setIsCreating(false)
     // Capture the createdAt timestamp before resetAll clears the name
     const createdAt = new Date().toISOString()
     resetAll()
@@ -895,13 +903,14 @@ export function CreateBotDialog() {
       if (navPollRef.current) clearInterval(navPollRef.current)
       navPollRef.current = setInterval(() => {
         attempts++
-        const bot = useBotStore.getState().bots.find(b =>
+        const store = useBotStore.getState()
+        const bot = store.bots.find(b =>
           b.name === importedName && Math.abs(new Date(b.createdAt).getTime() - new Date(importedAt).getTime()) < 2000
         )
-        if (bot) {
+        if (bot && store.isBotPersisted(bot.id)) {
           if (navPollRef.current) clearInterval(navPollRef.current)
           navPollRef.current = null
-          useBotStore.getState().setSelectedBotId(bot.id)
+          store.setSelectedBotId(bot.id)
           setTimeout(() => {
             const runtimeEl = document.getElementById('runtime-control')
             if (runtimeEl) runtimeEl.scrollIntoView({ behavior: 'smooth', block: 'center' })
@@ -1475,8 +1484,10 @@ export function CreateBotDialog() {
           {activeTab === 'create' ? (
             <Button
               onClick={handleCreate}
+              disabled={isCreating}
               className="gap-1.5 bg-gradient-to-r from-cyan-600 to-blue-600 shadow-md shadow-cyan-500/25 hover:from-cyan-700 hover:to-blue-700"
             >
+              {isCreating && <Loader2 className="size-4 animate-spin" />}
               {t('createBot.createButton')}
             </Button>
           ) : (

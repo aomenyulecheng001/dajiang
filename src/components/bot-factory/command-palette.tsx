@@ -37,16 +37,14 @@ export function CommandPalette() {
   const t = useT()
   const { theme, setTheme } = useTheme()
 
-  const {
-    bots,
-    setSelectedBotId,
-    selectedBotId,
-    setCreateBotDialogOpen,
-    setCreateBotDialogMode,
-    viewMode,
-    setViewMode,
-    setStatusFilter,
-  } = useBotStore()
+  const bots = useBotStore(s => s.bots)
+  const setSelectedBotId = useBotStore(s => s.setSelectedBotId)
+  const selectedBotId = useBotStore(s => s.selectedBotId)
+  const setCreateBotDialogOpen = useBotStore(s => s.setCreateBotDialogOpen)
+  const setCreateBotDialogMode = useBotStore(s => s.setCreateBotDialogMode)
+  const viewMode = useBotStore(s => s.viewMode)
+  const setViewMode = useBotStore(s => s.setViewMode)
+  const setStatusFilter = useBotStore(s => s.setStatusFilter)
 
   // Handle dialog open/close
   const handleOpenChange = useCallback((newOpen: boolean) => {

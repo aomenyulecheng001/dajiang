@@ -12,7 +12,7 @@
  */
 import { db } from '@/lib/db'
 import { NextResponse } from 'next/server'
-import { safeJsonParse } from '@/lib/api-helpers'
+import { safeJsonParse, getCurrentUserId } from '@/lib/api-helpers'
 import { validateBotId } from '@/lib/validation'
 import { decryptEnvVarsAsync } from '@/lib/crypto'
 
@@ -22,17 +22,17 @@ const revealRateMap = new Map<string, { count: number; resetAt: number }>()
 // Cleanup expired entries every 5 minutes to prevent unbounded memory growth
 const _revealCleanupTimer = setInterval(() => {
   const now = Date.now()
-  for (const [ip, entry] of revealRateMap) {
-    if (now > entry.resetAt) revealRateMap.delete(ip)
+  for (const [userId, entry] of revealRateMap) {
+    if (now > entry.resetAt) revealRateMap.delete(userId)
   }
 }, 5 * 60 * 1000)
 if (_revealCleanupTimer.unref) _revealCleanupTimer.unref()
 
-function checkRevealLimit(ip: string): boolean {
+function checkRevealLimit(key: string): boolean {
   const now = Date.now()
-  const entry = revealRateMap.get(ip)
+  const entry = revealRateMap.get(key)
   if (!entry || now > entry.resetAt) {
-    revealRateMap.set(ip, { count: 1, resetAt: now + REVEAL_RATE_LIMIT.windowMs })
+    revealRateMap.set(key, { count: 1, resetAt: now + REVEAL_RATE_LIMIT.windowMs })
     return true
   }
   if (entry.count >= REVEAL_RATE_LIMIT.max) return false
@@ -48,10 +48,11 @@ export async function GET(
   try {
     // SEC FIX: Strict rate limiting on the reveal endpoint.
     // This endpoint returns plaintext secrets — must be more restrictive than normal APIs.
-    const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
-      || request.headers.get('x-real-ip')
-      || 'unknown'
-    if (!checkRevealLimit(ip)) {
+    const userId = await getCurrentUserId(request)
+    if (!userId) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+    if (!checkRevealLimit(userId)) {
       return NextResponse.json(
         { error: 'Too many requests. Please try again later.' },
         { status: 429, headers: { 'Retry-After': '60' } },
@@ -64,6 +65,11 @@ export async function GET(
     const idErrors = validateBotId(id)
     if (idErrors.length > 0) {
       return NextResponse.json({ error: idErrors[0].message }, { status: 400 })
+    }
+
+    const ownershipBot = await db.bot.findUnique({ where: { id }, select: { ownerId: true } })
+    if (!ownershipBot || ownershipBot.ownerId !== userId) {
+      return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
 
     const bot = await db.bot.findUnique({

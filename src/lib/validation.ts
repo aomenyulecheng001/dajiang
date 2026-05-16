@@ -92,6 +92,13 @@ export function validateBotId(id: unknown): ValidationError[] {
   if (id.length > 100) {
     errors.push(err('id', 'Bot ID must be 100 characters or less'))
   }
+  // SECURITY FIX (SEC-77): Reject path traversal patterns.
+  // botId is used in file paths (e.g., rm() in DELETE handler), so '..' would
+  // cause path.join() to traverse up and delete unintended directories.
+  // Also reject IDs starting with '.' to prevent hidden file interactions.
+  if (id === '..' || id.includes('..') || id.startsWith('.')) {
+    errors.push(err('id', 'Bot ID contains invalid path characters'))
+  }
   // Only allow safe characters: alphanumeric, hyphens, underscores, dots
   if (!/^[a-zA-Z0-9._-]+$/.test(id)) {
     errors.push(err('id', 'Bot ID contains invalid characters'))
@@ -113,6 +120,11 @@ export function validateBotCreate(body: Record<string, unknown>): ValidationResu
       errors.push(err('id', 'Bot ID must be 100 characters or less'))
     } else if (body.id.length > 0 && !/^[a-zA-Z0-9._-]+$/.test(body.id)) {
       errors.push(err('id', 'Bot ID contains invalid characters'))
+    }
+    if (isString(body.id) && body.id.length > 0) {
+      if (body.id.includes('..') || body.id.startsWith('.')) {
+        errors.push(err('id', 'Bot ID contains invalid path characters'))
+      }
     }
   }
 
@@ -774,15 +786,11 @@ export function sanitizeCustomIcon(value: unknown): string {
   // Validate base64 content is valid (only A-Za-z0-9+/= characters)
   if (!/^[A-Za-z0-9+/]*={0,2}$/.test(base64Data)) return ''
 
-  // Additional check: ensure no HTML/script-like patterns in base64-decoded content
-  // This catches encoded <script>, javascript:, etc.
-  try {
-    const decoded = Buffer.from(base64Data, 'base64').toString('utf8')
-    if (/[<>"']/.test(decoded)) return '' // Reject if decoded content contains HTML chars
-  } catch {
-    // Invalid base64 — reject
-    return ''
-  }
-
+  // SECURITY FIX (SEC-102): Removed the HTML character check on decoded binary data.
+  // The previous check decoded base64 as UTF-8 and rejected content containing <>"'.
+  // This broke ALL valid binary image uploads (PNG, JPEG, etc.) because binary data
+  // almost always contains bytes that map to these ASCII characters (e.g., 0x3C = '<').
+  // SVG (the only image format that could carry XSS payloads) is already blocked by
+  // the MIME type whitelist above, making the HTML character check redundant.
   return value
 }

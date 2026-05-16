@@ -1,5 +1,7 @@
 import { db } from '@/lib/db'
+import { NextResponse } from 'next/server'
 import { validateBotId } from '@/lib/validation'
+import { getCurrentUserId } from '@/lib/api-helpers'
 
 /**
  * GET /api/bots/[id]/logs/stream
@@ -49,8 +51,10 @@ const PROXY_PADDING = ': ' + '0'.repeat(2048) + '\n\n'
 // Without this limit, a single client (or distributed attack) could open multiple
 // long-lived connections, each polling the DB every 3 seconds for up to 30 minutes,
 // consuming significant server resources (memory, CPU, DB connections).
-const MAX_GLOBAL_SSE_CONNECTIONS = 20
+const MAX_GLOBAL_SSE_CONNECTIONS = 50
+const MAX_SSE_CONNECTIONS_PER_USER = 5
 let activeSSEConnections = 0
+const activeSSEConnectionsByUser = new Map<string, number>()
 
 export async function GET(
   request: Request,
@@ -81,37 +85,86 @@ export async function GET(
   }
   activeSSEConnections++
 
-  // Check if bot exists — with retry to handle the race condition where
-  // the client navigates to the detail page before the POST to create
-  // the bot has completed and committed to the database.
-  let bot = await db.bot.findUnique({ where: { id }, select: { id: true } })
-  if (!bot) {
-    // Poll for the bot to appear (race condition after creation)
-    const startTime = Date.now()
-    while (Date.now() - startTime < BOT_APPEAR_WAIT_MS) {
-      await new Promise(r => setTimeout(r, BOT_APPEAR_POLL_MS))
-      bot = await db.bot.findUnique({ where: { id }, select: { id: true } })
-      if (bot) break
+  // BUG FIX (BUG-103): Wrap DB queries in try/catch to ensure activeSSEConnections
+  // is decremented if the DB is unreachable. Previously, if db.bot.findUnique
+  // threw, the counter was incremented but never decremented, eventually
+  // exhausting the connection limit and blocking all SSE connections.
+  let ownershipBot
+  try {
+    ownershipBot = await db.bot.findUnique({ where: { id }, select: { ownerId: true } })
+    if (!ownershipBot) {
+      const startTime = Date.now()
+      while (Date.now() - startTime < BOT_APPEAR_WAIT_MS) {
+        await new Promise(r => setTimeout(r, BOT_APPEAR_POLL_MS))
+        ownershipBot = await db.bot.findUnique({ where: { id }, select: { ownerId: true } })
+        if (ownershipBot) break
+      }
     }
+  } catch (error) {
+    console.error(`[SSE] DB error checking ownership for bot ${id}:`, error)
+    activeSSEConnections--
+    return NextResponse.json({ error: 'Service temporarily unavailable' }, { status: 503 })
   }
 
-  if (!bot) {
+  const userId = await getCurrentUserId(request)
+  if (!userId) {
     activeSSEConnections--
-    return new Response(JSON.stringify({ error: 'Bot not found' }), {
-      status: 404,
-      headers: { 'Content-Type': 'application/json' },
-    })
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  }
+  const userConns = activeSSEConnectionsByUser.get(userId) || 0
+  if (userConns >= MAX_SSE_CONNECTIONS_PER_USER) {
+    activeSSEConnections--
+    return new Response(JSON.stringify({
+      error: 'Too many SSE connections for this user',
+    }), { status: 429, headers: { 'Content-Type': 'application/json', 'Retry-After': '30' } })
+  }
+  activeSSEConnectionsByUser.set(userId, userConns + 1)
+  if (!ownershipBot || ownershipBot.ownerId !== userId) {
+    activeSSEConnections--
+    const uc = activeSSEConnectionsByUser.get(userId) || 1
+    activeSSEConnectionsByUser.set(userId, Math.max(0, uc - 1))
+    return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
   }
 
   // Set up SSE response stream
   const encoder = new TextEncoder()
+
+  // BUG FIX (BUG-102): Register abort listener BEFORE any async operations.
+  // Previously, the abort listener was set up inside the async IIFE, AFTER
+  // the initial fetch and timer setup. If the client disconnected during the
+  // initial fetch, the abort event had already fired but the listener wasn't
+  // registered yet, causing timers to leak until MAX_CONNECTION_DURATION.
+  let streamClosed = false
+  let pendingTimers: { poll?: ReturnType<typeof setInterval>; heartbeat?: ReturnType<typeof setInterval>; maxDuration?: ReturnType<typeof setTimeout> } = {}
+
+  try {
+    request.signal.addEventListener('abort', () => {
+      if (streamClosed) return
+      streamClosed = true
+      activeSSEConnections--
+      const uc = activeSSEConnectionsByUser.get(userId) || 1
+      activeSSEConnectionsByUser.set(userId, Math.max(0, uc - 1))
+      if (pendingTimers.poll) clearInterval(pendingTimers.poll)
+      if (pendingTimers.heartbeat) clearInterval(pendingTimers.heartbeat)
+      if (pendingTimers.maxDuration) clearTimeout(pendingTimers.maxDuration)
+    })
+  } catch {
+    // signal.addEventListener may not be available in all runtimes
+  }
+
   const stream = new ReadableStream({
+    // BUG FIX (BUG-103): Wrap start callback in try/catch to ensure
+    // activeSSEConnections is decremented if an error occurs after
+    // the counter was incremented but before closeConnection is set up.
     start(controller) {
       // Helper to safely close and decrement the global connection counter
       const closeConnection = () => {
-        if (!closed) {
+        if (!closed && !streamClosed) {
           closed = true
+          streamClosed = true
           activeSSEConnections--
+          const uc = activeSSEConnectionsByUser.get(userId) || 1
+          activeSSEConnectionsByUser.set(userId, Math.max(0, uc - 1))
         }
       }
 
@@ -129,6 +182,12 @@ export async function GET(
       // Track the last log timestamp we've sent to avoid duplicates
       let lastSentTimestamp = new Date()
       let closed = false
+
+      // If already aborted (client disconnected while we were setting up), bail out
+      if (streamClosed) {
+        try { controller.close() } catch { /* already closed */ }
+        return
+      }
 
       // CRITICAL: Send 2KB padding FIRST to flush reverse-proxy buffers.
       // Without this, the proxy holds the entire response until its internal
@@ -160,7 +219,7 @@ export async function GET(
           // Send in chronological order (oldest first)
           const sorted = [...initialLogs].reverse()
           for (const log of sorted) {
-            if (closed) break
+            if (closed || streamClosed) break
             sendEvent('log', {
               id: log.id,
               botId: log.botId,
@@ -182,11 +241,11 @@ export async function GET(
         // P2-BUG-4 FIX: Start poll timer AFTER initial fetch completes.
         // This prevents the first poll from sending duplicate entries that
         // were already sent in the initial catch-up batch.
-        if (closed) return
+        if (closed || streamClosed) return
 
         // Poll for new logs periodically
         const pollTimer = setInterval(async () => {
-          if (closed) return
+          if (closed || streamClosed) return
           try {
             const newLogs = await db.botLog.findMany({
               where: {
@@ -198,7 +257,7 @@ export async function GET(
             })
 
             for (const log of newLogs) {
-              if (closed) break
+              if (closed || streamClosed) break
               sendEvent('log', {
                 id: log.id,
                 botId: log.botId,
@@ -213,10 +272,11 @@ export async function GET(
             console.error(`[SSE] Error polling logs for ${id}:`, error)
           }
         }, POLL_INTERVAL)
+        pendingTimers.poll = pollTimer
 
         // Send heartbeat to keep connection alive (prevents proxy/load-balancer timeout)
         const heartbeatTimer = setInterval(() => {
-          if (closed) return
+          if (closed || streamClosed) return
           try {
             controller.enqueue(encoder.encode(`:heartbeat\n\n`))
           } catch {
@@ -227,31 +287,28 @@ export async function GET(
             try { controller.close() } catch { /* already closed */ }
           }
         }, HEARTBEAT_INTERVAL)
+        pendingTimers.heartbeat = heartbeatTimer
 
         // Maximum connection duration safety net
         const maxDurationTimer = setTimeout(() => {
-          if (closed) return
+          if (closed || streamClosed) return
           sendEvent('error', { message: 'Connection timeout, please reconnect' })
           closeConnection()
           clearInterval(pollTimer)
           clearInterval(heartbeatTimer)
           try { controller.close() } catch { /* already closed */ }
         }, MAX_CONNECTION_DURATION)
-
-        // Clean up on abort (client disconnect)
-        try {
-          request.signal.addEventListener('abort', () => {
-            if (closed) return
-            closeConnection()
-            clearInterval(pollTimer)
-            clearInterval(heartbeatTimer)
-            clearTimeout(maxDurationTimer)
-            try { controller.close() } catch { /* already closed */ }
-          })
-        } catch {
-          // signal.addEventListener may not be available in all runtimes
-        }
+        pendingTimers.maxDuration = maxDurationTimer
       })()
+    },
+    cancel() {
+      if (!streamClosed) {
+        streamClosed = true
+        activeSSEConnections--
+      }
+      if (pendingTimers.poll) clearInterval(pendingTimers.poll)
+      if (pendingTimers.heartbeat) clearInterval(pendingTimers.heartbeat)
+      if (pendingTimers.maxDuration) clearTimeout(pendingTimers.maxDuration)
     },
   })
 

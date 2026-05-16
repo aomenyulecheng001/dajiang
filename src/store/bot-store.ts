@@ -22,6 +22,7 @@ interface BotStore {
   createBotDialogMode: 'create' | 'import' | 'git'
   editBotId: string | null
   _hasHydrated: boolean
+  _isHydrating: boolean
   // Pagination state
   currentPage: number
   pageSize: number
@@ -89,7 +90,7 @@ function genWebhookSecret(): string {
 
 // ─── DB Persistence Helpers ───────────────────────────────────────────────
 
-function authFetch(url: string, init: RequestInit = {}): Promise<Response> {
+export function authFetch(url: string, init: RequestInit = {}): Promise<Response> {
   const headers = new Headers(init.headers)
   if (!headers.has('Content-Type') && init.body && typeof init.body === 'string') {
     headers.set('Content-Type', 'application/json')
@@ -119,6 +120,7 @@ function authFetch(url: string, init: RequestInit = {}): Promise<Response> {
 let dbBotIds = new Set<string>()
 const persistTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const MAX_LOGS_PER_BOT = 200
+const logDedupKeys = new Map<string, Set<string>>()
 
 /** PERF FIX: Track last log fetch timestamp per bot for incremental updates */
 const lastLogFetchTime = new Map<string, string>()
@@ -126,15 +128,26 @@ const lastLogFetchTime = new Map<string, string>()
 /** Fields to exclude from PATCH body (handled separately, read-only, or auto-managed by DB) */
 const PATCH_EXCLUDE_FIELDS = new Set(['id', 'createdAt', 'logs', 'stats', 'updatedAt', 'envVars', 'codeDirty'])
 
+const REF_EQUAL_FIELDS = new Set(['projectFiles', 'code', 'codeBlocks', 'logs', 'stats'])
+
+const SNAPSHOT_EXCLUDE_FIELDS = new Set(['logs'])
+
+function createFilteredSnapshot(bot: Record<string, unknown> | Bot): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(bot).filter(([k]) => !SNAPSHOT_EXCLUDE_FIELDS.has(k))
+  )
+}
+
 /** Ensure a bot loaded from DB has all nested fields with safe defaults */
 function normalizeBot(raw: Partial<Bot> & { id: string; name: string }): Bot {
   return {
     id: raw.id,
+    ownerId: raw.ownerId || undefined,
     name: raw.name,
     description: raw.description ?? '',
     emoji: raw.emoji ?? '🤖',
     customIcon: raw.customIcon || undefined,
-    status: raw.status ?? 'inactive',
+    status: raw.status || 'inactive',
     health: raw.health ?? 'unknown',
     language: raw.language ?? 'typescript',
     template: raw.template ?? 'custom',
@@ -189,153 +202,108 @@ function normalizeBot(raw: Partial<Bot> & { id: string; name: string }): Bot {
  */
 const botSnapshots = new Map<string, Record<string, unknown>>()
 
-/** P2-17 FIX: Deep equality check for dirty field tracking.
- * Uses JSON.stringify for objects/arrays and === for primitives.
- * Prevents unnecessary PATCH requests when complex fields haven't changed.
- */
 function isDeepEqual(a: unknown, b: unknown): boolean {
   if (a === b) return true
-  // Handle NaN: NaN !== NaN in JS, but they should be considered equal
-  if (Number.isNaN(a) && Number.isNaN(b)) return true
   if (a == null || b == null) return a === b
   if (typeof a !== typeof b) return false
-  if (typeof a === 'object') {
-    try {
-      // Sort keys before comparing to handle key-order differences from spread operations
-      const sortKeys = (_key: string, value: unknown) => {
-        if (value && typeof value === 'object' && !Array.isArray(value)) {
-          return Object.keys(value as Record<string, unknown>).sort().reduce((obj: Record<string, unknown>, key) => {
-            obj[key] = (value as Record<string, unknown>)[key]
-            return obj
-          }, {})
-        }
-        return value
+  if (typeof a !== 'object') return false
+  if (Array.isArray(a) !== Array.isArray(b)) return false
+  if (Array.isArray(a)) {
+    if (a.length !== (b as unknown[]).length) return false
+    for (let i = 0; i < a.length; i++) {
+      if (!isDeepEqual(a[i], (b as unknown[])[i])) return false
+    }
+    return true
+  }
+  const aObj = a as Record<string, unknown>
+  const bObj = b as Record<string, unknown>
+  const keysA = Object.keys(aObj)
+  const keysB = Object.keys(bObj)
+  if (keysA.length !== keysB.length) return false
+  for (const key of keysA) {
+    if (!Object.prototype.hasOwnProperty.call(bObj, key)) return false
+    if (!isDeepEqual(aObj[key], bObj[key])) return false
+  }
+  return true
+}
+
+function computePatchDiff(bot: Bot, prev: Record<string, unknown> | undefined): Record<string, unknown> | null {
+  const patchData: Record<string, unknown> = {}
+  const currentEntries = Object.entries(bot)
+  for (const [key, value] of currentEntries) {
+    if (PATCH_EXCLUDE_FIELDS.has(key)) continue
+    if (SNAPSHOT_EXCLUDE_FIELDS.has(key)) { patchData[key] = value; continue }
+    const prevVal = prev ? prev[key] : undefined
+    if (REF_EQUAL_FIELDS.has(key)) { if (value === prevVal) continue }
+    else if (isDeepEqual(prevVal, value)) continue
+    patchData[key] = value
+  }
+  for (const key of Object.keys(patchData)) {
+    if (patchData[key] === undefined) patchData[key] = ''
+  }
+  return Object.keys(patchData).length > 0 ? patchData : null
+}
+
+const PATCH_DEBOUNCE_MS = 500
+
+async function executePatch(botId: string, _retryCount = 0): Promise<boolean> {
+  const bot = useBotStore.getState().bots.find(b => b.id === botId)
+  if (!bot) { persistTimers.delete(botId); return false }
+  const patchData = computePatchDiff(bot, botSnapshots.get(botId))
+  if (!patchData) { persistTimers.delete(botId); return false }
+  try {
+    const res = await authFetch(`/api/bots/${botId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patchData),
+    })
+    if (!res.ok) {
+      if (res.status === 401) return false
+      if (res.status >= 500 && _retryCount < 2) {
+        await new Promise(r => setTimeout(r, 1000 * Math.pow(2, _retryCount)))
+        return executePatch(botId, _retryCount + 1)
       }
-      return JSON.stringify(a, sortKeys) === JSON.stringify(b, sortKeys)
-    } catch {
+      console.error(`[BotStore] PATCH /api/bots/${botId} failed:`, res.status)
       return false
     }
-  }
-  return false
-}
-
-function schedulePatch(botId: string, getBot: () => Bot | undefined) {
-  const existing = persistTimers.get(botId)
-  if (existing) clearTimeout(existing)
-
-  persistTimers.set(botId, setTimeout(async () => {
+    const updated = await res.json()
+    const currentBot = useBotStore.getState().bots.find(b => b.id === botId)
+    if (currentBot) {
+      botSnapshots.set(botId, createFilteredSnapshot(currentBot))
+    }
     persistTimers.delete(botId)
-    const bot = getBot()
-    if (!bot) return
-    try {
-      // P2-4: Track which fields changed and only send those
-      const prev = botSnapshots.get(botId)
-      const patchData: Record<string, unknown> = {}
-      const currentEntries = Object.entries(bot)
-
-      for (const [key, value] of currentEntries) {
-        if (PATCH_EXCLUDE_FIELDS.has(key)) continue
-        // P2-17 FIX: Use deep equality instead of shallow comparison for objects/arrays
-        if (!prev || !Object.prototype.hasOwnProperty.call(prev, key) || !isDeepEqual(prev[key], value)) {
-          patchData[key] = value
-        }
-      }
-      // BUG FIX: Convert undefined values to '' for DB compatibility.
-      // JSON.stringify omits keys with undefined values, so PATCH requests would
-      // not include cleared fields (e.g., customIcon: undefined when switching
-      // from a custom icon to a standard emoji). The DB uses empty string defaults
-      // for all String fields, so '' is the correct "cleared" value.
-      for (const key of Object.keys(patchData)) {
-        if (patchData[key] === undefined) {
-          patchData[key] = ''
-        }
-      }
-      // P2 FIX: Remove client-side updatedAt — let Prisma @updatedAt handle it
-      // patchData.updatedAt = new Date().toISOString()
-
-      const res = await authFetch(`/api/bots/${botId}`, {
-        method: 'PATCH',
-        body: JSON.stringify(patchData),
-      })
-
-      if (!res.ok) {
-        // BUG FIX: Don't update snapshot on failed PATCH.
-        // Without this check, the snapshot is updated even on 404/500 responses,
-        // causing subsequent changes to be silently dropped because the diff
-        // against the snapshot shows no change. The data is lost permanently.
-        console.warn(`PATCH failed for bot ${botId}: HTTP ${res.status}`)
-        return
-      }
-
-      dbBotIds.add(botId)
-
-      // P2 FIX: Only update snapshot AFTER successful persist
-      // (prevents silently dropping failed updates)
-      botSnapshots.set(botId, Object.fromEntries(currentEntries))
-    } catch (e) {
-      console.warn(`Failed to persist bot ${botId}:`, e)
+    return true
+  } catch (error) {
+    if (_retryCount < 2) {
+      await new Promise(r => setTimeout(r, 1000 * Math.pow(2, _retryCount)))
+      return executePatch(botId, _retryCount + 1)
     }
-  }, 500))
+    console.error(`[BotStore] PATCH /api/bots/${botId} error:`, error)
+    persistTimers.delete(botId)
+    return false
+  }
 }
 
-/**
- * BUG FIX: Flush any pending debounced PATCH for a bot before fetchBotDetail
- * overwrites the store with stale DB data. Without this, changes made within
- * the 500ms debounce window are silently lost because:
- * 1. User edits code → schedulePatch (500ms debounce)
- * 2. fetchBotDetail resolves → overwrites store with stale DB data
- * 3. schedulePatch timer fires → no diff detected → PATCH never sent
- */
-async function flushPendingPatch(botId: string, getBot: () => Bot | undefined): Promise<boolean> {
+function schedulePatch(botId: string, _getBot?: () => Bot | undefined) {
+  if (persistTimers.has(botId)) return
+  persistTimers.set(botId, setTimeout(() => {
+    executePatch(botId)
+  }, PATCH_DEBOUNCE_MS))
+}
+
+async function flushPendingPatch(botId: string, _getBot?: () => Bot | undefined): Promise<boolean> {
   const timer = persistTimers.get(botId)
-  if (!timer) return true // No pending patch — nothing to flush
-  clearTimeout(timer)
-  persistTimers.delete(botId)
-  // Execute the same persistence logic immediately
-  const bot = getBot()
-  if (!bot) return true
-  try {
-    const prev = botSnapshots.get(botId)
-    const patchData: Record<string, unknown> = {}
-    const currentEntries = Object.entries(bot)
-    for (const [key, value] of currentEntries) {
-      if (PATCH_EXCLUDE_FIELDS.has(key)) continue
-      if (!prev || !Object.prototype.hasOwnProperty.call(prev, key) || !isDeepEqual(prev[key], value)) {
-        patchData[key] = value
-      }
-    }
-    // BUG FIX: Same undefined→'' conversion as schedulePatch (see comment there)
-    for (const key of Object.keys(patchData)) {
-      if (patchData[key] === undefined) {
-        patchData[key] = ''
-      }
-    }
-    if (Object.keys(patchData).length > 0) {
-      const res = await authFetch(`/api/bots/${botId}`, {
-        method: 'PATCH',
-        body: JSON.stringify(patchData),
-      })
-      if (!res.ok) {
-        // BUG FIX: Show error toast when flush fails instead of silently swallowing.
-        // Without this, the user's edits are lost when fetchBotDetail overwrites
-        // the store with stale DB data.
-        const locale = useI18nStore.getState().locale
-        const t = (key: string, params?: Record<string, string | number>) => getTranslation(locale, key as any, params)
-        toast.error(t('common.saveFailed'), { description: t('common.saveFailedDesc') })
-        return false
-      }
-      dbBotIds.add(botId)
-      botSnapshots.set(botId, Object.fromEntries(currentEntries))
-    }
-  } catch (e) {
-    console.warn(`Failed to flush persist bot ${botId}:`, e)
-    // BUG FIX: Show error toast on network failure
+  if (timer) {
+    clearTimeout(timer)
+    persistTimers.delete(botId)
+  }
+  const result = await executePatch(botId)
+  if (!result) {
     const locale = useI18nStore.getState().locale
     const t = (key: string, params?: Record<string, string | number>) => getTranslation(locale, key as any, params)
     toast.error(t('common.saveFailed'), { description: t('common.saveFailedDesc') })
-    return false
   }
-  return true
+  return result
 }
 
 /**
@@ -345,28 +313,35 @@ async function flushPendingPatch(botId: string, getBot: () => Bot | undefined): 
  * This avoids the risk of schedulePatch sending masked placeholders (••••••••••••)
  * that would destroy real encrypted secrets.
  */
+const pendingEnvVarRequests = new Map<string, Promise<void>>()
+
 function persistEnvVarsToServer(botId: string) {
+  if (pendingEnvVarRequests.has(botId)) return
   const state = useBotStore.getState()
   const bot = state.bots.find(b => b.id === botId)
   if (!bot) return
-  // Strip the client-side `id` field from each env var before sending to server
   const envVarsForServer = bot.envVars.map(({ id: _id, ...rest }) => rest)
-  authFetch(`/api/bots/${botId}`, {
+  const promise = authFetch(`/api/bots/${botId}`, {
     method: 'PATCH',
     body: JSON.stringify({ envVars: envVarsForServer }),
   }).then(async (res) => {
     if (res.ok) {
       const updated = await res.json()
-      // Update snapshot so next schedulePatch doesn't see envVars as dirty
-      const currentEntries = Object.entries(bot)
-      botSnapshots.set(botId, Object.fromEntries(currentEntries))
-      // Update the store with server response (e.g., re-masked encrypted values)
       useBotStore.setState((state) => ({
         bots: state.bots.map((b) => {
           if (b.id !== botId) return b
-          return { ...b, envVars: updated.envVars || b.envVars }
+          const serverEnvVars = (updated.envVars || b.envVars) as EnvVar[]
+          const mergedEnvVars = serverEnvVars.map((sv: EnvVar) => {
+            const existing = b.envVars.find((ev: EnvVar) => ev.key === sv.key)
+            return { ...sv, id: existing?.id || sv.id || crypto.randomUUID() }
+          })
+          return { ...b, envVars: mergedEnvVars }
         }),
       }))
+      const currentBot = useBotStore.getState().bots.find(b => b.id === botId)
+      if (currentBot) {
+        botSnapshots.set(botId, createFilteredSnapshot(currentBot))
+      }
     } else {
       const locale = useI18nStore.getState().locale
       const t = (key: string, params?: Record<string, string | number>) => getTranslation(locale, key as any, params)
@@ -374,7 +349,20 @@ function persistEnvVarsToServer(botId: string) {
     }
   }).catch((e) => {
     console.warn(`Failed to persist env vars for bot ${botId}:`, e)
+  }).finally(() => {
+    pendingEnvVarRequests.delete(botId)
+    const latestBot = useBotStore.getState().bots.find(b => b.id === botId)
+    if (latestBot && pendingEnvVarRequests.has(botId) === false) {
+      const prev = botSnapshots.get(botId)
+      const currentEnvVars = latestBot.envVars.map(({ id: _id, ...rest }) => rest)
+      const prevEnvVars = (prev?.envVars || []) as EnvVar[]
+      const prevForCompare = prevEnvVars.map(({ id: _id, ...rest }) => rest)
+      if (JSON.stringify(currentEnvVars) !== JSON.stringify(prevForCompare)) {
+        persistEnvVarsToServer(botId)
+      }
+    }
   })
+  pendingEnvVarRequests.set(botId, promise)
 }
 
 /**
@@ -382,7 +370,7 @@ function persistEnvVarsToServer(botId: string) {
  * P0 FIX: Changed from PUT to POST because PUT returns 404 for non-existent bots
  * after the upsert→update migration. POST creates with server-assigned ID.
  */
-async function persistNewBot(bot: Bot): Promise<string> {
+async function persistNewBot(bot: Bot): Promise<string | null> {
   try {
     const res = await authFetch('/api/bots', {
       method: 'POST',
@@ -393,18 +381,18 @@ async function persistNewBot(bot: Bot): Promise<string> {
       const serverId = data.id
       if (!serverId || typeof serverId !== 'string') {
         console.warn('Server did not return a valid bot ID:', data)
-        return bot.id
+        return null
       }
       dbBotIds.add(serverId)
       return serverId
     } else {
       const errText = await res.text().catch(() => 'Unknown error')
       console.warn(`Failed to persist new bot: HTTP ${res.status}:`, errText)
-      return bot.id
+      return null
     }
   } catch (e) {
     console.warn(`Failed to persist new bot ${bot.id}:`, e)
-    return bot.id
+    return null
   }
 }
 
@@ -496,7 +484,6 @@ function getCodeTemplate(type: CodeBlock['type'], language: CodeBlock['language'
 
 // ─── Store ─────────────────────────────────────────────────────────────────
 
-let isHydrating = false
 let hasHydrated = false
 
 /** Check if the initial bot hydration from DB has completed */
@@ -507,18 +494,16 @@ export function getHasHydrated(): boolean {
 /** P0 FIX: Reset hydration flags so hydrateFromDB can be called again after auth */
 export function resetHydration() {
   hasHydrated = false
-  isHydrating = false
-  // Also reset the reactive store state
-  useBotStore.setState({ _hasHydrated: false })
-  // BUG FIX: Clear pending persistence state on logout/reset.
-  // Without this, stale persistTimers fire after logout, sending PATCH
-  // requests with invalid auth tokens that generate 401 errors.
+  useBotStore.setState({ _hasHydrated: false, _isHydrating: false, bots: [], selectedBotId: null })
   for (const [, timer] of persistTimers.entries()) {
     clearTimeout(timer)
   }
   persistTimers.clear()
   botSnapshots.clear()
   dbBotIds.clear()
+  pendingEnvVarRequests.clear()
+  lastLogFetchTime.clear()
+  logDedupKeys.clear()
 }
 
 export const useBotStore = create<BotStore>((set, get) => ({
@@ -533,6 +518,7 @@ export const useBotStore = create<BotStore>((set, get) => ({
   createBotDialogMode: 'create' as const,
   editBotId: null,
   _hasHydrated: false,
+  _isHydrating: false,
   currentPage: 1,
   pageSize: PAGINATION.DEFAULT_PAGE_SIZE,
   // ─── Persistence ──────────────────────────────────────────────────────────
@@ -541,44 +527,47 @@ export const useBotStore = create<BotStore>((set, get) => ({
     // Only hydrate on client-side
     if (typeof window === 'undefined') return
     if (hasHydrated) return
-    if (isHydrating) return
+    if (get()._isHydrating) return
 
-    isHydrating = true
+    set({ _isHydrating: true })
     const MAX_RETRIES = 3
     let attempt = 0
 
     while (attempt < MAX_RETRIES) {
       try {
-        // OPTIMIZED: Use HYDRATION_PAGE_SIZE for better performance
-        // Loads first page of bots efficiently instead of requesting all at once
-        const res = await authFetch(`/api/bots?page=1&pageSize=${PAGINATION.HYDRATION_PAGE_SIZE}`)
-        if (res.ok) {
+        let allBots: Bot[] = []
+        let page = 1
+        let hasMore = true
+
+        while (hasMore) {
+          const res = await authFetch(`/api/bots?page=${page}&pageSize=${PAGINATION.HYDRATION_PAGE_SIZE}`)
+          if (!res.ok) break
           const data = await res.json()
-          // Handle new API response format: { data, pagination, meta }
-          // Also support legacy format: { bots } for backward compatibility
-          const raw: Bot[] = Array.isArray(data.data) 
-            ? data.data 
-            : Array.isArray(data.bots) 
-              ? data.bots 
+          const raw: Bot[] = Array.isArray(data.data)
+            ? data.data
+            : Array.isArray(data.bots)
+              ? data.bots
               : []
-          
-          // Normalize bots to ensure all nested fields have safe defaults
-          const bots: Bot[] = raw.map(normalizeBot)
-          set({ bots })
+          allBots = allBots.concat(raw.map(normalizeBot))
+          hasMore = data.pagination?.hasNextPage ?? false
+          page++
+          if (page > 10) break
+        }
+
+        if (allBots.length > 0 || page > 1) {
+          if (hasMore && allBots.length > 0) {
+            console.warn(`[BotStore] Partial hydration: got ${allBots.length} bots, more pages available`)
+          }
+          set({ bots: allBots })
           dbBotIds.clear()
-          bots.forEach((b: { id: string }) => dbBotIds.add(b.id))
-          // BUG FIX: Clear stale persistTimers and botSnapshots from previous sessions.
-          // Without this, deleted bots could have stale timers that PATCH to 404,
-          // and stale snapshots could cause incorrect dirty-field detection,
-          // silently overwriting server-side changes made by another session.
+          allBots.forEach((b: { id: string }) => dbBotIds.add(b.id))
           for (const [timerBotId, timer] of persistTimers.entries()) {
             clearTimeout(timer)
             persistTimers.delete(timerBotId)
           }
           botSnapshots.clear()
-          // Initialize dirty tracking snapshots
-          for (const bot of bots) {
-            botSnapshots.set(bot.id, Object.fromEntries(Object.entries(bot)))
+          for (const bot of allBots) {
+            botSnapshots.set(bot.id, createFilteredSnapshot(bot))
           }
           hasHydrated = true
           set({ _hasHydrated: true })
@@ -594,23 +583,20 @@ export const useBotStore = create<BotStore>((set, get) => ({
       }
     }
 
-    isHydrating = false
+    set({ _isHydrating: false })
   },
 
   // ─── Computed ────────────────────────────────────────────────────────────
 
   filteredBots: () => {
     const { bots, searchQuery, statusFilter, sortBy, sortOrder } = get()
+    const noFilter = statusFilter === 'all' && !searchQuery.trim()
     let filtered = bots
 
     if (statusFilter !== 'all') {
       filtered = filtered.filter((b) => b.status === statusFilter)
     }
 
-    // Task 12 FIX: Enhanced search — also searches language and template fields,
-    // and supports multiple space-separated terms with AND logic (each term must
-    // match at least one field). OPT-7: Added fuzzy matching as fallback so
-    // abbreviations like "tg" match "telegram", "ts" match "typescript", etc.
     if (searchQuery.trim()) {
       const terms = searchQuery.toLowerCase().trim().split(/\s+/)
       filtered = filtered.filter((b) => {
@@ -626,8 +612,11 @@ export const useBotStore = create<BotStore>((set, get) => ({
       })
     }
 
-    // Sort
-    const sorted = [...filtered].sort((a, b) => {
+    if (filtered.length <= 1) return filtered
+
+    if (noFilter && sortBy === 'updatedAt' && sortOrder === 'desc') return filtered
+
+    return [...filtered].sort((a, b) => {
       let cmp = 0
       switch (sortBy) {
         case 'name':
@@ -647,8 +636,6 @@ export const useBotStore = create<BotStore>((set, get) => ({
       }
       return sortOrder === 'desc' ? -cmp : cmp
     })
-
-    return sorted
   },
 
   // ─── UI Actions ──────────────────────────────────────────────────────────
@@ -663,8 +650,8 @@ export const useBotStore = create<BotStore>((set, get) => ({
     }
   },
   setViewMode: (mode) => set({ viewMode: mode }),
-  setSearchQuery: (q) => set({ searchQuery: q }),
-  setStatusFilter: (f) => set({ statusFilter: f }),
+  setSearchQuery: (q) => set({ searchQuery: q, currentPage: 1 }),
+  setStatusFilter: (f) => set({ statusFilter: f, currentPage: 1 }),
   setSortBy: (s) => set({ sortBy: s, currentPage: 1 }),
   setSortOrder: (o) => set({ sortOrder: o, currentPage: 1 }),
   setCurrentPage: (page) => set({ currentPage: page }),
@@ -677,7 +664,7 @@ export const useBotStore = create<BotStore>((set, get) => ({
   // ─── Mutation Actions ────────────────────────────────────────────────────
 
   addBot: (params) => {
-    const newBot: Bot = {
+    const newBot = normalizeBot({
       id: genId(),
       name: params.name,
       description: params.description,
@@ -715,60 +702,45 @@ export const useBotStore = create<BotStore>((set, get) => ({
       logs: [],
       projectFiles: params.projectFiles,
       entryPoint: params.entryPoint,
-    }
+    })
     set((state) => ({ bots: [newBot, ...state.bots] }))
-    // P0 FIX: Use POST to create bot with client-provided ID.
-    // The server now accepts the client ID (if valid), eliminating the
-    // race condition where navigation polling finds the bot with a client
-    // UUID that doesn't exist in the database yet.
+
+    const clientUUID = newBot.id
+    const creationTimeout = setTimeout(() => {
+      const store = get()
+      const bot = store.bots.find(b => b.id === clientUUID)
+      if (bot && !dbBotIds.has(clientUUID)) {
+        console.warn(`[BotStore] Bot ${newBot.name} (${clientUUID}) persist timed out after 15s — keeping in store, persistNewBot may still resolve`)
+      }
+    }, 15000)
+
     persistNewBot(newBot).then((serverId) => {
-      // Add to known DB IDs immediately so the orphan detector doesn't remove it
+      clearTimeout(creationTimeout)
+      if (!serverId) return
       dbBotIds.add(serverId)
 
       if (serverId !== newBot.id) {
-        // Server assigned a different ID (ID collision, extremely rare) — update store
         set((state) => ({
           bots: state.bots.map(b => b.id === newBot.id ? { ...b, id: serverId } : b),
           ...(state.selectedBotId === newBot.id ? { selectedBotId: serverId } : {}),
         }))
-        // Update dirty tracking references
         const snapshot = botSnapshots.get(newBot.id)
         if (snapshot) {
           botSnapshots.delete(newBot.id)
           botSnapshots.set(serverId, { ...snapshot, id: serverId })
         }
+        const pendingTimer = persistTimers.get(newBot.id)
+        if (pendingTimer) {
+          clearTimeout(pendingTimer)
+          persistTimers.delete(newBot.id)
+          schedulePatch(serverId, () => get().bots.find(b => b.id === serverId))
+        }
       }
-      // Take snapshot after creation for dirty tracking
-      botSnapshots.set(serverId, Object.fromEntries(Object.entries(get().bots.find(b => b.id === serverId) || [])))
-    }).catch(() => {
-      // Should not happen — persistNewBot catches internally and returns client ID on failure
-      // But handle just in case
-    })
-
-    // BUG FIX: Detect when persistNewBot fails (server ID never replaced client ID).
-    // When the POST fails, persistNewBot returns the client UUID, and the bot remains
-    // in the store with an ID the server doesn't recognize. Every subsequent PATCH to
-    // this bot will 404. On page refresh, the bot disappears.
-    // We detect this by checking if the bot's ID is still not in dbBotIds after a
-    // reasonable timeout, and remove it from the store with an error toast.
-    const clientUUID = newBot.id
-    setTimeout(() => {
-      const store = get()
-      const bot = store.bots.find(b => b.id === clientUUID)
-      // If the bot still has the client UUID after 5 seconds and it's not in
-      // dbBotIds (meaning persistNewBot never resolved successfully), remove it.
-      if (bot && !dbBotIds.has(clientUUID)) {
-        // Remove the orphaned bot from the store
-        set((state) => ({
-          bots: state.bots.filter(b => b.id !== clientUUID),
-          ...(state.selectedBotId === clientUUID ? { selectedBotId: null } : {}),
-        }))
-        botSnapshots.delete(clientUUID)
-        const locale = useI18nStore.getState().locale
-        const t = (key: string, params?: Record<string, string | number>) => getTranslation(locale, key as any, params)
-        toast.error(t('createBot.createFailed'), { description: t('createBot.createFailedDesc', { name: newBot.name }) })
+      const currentBot = get().bots.find(b => b.id === serverId)
+      if (currentBot) {
+        botSnapshots.set(serverId, createFilteredSnapshot(currentBot))
       }
-    }, 5000)
+    }).catch(() => { clearTimeout(creationTimeout) })
   },
 
   updateBot: (id, data) => {
@@ -793,13 +765,14 @@ export const useBotStore = create<BotStore>((set, get) => ({
       bots: current.bots.filter((b) => b.id !== id),
       ...(current.selectedBotId === id && { selectedBotId: null }),
     })
-    // Clean up dirty tracking and pending persist timers
+    botSnapshots.delete(id)
+    logDedupKeys.delete(id)
+    lastLogFetchTime.delete(id)
     const pendingTimer = persistTimers.get(id)
     if (pendingTimer) {
       clearTimeout(pendingTimer)
       persistTimers.delete(id)
     }
-    botSnapshots.delete(id)
 
     // P2-2 FIX: Handle delete result — show error if DB delete fails
     const success = await deleteBotFromDB(id)
@@ -815,11 +788,7 @@ export const useBotStore = create<BotStore>((set, get) => ({
       const bot = current.bots.find((b) => b.id === id)
       if (bot) {
         set((state) => {
-          // Find the index where the bot should be re-inserted
-          // It was originally at the position before all bots that are still in state
-          const existingIds = new Set(state.bots.map(b => b.id))
           const originalIndex = current.bots.findIndex(b => b.id === id)
-          // If we can't determine position, append at the end
           const insertIndex = originalIndex >= 0 ? Math.min(originalIndex, state.bots.length) : state.bots.length
           const newBots = [...state.bots]
           newBots.splice(insertIndex, 0, bot)
@@ -988,17 +957,30 @@ export const useBotStore = create<BotStore>((set, get) => ({
    * Deduplicates by timestamp + message + level to handle SSE reconnects.
    */
   addLogEntryLocal: (botId, entry) => {
+    const dedupKey = `${entry.timestamp}:${entry.message}:${entry.level}`
+    let dedupSet = logDedupKeys.get(botId)
+    if (!dedupSet) {
+      dedupSet = new Set()
+      logDedupKeys.set(botId, dedupSet)
+    }
+    if (dedupSet.has(dedupKey)) return
+    dedupSet.add(dedupKey)
     set((state) => ({
       bots: state.bots.map((b) => {
         if (b.id !== botId) return b
-        // Deduplicate: skip if a log with same timestamp+message+level already exists
-        const isDuplicate = b.logs.some(
-          l => l.timestamp === entry.timestamp && l.message === entry.message && l.level === entry.level
-        )
-        if (isDuplicate) return b
+        const newLogs = [{ id: genId(), ...entry }, ...b.logs]
+        if (newLogs.length > MAX_LOGS_PER_BOT) {
+          const removed = newLogs.slice(MAX_LOGS_PER_BOT)
+          const currentDedupSet = logDedupKeys.get(botId)
+          if (currentDedupSet) {
+            for (const r of removed) {
+              currentDedupSet.delete(`${r.timestamp}:${r.message}:${r.level}`)
+            }
+          }
+        }
         return {
           ...b,
-          logs: [{ id: genId(), ...entry }, ...b.logs].slice(0, MAX_LOGS_PER_BOT),
+          logs: newLogs.slice(0, MAX_LOGS_PER_BOT),
         }
       }),
     }))
@@ -1208,32 +1190,49 @@ export const useBotStore = create<BotStore>((set, get) => ({
         // Use the current store bot (with preserved status) for the snapshot
         const currentBot = get().bots.find(b => b.id === botId)
         if (currentBot) {
-          botSnapshots.set(botId, Object.fromEntries(Object.entries(currentBot)))
+          botSnapshots.set(botId, createFilteredSnapshot(currentBot))
         }
       } else if (res.status === 404) {
-        // RACE CONDITION FIX: If we get 404, the bot may not be in the DB yet
-        // (e.g., persistNewBot just fired). Retry after a short delay.
-        // Only retry if the bot exists in the local store (optimistic creation).
         const localBot = get().bots.find(b => b.id === botId)
         if (localBot) {
-          await new Promise(r => setTimeout(r, 500))
-          const retryRes = await authFetch(`/api/bots/${botId}`)
-          if (retryRes.ok) {
-            const data = await retryRes.json()
-            const fullBot = normalizeBot(data)
-            set((state) => ({
-              bots: state.bots.map((b) => {
-                if (b.id !== botId) return b
-                return {
-                  ...fullBot,
-                  logs: b.logs,
-                  stats: { ...fullBot.stats, ...b.stats },
-                }
-              }),
-            }))
-            const currentBot = get().bots.find(b => b.id === botId)
-            if (currentBot) {
-              botSnapshots.set(botId, Object.fromEntries(Object.entries(currentBot)))
+          const MAX_404_RETRIES = 3
+          for (let retry = 0; retry < MAX_404_RETRIES; retry++) {
+            await new Promise(r => setTimeout(r, 500 * (retry + 1)))
+            const retryRes = await authFetch(`/api/bots/${botId}`)
+            if (retryRes.ok) {
+              const data = await retryRes.json()
+              const fullBot = normalizeBot(data)
+              set((state) => ({
+                bots: state.bots.map((b) => {
+                  if (b.id !== botId) return b
+                  // BUG FIX: Preserve live runner-synced status fields in 404 retry path,
+                  // same as the main success path (see lines 1192-1215).
+                  // Without this, stale DB data overwrites the correct runner-synced status.
+                  return {
+                    ...fullBot,
+                    logs: b.logs,
+                    status: b.status,
+                    health: b.health,
+                    lastRunnerStatus: b.lastRunnerStatus,
+                    lastDeployedAt: b.lastDeployedAt || fullBot.lastDeployedAt,
+                    stats: {
+                      ...fullBot.stats,
+                      messages: b.stats.messages,
+                      users: b.stats.users,
+                      errors: b.stats.errors,
+                      uptime: b.stats.uptime,
+                      dailyMessages: b.stats.dailyMessages,
+                      topCommands: b.stats.topCommands,
+                      hourlyActivity: b.stats.hourlyActivity,
+                    },
+                  }
+                }),
+              }))
+              const currentBot = get().bots.find(b => b.id === botId)
+              if (currentBot) {
+                botSnapshots.set(botId, createFilteredSnapshot(currentBot))
+              }
+              break
             }
           }
         }
@@ -1253,7 +1252,7 @@ export const useBotStore = create<BotStore>((set, get) => ({
       starting: 'deploying',
       deploying: 'deploying',
       error: 'error',
-      stopping: 'active',   // Keep 'active' during graceful shutdown — the bot is still alive
+      stopping: 'deploying',
       stopped: 'inactive',
     }
     const mapped = statusMap[runnerStatus]
@@ -1274,12 +1273,6 @@ export const useBotStore = create<BotStore>((set, get) => ({
 
         const newHealth = healthMap[runnerStatus] || b.health
 
-        // BUG FIX: When the runner says "stopped", we now set status to "inactive"
-        // and use lastRunnerStatus='stopped' to indicate the bot was previously running.
-        // The old design kept status='active' with health='warning', which caused the
-        // UI to incorrectly show the bot as "Running" when it was actually stopped.
-        // Now the header badge, bot card, and runtime control all show the correct "Stopped" state,
-        // and the "Needs Restart" badge appears when lastRunnerStatus='stopped'.
         if (b.status === mapped && b.health === newHealth && b.lastRunnerStatus === runnerStatus) return b
 
         return {
@@ -1287,37 +1280,32 @@ export const useBotStore = create<BotStore>((set, get) => ({
           status: mapped,
           health: newHealth,
           lastRunnerStatus: runnerStatus,
-          // BUG FIX: Only set lastDeployedAt when transitioning TO running
-          // from a KNOWN non-running state (not from empty/unknown after page refresh).
-          // Without the `b.lastRunnerStatus` truthiness check, page refresh causes
-          // lastRunnerStatus='' from DB hydration, which satisfies `!== 'running'`,
-          // incorrectly resetting lastDeployedAt to "now" and clearing the
-          // "pending redeploy" indicator.
-          // Logic: set if (1) runner says 'running', (2) lastRunnerStatus is a known
-          // non-running state like 'stopped'/'starting'/'error', OR (3) it's the very
-          // first deploy (no lastDeployedAt yet and unknown previous state).
           lastDeployedAt: runnerStatus === 'running' && b.lastRunnerStatus !== 'running'
             && (b.lastRunnerStatus || !b.lastDeployedAt)
             ? new Date().toISOString()
             : b.lastDeployedAt,
-          // Clear codeDirty when bot successfully transitions to running (deploy completed)
-          codeDirty: runnerStatus === 'running' && b.lastRunnerStatus !== 'running'
-            && (b.lastRunnerStatus || !b.lastDeployedAt)
-            ? false
-            : b.codeDirty,
+          codeDirty: b.codeDirty,
           updatedAt: new Date().toISOString(),
         }
       }),
     }))
-    // BUG FIX: Update snapshot after syncRunnerStatus changes the bot.
-    // Without this, the next schedulePatch would include status/lastRunnerStatus/etc.
-    // in the diff even though they've already been persisted, causing unnecessary
-    // fields in the PATCH body and potential stale-value overwrites.
     const updatedBot = get().bots.find(b => b.id === botId)
     if (updatedBot) {
-      botSnapshots.set(botId, Object.fromEntries(Object.entries(updatedBot)))
+      const existingSnapshot = botSnapshots.get(botId)
+      if (existingSnapshot) {
+        botSnapshots.set(botId, {
+          ...existingSnapshot,
+          status: updatedBot.status,
+          health: updatedBot.health,
+          lastRunnerStatus: updatedBot.lastRunnerStatus,
+          lastDeployedAt: updatedBot.lastDeployedAt,
+          codeDirty: updatedBot.codeDirty,
+          updatedAt: updatedBot.updatedAt,
+        })
+      } else {
+        // Don't create snapshot — it should be created by fetchBotDetail
+      }
     }
-    // Debounced persist
     schedulePatch(botId, () => get().bots.find(b => b.id === botId))
   },
 

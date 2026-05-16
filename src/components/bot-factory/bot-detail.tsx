@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useRef } from 'react'
 import { Info, Code, Settings, ScrollText, BarChart3, MessageSquare, Users, AlertTriangle } from 'lucide-react'
 import { OverviewTab } from './tabs/overview-tab'
 import { CodeTab } from './tabs/code-tab'
@@ -14,9 +14,15 @@ import { useBotStore } from '@/store/bot-store'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { RuntimeControl } from './runtime-control'
 import { useT, useLocale } from '@/lib/i18n'
+import { TabErrorBoundary } from './tab-error-boundary'
 
 export function BotDetail() {
-  const bot = useBotStore((s) => s.bots.find((b) => b.id === s.selectedBotId))
+  const rawBot = useBotStore((s) => s.bots.find((b) => b.id === s.selectedBotId))
+  const botRef = useRef(rawBot)
+  if (rawBot !== botRef.current) {
+    botRef.current = rawBot
+  }
+  const bot = botRef.current
   const [activeTab, setActiveTab] = useState('overview')
   const t = useT()
   const locale = useLocale()
@@ -120,11 +126,11 @@ export function BotDetail() {
           </TabsTrigger>
         </TabsList>
 
-        <TabsContent value="overview" className="mt-3 rounded-xl border border-border/50 bg-card shadow-sm"><div className="p-5"><OverviewTab key={bot.id} /></div></TabsContent>
-        <TabsContent value="code" className="mt-3 rounded-xl border border-border/50 bg-card shadow-sm"><div className="p-5"><CodeTab key={bot.id} /></div></TabsContent>
-        <TabsContent value="config" className="mt-3 rounded-xl border border-border/50 bg-card shadow-sm"><div className="p-5"><ConfigCombinedTab key={bot.id} /></div></TabsContent>
-        <TabsContent value="logs" className="mt-3 rounded-xl border border-border/50 bg-card shadow-sm"><div className="p-5"><LogsTab key={bot.id} isVisible={activeTab === 'logs'} /></div></TabsContent>
-        <TabsContent value="monitoring" className="mt-3 rounded-xl border border-border/50 bg-card shadow-sm"><div className="p-5"><MonitoringTab key={bot.id} /></div></TabsContent>
+        <TabsContent value="overview" className="mt-3 rounded-xl border border-border/50 bg-card shadow-sm"><div className="p-5"><TabErrorBoundary fallback={t('common.tabError')}>{activeTab === 'overview' && <OverviewTab key={bot.id} />}</TabErrorBoundary></div></TabsContent>
+        <TabsContent value="code" className="mt-3 rounded-xl border border-border/50 bg-card shadow-sm"><div className="p-5"><TabErrorBoundary fallback={t('common.tabError')}>{activeTab === 'code' && <CodeTab key={bot.id} />}</TabErrorBoundary></div></TabsContent>
+        <TabsContent value="config" className="mt-3 rounded-xl border border-border/50 bg-card shadow-sm"><div className="p-5"><TabErrorBoundary fallback={t('common.tabError')}>{activeTab === 'config' && <ConfigCombinedTab key={bot.id} />}</TabErrorBoundary></div></TabsContent>
+        <TabsContent value="logs" className="mt-3 rounded-xl border border-border/50 bg-card shadow-sm"><div className="p-5"><TabErrorBoundary fallback={t('common.tabError')}>{activeTab === 'logs' && <LogsTab key={bot.id} isVisible={activeTab === 'logs'} />}</TabErrorBoundary></div></TabsContent>
+        <TabsContent value="monitoring" className="mt-3 rounded-xl border border-border/50 bg-card shadow-sm"><div className="p-5"><TabErrorBoundary fallback={t('common.tabError')}>{activeTab === 'monitoring' && <MonitoringTab key={bot.id} isVisible={activeTab === 'monitoring'} />}</TabErrorBoundary></div></TabsContent>
       </Tabs>
     </div>
   )

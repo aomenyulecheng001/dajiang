@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useRef, useEffect } from 'react'
 import { useTheme } from 'next-themes'
 import { Search, Sun, Moon, Grid2X2, List, Plus, Globe, HelpCircle, LogOut, ArrowLeft, KeyRound, UserCircle, Settings } from 'lucide-react'
 import { Input } from '@/components/ui/input'
@@ -28,7 +28,7 @@ import {
 } from '@/components/ui/tooltip'
 import { cn, statusConfig, getAvatarColor, getStatusLabel } from '@/lib/utils'
 import { useBotStore } from '@/store/bot-store'
-import { useBotRunner } from '@/lib/bot-runner-context'
+import { useBotRunnerConnection } from '@/lib/bot-runner-context'
 import { useAuthStore } from '@/store/auth-store'
 import { useT, useLocale, setLocale } from '@/lib/i18n'
 import type { Locale } from '@/lib/i18n'
@@ -47,23 +47,44 @@ interface HeaderProps {
 
 export function Header({ searchInputRef, onShortcutsOpen }: HeaderProps) {
   const { resolvedTheme, setTheme } = useTheme()
-  const {
-    searchQuery,
-    setSearchQuery,
-    viewMode,
-    setViewMode,
-    statusFilter,
-    setStatusFilter,
-    setCreateBotDialogOpen,
-    bots,
-    selectedBotId,
-    setSelectedBotId,
-  } = useBotStore()
-  const { connected, reconnecting, reconnectAttempt } = useBotRunner()
+  const searchQuery = useBotStore(s => s.searchQuery)
+  const setSearchQuery = useBotStore(s => s.setSearchQuery)
+  const [localSearch, setLocalSearch] = useState(searchQuery)
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const handleSearchChange = (value: string) => {
+    setLocalSearch(value)
+    if (debounceRef.current) clearTimeout(debounceRef.current)
+    debounceRef.current = setTimeout(() => {
+      setSearchQuery(value)
+    }, 200)
+  }
+
+  useEffect(() => {
+    return () => {
+      if (debounceRef.current) clearTimeout(debounceRef.current)
+    }
+  }, [])
+  const viewMode = useBotStore(s => s.viewMode)
+  const setViewMode = useBotStore(s => s.setViewMode)
+  const statusFilter = useBotStore(s => s.statusFilter)
+  const setStatusFilter = useBotStore(s => s.setStatusFilter)
+  const setCreateBotDialogOpen = useBotStore(s => s.setCreateBotDialogOpen)
+  const bots = useBotStore(s => s.bots)
+  const selectedBotId = useBotStore(s => s.selectedBotId)
+  const setSelectedBotId = useBotStore(s => s.setSelectedBotId)
+  const { connected, reconnecting, reconnectAttempt, connectionError } = useBotRunnerConnection()
   const { username, logout } = useAuthStore()
 
-  // Get the currently selected bot for detail view header
-  const selectedBot = useBotStore((s) => s.bots.find((b) => b.id === s.selectedBotId))
+  // PERF FIX: Use targeted selector for the selected bot instead of s.bots.find().
+  // Previously: const selectedBot = useBotStore((s) => s.bots.find((b) => b.id === s.selectedBotId))
+  // This returned a new reference on every bots array change. Now the selector returns
+  // the specific bot object, and Zustand's Object.is comparison skips re-renders when
+  // the selected bot hasn't changed.
+  const selectedBot = useBotStore((s) => {
+    if (!s.selectedBotId) return undefined
+    return s.bots.find((b) => b.id === s.selectedBotId)
+  })
   const isDetailView = !!selectedBotId
 
   // PERF FIX: Memoize the filtered bot count so we don't call filteredBots()
@@ -112,7 +133,7 @@ export function Header({ searchInputRef, onShortcutsOpen }: HeaderProps) {
     ? t('runtime.botRunnerConnected')
     : reconnecting
       ? `${t('runtime.autoReconnect')} (${t('runtime.reconnectAttempt', { n: reconnectAttempt })})`
-      : t('runtime.botRunnerDisconnected')
+      : connectionError || t('runtime.botRunnerDisconnected')
 
   // ─── Detail View Header ────────────────────────────────────────────────────
   if (isDetailView && selectedBot) {
@@ -309,8 +330,8 @@ export function Header({ searchInputRef, onShortcutsOpen }: HeaderProps) {
           <Input
             ref={searchInputRef}
             placeholder={t('common.search')}
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
+            value={localSearch}
+            onChange={(e) => handleSearchChange(e.target.value)}
             onFocus={() => setIsSearchFocused(true)}
             onBlur={() => setIsSearchFocused(false)}
             className="h-10 pl-10 pr-20 sm:pr-[6rem] bg-muted/50 border-transparent focus-visible:border-ring focus-visible:bg-background transition-colors"

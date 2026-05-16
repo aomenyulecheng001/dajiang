@@ -44,21 +44,25 @@ export function formatDate(date: string, locale: Locale = 'zh'): string {
 
 export const statusConfig: Record<string, { label: string; className: string; dotClass: string }> = {
   active: {
+    /** @deprecated Use getStatusLabel() for localized display text */
     label: 'Active',
     className: 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-500/20',
     dotClass: 'bg-emerald-500',
   },
   inactive: {
+    /** @deprecated Use getStatusLabel() for localized display text */
     label: 'Inactive',
     className: 'bg-gray-500/10 text-gray-600 dark:text-gray-400 border-gray-500/20',
     dotClass: 'bg-gray-400',
   },
   error: {
+    /** @deprecated Use getStatusLabel() for localized display text */
     label: 'Error',
     className: 'bg-red-500/10 text-red-700 dark:text-red-400 border-red-500/20',
     dotClass: 'bg-red-500',
   },
   deploying: {
+    /** @deprecated Use getStatusLabel() for localized display text */
     label: 'Deploying',
     className: 'bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-500/20',
     dotClass: 'bg-amber-500',
@@ -67,21 +71,25 @@ export const statusConfig: Record<string, { label: string; className: string; do
 
 export const healthConfig: Record<string, { label: string; className: string; dotClass: string }> = {
   healthy: {
+    /** @deprecated Use getHealthLabel() for localized display text */
     label: 'Healthy',
     className: 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-500/20',
     dotClass: 'bg-emerald-500',
   },
   warning: {
+    /** @deprecated Use getHealthLabel() for localized display text */
     label: 'Warning',
     className: 'bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-500/20',
     dotClass: 'bg-amber-500',
   },
   critical: {
+    /** @deprecated Use getHealthLabel() for localized display text */
     label: 'Critical',
     className: 'bg-red-500/10 text-red-700 dark:text-red-400 border-red-500/20',
     dotClass: 'bg-red-500',
   },
   unknown: {
+    /** @deprecated Use getHealthLabel() for localized display text */
     label: 'Unknown',
     className: 'bg-gray-500/10 text-gray-600 dark:text-gray-400 border-gray-500/20',
     dotClass: 'bg-gray-400',
@@ -96,10 +104,13 @@ export function getStatusLabel(key: string, locale: Locale = 'zh'): string {
     error: { en: 'Error', zh: '异常' },
     deploying: { en: 'Deploying', zh: '部署中' },
   }
-  return map[key]?.[locale] || statusConfig[key]?.label || key
+  if (!key || !map[key]) {
+    return map.inactive[locale] || statusConfig.inactive.label
+  }
+  return map[key][locale] || statusConfig[key]?.label || key
 }
 
-/** Get localized health label */
+/** Get localized health label. Always prefer this over healthConfig[key].label */
 export function getHealthLabel(key: string, locale: Locale = 'zh'): string {
   const map: Record<string, Record<Locale, string>> = {
     healthy: { en: 'Healthy', zh: '健康' },
@@ -195,6 +206,7 @@ export function generateUUID(): string {
     return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`
   }
   // Last resort fallback (very rare)
+  console.warn('[SECURITY] Using Math.random() for UUID generation - not cryptographically secure')
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
     const r = (Math.random() * 16) | 0
     const v = c === 'x' ? r : (r & 0x3) | 0x8

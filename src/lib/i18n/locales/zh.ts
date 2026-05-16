@@ -14,6 +14,7 @@ export const zh = {
     processing: '处理中...',
     loading: '加载中...',
     noDescription: '暂无描述',
+    tabError: '此部分遇到错误',
     bot: '个机器人',
     bots: '个机器人',
     name: '名称',
@@ -68,8 +69,12 @@ export const zh = {
     saving: '保存中...',
     dep: '个依赖',
     deps: '个依赖',
+    sessionExpired: '会话已过期',
+    pleaseLoginAgain: '请重新登录。',
+    tooManyRequests: '请求过于频繁，请稍后重试。',
   },
   auth: {
+    subtitle: 'Telegram 机器人管理平台',
     signIn: '登录',
     signingIn: '登录中...',
     enterUsername: '输入用户名',
@@ -115,6 +120,11 @@ export const zh = {
     title: 'Bot Factory',
     switchLanguage: '切换语言',
     searchResults: '{n} 个结果',
+  },
+  pagination: {
+    navigation: '分页导航',
+    page: '页',
+    items: '条',
   },
   page: {
     yourBots: '我的机器人',
@@ -414,6 +424,18 @@ export const zh = {
     realtimeLogs: '实时日志',
     searchPlaceholder: '搜索日志...',
     searchResults: '{n} 条匹配',
+    pollingPaused: '日志轮询已暂停 — Bot 未运行',
+    simMsg: {
+      0: '消息处理完成',
+      1: '用户 #4521 发起会话',
+      2: 'API 请求成功',
+      3: '缓存已刷新',
+      4: '数据库查询耗时 45ms',
+      5: 'Webhook 推送成功',
+      6: '新订阅用户加入',
+      7: '命令 /help 被调用',
+      8: '定时任务执行完成',
+    },
   },
   codeTab: {
     title: '源代码',
@@ -502,6 +524,8 @@ export const zh = {
     duplicateDep: '依赖 "{name}" 已存在',
     editItem: '编辑 {name}',
     removeItem: '移除 {name}',
+    removeConfirmTitle: '移除依赖',
+    removeConfirmDesc: '确定要移除 "{name}" 吗？此操作无法撤销。',
   },
   envTab: {
     title: '环境变量',
@@ -540,6 +564,9 @@ export const zh = {
     bulkImportSuccess: '已导入 {n} 个变量',
     revealFailed: '无法查看加密值，请重试',
     autoRevealForEdit: '正在解密以便编辑...',
+    removeConfirmTitle: '移除变量',
+    removeConfirmDesc: '确定要移除 "{key}" 吗？此操作无法撤销。',
+    removeConfirmDescSensitive: '确定要移除敏感/加密变量 "{key}" 吗？这将永久删除已存储的密钥。此操作无法撤销。',
   },
   shortcuts: {
     title: '键盘快捷键',
@@ -586,6 +613,8 @@ export const zh = {
     running: '运行中',
     error: '错误',
     stopped: '已停止',
+    notDeployed: '未部署',
+    startingCompact: '启动中...',
     title: '运行控制',
     expand: '展开控制面板',
     collapse: '折叠控制面板',
@@ -714,5 +743,8 @@ export const zh = {
   },
   charts: {
     messages: '{count} 条消息',
+  },
+  botRunner: {
+    notConnected: 'Bot Runner 未连接，请稍后重试。',
   },
 } as const;

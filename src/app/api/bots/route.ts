@@ -1,6 +1,6 @@
 import { db } from '@/lib/db'
 import { NextResponse } from 'next/server'
-import { safeJsonParse, serializeBotListResponse, serializeBotResponse } from '@/lib/api-helpers'
+import { safeJsonParse, serializeBotListResponse, serializeBotResponse, getCurrentUserId } from '@/lib/api-helpers'
 import { validateBotCreate, sanitizeBotName, sanitizeBotDescription, sanitizeEmoji, sanitizeCustomIcon } from '@/lib/validation'
 import { decryptEnvVarsMaskedAsync, decryptEnvVarsAsync, encryptEnvVarsOnSaveAsync } from '@/lib/crypto'
 import { PAGINATION } from '@/lib/bot-constants'
@@ -38,19 +38,35 @@ const BOT_LIST_SELECT: Record<string, true> = {
 
 export async function GET(request: Request) {
   try {
+    const userId = await getCurrentUserId(request)
+    // SECURITY FIX: Return 401 if no authenticated user. Previously, when userId
+    // was null, the where clause was {} which returned ALL bots from the database.
+    // While middleware should block unauthenticated requests, this is a defense-in-depth
+    // measure to prevent data leakage if middleware is ever misconfigured.
+    if (!userId) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
     const { searchParams } = new URL(request.url)
-    const page = Math.max(1, parseInt(searchParams.get('page') || '1', 10))
-    const pageSize = Math.min(PAGINATION.MAX_PAGE_SIZE, Math.max(1, parseInt(searchParams.get('pageSize') || String(PAGINATION.DEFAULT_PAGE_SIZE), 10)))
+    // BUG FIX (BUG-101): Use || fallback after parseInt to handle NaN.
+    // Math.max(1, NaN) returns NaN (not 1), which propagates through
+    // arithmetic and causes Prisma to throw or return unexpected results.
+    // Other routes (messages/route.ts) already use this pattern.
+    const page = Math.max(1, parseInt(searchParams.get('page') || '1', 10) || 1)
+    const pageSize = Math.min(PAGINATION.MAX_PAGE_SIZE, Math.max(1, parseInt(searchParams.get('pageSize') || String(PAGINATION.DEFAULT_PAGE_SIZE), 10) || PAGINATION.DEFAULT_PAGE_SIZE))
     const skip = (page - 1) * pageSize
+
+    const where = { ownerId: userId }
 
     const [bots, total] = await Promise.all([
       db.bot.findMany({
+        where,
         select: BOT_LIST_SELECT,
         orderBy: { updatedAt: 'desc' },
         skip,
         take: pageSize,
       }),
-      db.bot.count(),
+      db.bot.count({ where }),
     ])
 
     const parsed = bots.map((bot) => serializeBotListResponse(bot))
@@ -85,6 +101,11 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
   try {
+    const userId = await getCurrentUserId(request)
+    if (!userId) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
     // Parse request body with size limit protection
     let bot: Record<string, unknown>
     try {
@@ -124,7 +145,12 @@ export async function POST(request: Request) {
 
     const processedEnvVars = await encryptEnvVarsOnSaveAsync((bot.envVars as { key: string; value: string; isEncrypted?: boolean }[]) || [])
 
+    const clientId = bot.id
     const createData = {
+      // SECURITY FIX (SEC-77): Also reject path traversal patterns in client-provided bot ID
+      ...(clientId && typeof clientId === 'string' && clientId.length > 0 && clientId.length <= 100 && /^[a-zA-Z0-9._-]+$/.test(clientId) && !clientId.includes('..') && !clientId.startsWith('.')
+        ? { id: clientId }
+        : {}),
       name: sanitizeBotName(bot.name),
       description: sanitizeBotDescription(bot.description),
       emoji: sanitizeEmoji(bot.emoji),
@@ -143,15 +169,31 @@ export async function POST(request: Request) {
       projectFiles: JSON.stringify(bot.projectFiles || []),
       entryPoint: (bot.entryPoint as string) || '',
       webhookSecret: ((bot.config as Record<string, unknown>)?.webhookSecret as string) || '',
+      ownerId: userId,
     }
 
     const created = await db.bot.create({ data: createData })
 
+    // SECURITY FIX (SEC-86): Audit log for bot creation
+    console.info(`[Audit] Bot created: id=${created.id}, name=${sanitizeBotName(bot.name)}, owner=${userId}`)
+
     // POST returns full bot data (including envVars for immediate use)
     const serialized = await serializeBotResponse(created, decryptEnvVarsMaskedAsync, decryptEnvVarsAsync)
     return NextResponse.json(serialized)
-  } catch (error) {
+  } catch (error: unknown) {
     console.error('POST /api/bots error:', error)
+    // Handle Prisma unique constraint violations with specific error messages
+    if (error && typeof error === 'object' && 'code' in error && (error as { code: string }).code === 'P2002') {
+      const meta = 'meta' in error ? (error as { meta?: { target?: string[] } }).meta : undefined
+      const target = meta?.target?.[0]
+      if (target === 'name') {
+        return NextResponse.json({ error: 'A bot with this name already exists' }, { status: 409 })
+      }
+      if (target === 'id') {
+        return NextResponse.json({ error: 'A bot with this ID already exists' }, { status: 409 })
+      }
+      return NextResponse.json({ error: 'A bot with this unique field already exists' }, { status: 409 })
+    }
     return NextResponse.json({ error: 'Failed to create bot' }, { status: 500 })
   }
 }

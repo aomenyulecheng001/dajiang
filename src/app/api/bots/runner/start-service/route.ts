@@ -27,66 +27,92 @@ function isServiceRunning(): boolean {
  */
 function killExistingOnPort(port: number): Promise<boolean> {
   return new Promise((resolve) => {
-    // Try lsof first (works on macOS and most Linux)
-    const commands: { cmd: string; args: string[] }[] = [
-      { cmd: 'lsof', args: ['-ti', `:${port}`] },
-      { cmd: 'fuser', args: [`${port}/tcp`, '-k'] },
-    ]
-
-    let tried = 0
-    function tryNext(): void {
-      if (tried >= commands.length) {
-        resolve(false)
-        return
-      }
-      const { cmd, args } = commands[tried]
-      tried++
-      const proc = spawn(cmd, args, {
+    if (process.platform === 'win32') {
+      const proc = spawn('netstat', ['-ano', '-p', 'TCP'], {
         stdio: ['ignore', 'pipe', 'pipe'],
-        timeout: 5000,
       })
-
       let stdout = ''
       proc.stdout?.on('data', (data: Buffer) => { stdout += data.toString() })
-      proc.stderr?.on('data', () => { /* ignore */ })
-
       proc.on('close', () => {
-        const pids = cmd === 'fuser'
-          ? [] // fuser handles killing itself
-          : stdout.trim().split('\n').filter(Boolean)
-        let killed = false
-        if (cmd === 'fuser') {
-          killed = true // fuser -k returns success if it killed something
-        } else {
-          for (const pidStr of pids) {
-            const pid = parseInt(pidStr, 10)
-            if (!isNaN(pid)) {
+        const lines = stdout.split('\n')
+        const portStr = `:${port}`
+        for (const line of lines) {
+          if (line.includes(portStr) && line.includes('LISTENING')) {
+            const parts = line.trim().split(/\s+/)
+            const pid = parseInt(parts[parts.length - 1], 10)
+            if (!isNaN(pid) && pid > 0) {
               try {
-                process.kill(pid, 'SIGKILL')
-                killed = true
-              } catch {
-                // Process might already be dead
-              }
+                spawn('taskkill', ['/F', '/PID', String(pid)], { timeout: 5000 })
+                resolve(true)
+                return
+              } catch { /* ignore */ }
             }
           }
         }
-        if (killed) {
-          resolve(true)
-        } else {
-          tryNext()
-        }
+        resolve(false)
       })
+      proc.on('error', () => resolve(false))
+    } else {
+      const commands: { cmd: string; args: string[] }[] = [
+        { cmd: 'lsof', args: ['-ti', `:${port}`] },
+        { cmd: 'fuser', args: [`${port}/tcp`, '-k'] },
+      ]
 
-      proc.on('error', () => tryNext())
+      let tried = 0
+      function tryNext(): void {
+        if (tried >= commands.length) {
+          resolve(false)
+          return
+        }
+        const { cmd, args } = commands[tried]
+        tried++
+        const proc = spawn(cmd, args, {
+          stdio: ['ignore', 'pipe', 'pipe'],
+          timeout: 5000,
+        })
 
-      // Safety timeout
-      setTimeout(() => {
-        try { proc.kill() } catch { /* ignore */ }
-        tryNext()
-      }, 5000)
+        let stdout = ''
+        proc.stdout?.on('data', (data: Buffer) => { stdout += data.toString() })
+        proc.stderr?.on('data', () => { /* ignore */ })
+
+        proc.on('close', () => {
+          const pids = cmd === 'fuser'
+            ? [] // fuser handles killing itself
+            : stdout.trim().split('\n').filter(Boolean)
+          let killed = false
+          if (cmd === 'fuser') {
+            killed = true // fuser -k returns success if it killed something
+          } else {
+            for (const pidStr of pids) {
+              const pid = parseInt(pidStr, 10)
+              if (!isNaN(pid)) {
+                try {
+                  process.kill(pid, 'SIGKILL')
+                  killed = true
+                } catch {
+                  // Process might already be dead
+                }
+              }
+            }
+          }
+          if (killed) {
+            resolve(true)
+          } else {
+            tryNext()
+          }
+        })
+
+        proc.on('error', () => tryNext())
+
+        // Safety timeout
+        setTimeout(() => {
+          try { proc.kill() } catch { /* ignore */ }
+          tryNext()
+        }, 5000)
+      }
+
+      tryNext()
     }
-
-    tryNext()
   })
 }
 
@@ -144,10 +170,24 @@ export async function POST(request: Request) {
     const authHeader = request.headers.get('authorization')
     const cookieToken = request.headers.get('cookie')?.match(/session_token=([^;]+)/)?.[1]
     const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : cookieToken || null
-    if (!token || !(await validateSessionAsync(token))) {
+    const session = token ? await validateSessionAsync(token) : null
+    if (!session) {
       return NextResponse.json(
         { error: 'Unauthorized' },
         { status: 401 }
+      )
+    }
+
+    // SECURITY FIX (SEC-108): Authorization check — only admin (first account) can
+    // start the runner service. Starting the service kills existing processes and
+    // spawns a new one, which is a privileged operation that should not be available
+    // to all authenticated users.
+    const { db } = await import('@/lib/db')
+    const firstAccount = await db.account.findFirst({ orderBy: { createdAt: 'asc' } })
+    if (!firstAccount || firstAccount.id !== session.userId) {
+      return NextResponse.json(
+        { error: 'Forbidden: only admin can start the runner service' },
+        { status: 403 }
       )
     }
 
@@ -160,7 +200,8 @@ export async function POST(request: Request) {
         {
           success: true,
           message: 'Bot runner service is already running',
-          pid: serviceProcess?.pid,
+          // SECURITY FIX (SEC-82): Removed pid from response to prevent
+          // information leakage that could aid targeted attacks.
         },
         { status: 200 }
       )
@@ -248,8 +289,6 @@ export async function POST(request: Request) {
     if (process.env.PATH) safeEnvVars.PATH = process.env.PATH
     if (process.env.HOME) safeEnvVars.HOME = process.env.HOME
     if (process.env.PROJECT_ROOT) safeEnvVars.PROJECT_ROOT = process.env.PROJECT_ROOT
-    if (process.env.HMAC_SECRET) safeEnvVars.HMAC_SECRET = process.env.HMAC_SECRET
-    if (process.env.ENCRYPTION_KEY) safeEnvVars.ENCRYPTION_KEY = process.env.ENCRYPTION_KEY
     if (process.env.SERVER_ORIGIN) safeEnvVars.SERVER_ORIGIN = process.env.SERVER_ORIGIN
     if (process.env.BOT_RUNNER_URL) safeEnvVars.BOT_RUNNER_URL = process.env.BOT_RUNNER_URL
 
@@ -320,7 +359,6 @@ export async function POST(request: Request) {
           {
             success: true,
             message: 'Bot runner service started and health check passed',
-            pid: serviceProcess?.pid,
             port: PORT,
           },
           { status: 200 }
@@ -334,7 +372,6 @@ export async function POST(request: Request) {
       {
         success: true,
         message: 'Bot runner service started (health check pending)',
-        pid: serviceProcess?.pid,
         port: PORT,
       },
       { status: 200 }

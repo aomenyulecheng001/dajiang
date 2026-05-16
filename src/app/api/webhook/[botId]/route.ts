@@ -7,11 +7,15 @@ import { safeJsonParse } from '@/lib/api-helpers'
 // SEC FIX: Track consecutive webhook failures per bot for alerting.
 // Logs at ERROR level only when threshold is exceeded to avoid log flooding.
 const WEBHOOK_FAILURE_ALERT_THRESHOLD = 10
-const webhookFailureCounts = new Map<string, number>()
+const webhookFailureCounts = new Map<string, { count: number; lastFailureAt: number }>()
 
-// Cleanup stale failure counts every 10 minutes to prevent unbounded memory growth
 const _failureCleanupTimer = setInterval(() => {
-  webhookFailureCounts.clear()
+  const now = Date.now()
+  for (const [botId, entry] of webhookFailureCounts) {
+    if (now - entry.lastFailureAt > 30 * 60 * 1000) {
+      webhookFailureCounts.delete(botId)
+    }
+  }
 }, 10 * 60 * 1000)
 if (_failureCleanupTimer.unref) _failureCleanupTimer.unref()
 
@@ -105,7 +109,18 @@ export async function POST(
   request: Request,
   { params }: { params: Promise<{ botId: string }> }
 ) {
-  const { botId } = await params
+  // BUG FIX (QUALITY-2): Move params resolution inside try/catch.
+  // Previously, if params rejected (edge case), the error was unhandled
+  // and would result in an unstructured 500 response. Other routes like
+  // bots/[id]/route.ts wrap this in try/catch for consistency.
+  let botId: string
+  try {
+    const resolved = await params
+    botId = resolved.botId
+  } catch (error) {
+    console.error('[Webhook] Error resolving params:', error)
+    return NextResponse.json({ ok: false, description: 'Invalid request' }, { status: 400 })
+  }
 
   // Validate botId format (prevent path traversal)
   if (!botId || botId.length > 100 || !/^[a-zA-Z0-9._-]+$/.test(botId)) {
@@ -185,38 +200,53 @@ export async function POST(
 
       if (!response.ok) {
         const errText = await response.text().catch(() => '')
-        const count = (webhookFailureCounts.get(botId) || 0) + 1
-        webhookFailureCounts.set(botId, count)
-        if (count >= WEBHOOK_FAILURE_ALERT_THRESHOLD && count % WEBHOOK_FAILURE_ALERT_THRESHOLD === 0) {
-          console.error(`[Webhook] 🔴 ALERT: Bot ${botId} has ${count} consecutive webhook failures (runner returned ${response.status}). Check bot-runner status!`)
+        const entry = webhookFailureCounts.get(botId) || { count: 0, lastFailureAt: 0 }
+        entry.count++
+        entry.lastFailureAt = Date.now()
+        webhookFailureCounts.set(botId, entry)
+        if (entry.count >= WEBHOOK_FAILURE_ALERT_THRESHOLD && entry.count % WEBHOOK_FAILURE_ALERT_THRESHOLD === 0) {
+          console.error(`[Webhook] ALERT: Bot ${botId} has ${entry.count} consecutive webhook failures (runner returned ${response.status}). Check bot-runner status!`)
         } else {
-          console.warn(`[Webhook] Bot-runner returned ${response.status} for bot ${botId} (${count} consecutive): ${errText}`)
+          console.warn(`[Webhook] Bot-runner returned ${response.status} for bot ${botId} (${entry.count} consecutive): ${errText}`)
         }
-        return NextResponse.json({ ok: true, description: 'Webhook forwarded (bot may not be running)' })
+        return NextResponse.json(
+          { ok: false, description: 'Bot-runner error, please retry' },
+          { status: 502 }
+        )
       }
 
       // Reset failure count on success
       webhookFailureCounts.delete(botId)
       return NextResponse.json({ ok: true, description: 'Webhook forwarded successfully' })
     } catch (fetchError) {
-      const count = (webhookFailureCounts.get(botId) || 0) + 1
-      webhookFailureCounts.set(botId, count)
-      if (count >= WEBHOOK_FAILURE_ALERT_THRESHOLD && count % WEBHOOK_FAILURE_ALERT_THRESHOLD === 0) {
-        console.error(`[Webhook] 🔴 ALERT: Bot ${botId} has ${count} consecutive webhook failures (runner unreachable). Check bot-runner process!`)
+      const entry = webhookFailureCounts.get(botId) || { count: 0, lastFailureAt: 0 }
+      entry.count++
+      entry.lastFailureAt = Date.now()
+      webhookFailureCounts.set(botId, entry)
+      if (entry.count >= WEBHOOK_FAILURE_ALERT_THRESHOLD && entry.count % WEBHOOK_FAILURE_ALERT_THRESHOLD === 0) {
+        console.error(`[Webhook] ALERT: Bot ${botId} has ${entry.count} consecutive webhook failures (runner unreachable). Check bot-runner process!`)
       } else {
-        console.warn(`[Webhook] Failed to reach bot-runner for bot ${botId} (${count} consecutive):`, fetchError instanceof Error ? fetchError.message : fetchError)
+        console.warn(`[Webhook] Failed to reach bot-runner for bot ${botId} (${entry.count} consecutive):`, fetchError instanceof Error ? fetchError.message : fetchError)
       }
-      return NextResponse.json({ ok: true, description: 'Webhook forwarded (bot-runner unreachable)' })
+      return NextResponse.json(
+        { ok: false, description: 'Bot-runner unreachable, please retry' },
+        { status: 503 }
+      )
     }
   } catch (error) {
-    const count = (webhookFailureCounts.get(botId) || 0) + 1
-    webhookFailureCounts.set(botId, count)
-    if (count >= WEBHOOK_FAILURE_ALERT_THRESHOLD && count % WEBHOOK_FAILURE_ALERT_THRESHOLD === 0) {
-      console.error(`[Webhook] 🔴 ALERT: Bot ${botId} has ${count} consecutive processing errors.`)
+    const entry = webhookFailureCounts.get(botId) || { count: 0, lastFailureAt: 0 }
+    entry.count++
+    entry.lastFailureAt = Date.now()
+    webhookFailureCounts.set(botId, entry)
+    if (entry.count >= WEBHOOK_FAILURE_ALERT_THRESHOLD && entry.count % WEBHOOK_FAILURE_ALERT_THRESHOLD === 0) {
+      console.error(`[Webhook] ALERT: Bot ${botId} has ${entry.count} consecutive processing errors.`)
     } else {
       console.error(`[Webhook] Error processing update for bot ${botId}:`, error)
     }
-    return NextResponse.json({ ok: true, description: 'Webhook received' })
+    return NextResponse.json(
+      { ok: false, description: 'Internal error, please retry' },
+      { status: 500 }
+    )
   }
 }
 
@@ -225,7 +255,15 @@ export async function GET(
   request: Request,
   { params }: { params: Promise<{ botId: string }> }
 ) {
-  const { botId } = await params
+  // BUG FIX (QUALITY-2): Same as POST handler — wrap params in try/catch
+  let botId: string
+  try {
+    const resolved = await params
+    botId = resolved.botId
+  } catch (error) {
+    console.error('[Webhook GET] Error resolving params:', error)
+    return NextResponse.json({ ok: false, description: 'Invalid request' }, { status: 400 })
+  }
 
   if (!botId || botId.length > 100 || !/^[a-zA-Z0-9._-]+$/.test(botId)) {
     return NextResponse.json({ ok: false, description: 'Invalid bot ID' }, { status: 400 })
@@ -235,16 +273,24 @@ export async function GET(
   // This prevents unauthenticated probing of bot existence and runner state.
   const storedSecret = await getBotWebhookSecret(botId)
   const secretFromHeader = request.headers.get('x-telegram-bot-api-secret-token')
-  if (storedSecret) {
-    if (!secretFromHeader || !safeCompare(secretFromHeader, storedSecret)) {
-      return NextResponse.json({ ok: false, description: 'Unauthorized' }, { status: 401 })
-    }
+  if (!storedSecret) {
+    return NextResponse.json({ ok: false, description: 'Webhook not configured: missing secret_token' }, { status: 401 })
+  }
+  if (!secretFromHeader || !safeCompare(secretFromHeader, storedSecret)) {
+    return NextResponse.json({ ok: false, description: 'Unauthorized' }, { status: 401 })
   }
 
   // Forward verification to bot-runner
   try {
     const url = new URL(request.url)
-    const fullUrl = `${BOT_RUNNER_URL}/webhook/${encodeURIComponent(botId)}?${url.searchParams.toString()}`
+    const allowedParams = ['hub.mode', 'hub.challenge', 'hub.verify_token']
+    const filteredParams = new URLSearchParams()
+    for (const key of allowedParams) {
+      const value = url.searchParams.get(key)
+      if (value) filteredParams.set(key, value)
+    }
+    const qs = filteredParams.toString()
+    const fullUrl = `${BOT_RUNNER_URL}/webhook/${encodeURIComponent(botId)}${qs ? '?' + qs : ''}`
     const response = await fetch(fullUrl, { signal: AbortSignal.timeout(5000) })
     const data = await response.json().catch(() => ({}))
     return NextResponse.json({ ok: true, botId, ...data })

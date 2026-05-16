@@ -1,9 +1,11 @@
 import bcrypt from 'bcryptjs'
 import { db } from '@/lib/db'
-import { createSession, validateSession, validateSessionAsync, deleteSession, incrementTokenVersion } from '@/lib/session'
+import { createSession, validateSessionAsync, deleteSession, incrementTokenVersion, invalidateTokenVersionCache } from '@/lib/session'
+import { writeFile } from 'fs/promises'
+import { resolveFromProjectRoot } from '@/lib/project-root'
 
 // Re-export session functions for other modules
-export { validateSession, validateSessionAsync, deleteSession }
+export { validateSessionAsync, deleteSession }
 
 // P2-API-11 FIX: Cache ensureDefaultAccount result to avoid unnecessary DB query on every login
 let _accountEnsured = false
@@ -37,19 +39,18 @@ export async function ensureDefaultAccount(): Promise<void> {
       // Generate a random 16-character password using Web Crypto API
       password = Array.from(crypto.getRandomValues(new Uint8Array(12)))
         .map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 16)
-      console.log('')
-      console.log('╔════════════════════════════════════════════════════════╗')
-      console.log('║           🔑 INITIAL ADMIN CREDENTIALS                ║')
-      console.log('╠════════════════════════════════════════════════════════╣')
-      console.log(`║  Username: ${defaultUsername}`)
-      console.log(`║  Password: ${password}`)
-      console.log('╠════════════════════════════════════════════════════════╣')
-      console.log('║  ⚠️  CHANGE THIS PASSWORD AFTER FIRST LOGIN!          ║')
-      console.log('╚════════════════════════════════════════════════════════╝')
-      console.log('')
+      const credFile = resolveFromProjectRoot('.admin-credentials')
+      try {
+        await writeFile(credFile,
+          `Username: ${defaultUsername}\nPassword: ${password}\n\n⚠️ CHANGE THIS PASSWORD AFTER FIRST LOGIN!\n`,
+          'utf-8')
+        console.warn(`[Auth] Initial admin credentials written to .admin-credentials file. Delete after first login.`)
+      } catch {
+        console.warn(`[Auth] ⚠️ Could not write .admin-credentials file. Check server logs for credentials.`)
+      }
     }
 
-    const hashedPassword = await bcrypt.hash(password, 10)
+    const hashedPassword = await bcrypt.hash(password, 12)
     try {
       await db.account.create({
         data: {
@@ -85,13 +86,18 @@ export async function authenticateUser(
   // SECURITY FIX: Always call bcrypt.compare even for non-existent users
   // to prevent timing-based user enumeration attacks. Without this, a
   // missing user returns in <1ms while a wrong password takes ~100ms.
-  const DUMMY_HASH = '$2a$10$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+  const DUMMY_HASH = '$2a$10$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
   const hashToCompare = account?.password || DUMMY_HASH
 
   const isValid = await bcrypt.compare(password, hashToCompare)
   if (!account || !isValid) return null
 
-  // Create session token using the Edge-compatible session module
+  try {
+    const { unlink } = await import('fs/promises')
+    const credPath = resolveFromProjectRoot('.admin-credentials')
+    await unlink(credPath)
+  } catch { /* File may not exist or already deleted */ }
+
   const token = createSession(account.id, account.username, account.tokenVersion)
 
   return { token, username: account.username }
@@ -128,6 +134,12 @@ export async function resetPassword(
     return { success: false, message: 'New password must be at least 8 characters' }
   }
 
+  // SECURITY FIX (SEC-83): Maximum password length to prevent memory exhaustion.
+  // bcrypt truncates at 72 bytes anyway, but the full string is allocated before hashing.
+  if (newPassword.length > 128) {
+    return { success: false, message: 'New password must be 128 characters or less' }
+  }
+
   if (!/[a-zA-Z]/.test(newPassword)) {
     return { success: false, message: 'New password must contain at least one letter' }
   }
@@ -136,16 +148,31 @@ export async function resetPassword(
     return { success: false, message: 'New password must contain at least one number' }
   }
 
-  const hashedPassword = await bcrypt.hash(newPassword, 10)
+  if (!/[A-Z]/.test(newPassword)) {
+    return { success: false, message: 'New password must contain at least one uppercase letter' }
+  }
+
+  if (!/[^a-zA-Z0-9]/.test(newPassword)) {
+    return { success: false, message: 'New password must contain at least one special character' }
+  }
+
+  const hashedPassword = await bcrypt.hash(newPassword, 12)
+
+  // SECURITY FIX (SEC-22): Use a single atomic DB update to ensure password
+  // change and tokenVersion increment succeed together. Previously, these were
+  // separate operations and incrementTokenVersion could fail silently, leaving
+  // old session tokens from other devices valid after a password change.
   await db.account.update({
     where: { id: userId },
-    data: { password: hashedPassword },
+    data: {
+      password: hashedPassword,
+      tokenVersion: { increment: 1 },
+    },
   })
 
-  // SECURITY FIX: Increment tokenVersion to invalidate ALL existing session tokens.
-  // This persists across server restarts (unlike the in-memory revocation Map).
-  // Combined with deleteSession(currentToken), this ensures immediate + persistent revocation.
-  await incrementTokenVersion(userId)
+  // Invalidate the in-memory cache so the next token validation picks up
+  // the new tokenVersion from the DB, rejecting all old session tokens.
+  invalidateTokenVersionCache(userId)
 
   // Revoke the current session token so it cannot be reused after password change
   if (currentToken) {
@@ -203,11 +230,19 @@ export async function updateUsername(
 
   // M3 FIX: Handle TOCTOU race — two concurrent requests could pass the
   // uniqueness check and one will hit P2002. Catch it gracefully.
+  // SECURITY FIX (SEC-27): Atomic update — change username + increment
+  // tokenVersion in a single DB operation so they always succeed or fail together.
+  let updatedTokenVersion: number
   try {
-    await db.account.update({
+    const updatedAccount = await db.account.update({
       where: { id: account.id },
-      data: { username: newUsername },
+      data: {
+        username: newUsername,
+        tokenVersion: { increment: 1 },
+      },
+      select: { tokenVersion: true },
     })
+    updatedTokenVersion = updatedAccount.tokenVersion
   } catch (error: any) {
     if (error?.code === 'P2002') {
       return { success: false, message: 'Username is already taken' }
@@ -215,13 +250,13 @@ export async function updateUsername(
     throw error
   }
 
-  // H2 FIX: Revoke old token and issue a new one with the updated username
+  invalidateTokenVersionCache(account.id)
+
+  // H2 FIX: Revoke old token and issue a new one with the updated username.
   let newToken: string | undefined
   if (currentToken) {
-    // Revoke old token
     await deleteSession(currentToken)
-    // Create new token with updated username
-    newToken = createSession(account.id, newUsername)
+    newToken = createSession(account.id, newUsername, updatedTokenVersion)
   }
 
   return { success: true, message: 'Username updated successfully', username: newUsername, newToken }

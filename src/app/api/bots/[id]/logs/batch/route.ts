@@ -1,11 +1,15 @@
 import { db } from '@/lib/db'
 import { NextResponse } from 'next/server'
 import { validateBotId } from '@/lib/validation'
+import { getCurrentUserId } from '@/lib/api-helpers'
 
 const MAX_MESSAGE_LENGTH = 10000
 const MAX_SOURCE_LENGTH = 200
 const VALID_LOG_LEVELS = ['debug', 'info', 'warn', 'error', 'critical']
-const MAX_BATCH_SIZE = 500
+// SECURITY FIX (SEC-110): Reduced from 500 to 100 to mitigate DoS vector.
+// With 30 req/min rate limit, 500 entries/request = 15,000 entries/min per IP.
+// 100 entries/request = 3,000 entries/min, which is more reasonable.
+const MAX_BATCH_SIZE = 100
 
 /**
  * POST /api/bots/[id]/logs/batch
@@ -30,8 +34,12 @@ export async function POST(
       return NextResponse.json({ error: idErrors[0].message }, { status: 400 })
     }
 
-    const bot = await db.bot.findUnique({ where: { id }, select: { id: true } })
-    if (!bot) {
+    const userId = await getCurrentUserId(request)
+    if (!userId) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+    const ownershipBot = await db.bot.findUnique({ where: { id }, select: { ownerId: true } })
+    if (!ownershipBot || ownershipBot.ownerId !== userId) {
       return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
 
@@ -41,7 +49,10 @@ export async function POST(
       if (!text.trim()) {
         return NextResponse.json({ error: 'Request body is empty' }, { status: 400 })
       }
-      if (text.length > 5_000_000) {
+      // BUG FIX (QUALITY-1): Use Buffer.byteLength() instead of text.length.
+      // text.length counts UTF-16 code units, not actual bytes.
+      // Consistent with login/route.ts and bots/route.ts.
+      if (Buffer.byteLength(text, 'utf-8') > 5_000_000) {
         return NextResponse.json({ error: 'Request body too large' }, { status: 413 })
       }
       body = JSON.parse(text)
