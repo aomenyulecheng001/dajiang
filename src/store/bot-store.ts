@@ -202,16 +202,17 @@ function normalizeBot(raw: Partial<Bot> & { id: string; name: string }): Bot {
  */
 const botSnapshots = new Map<string, Record<string, unknown>>()
 
-function isDeepEqual(a: unknown, b: unknown): boolean {
+function isDeepEqual(a: unknown, b: unknown, depth: number = 0): boolean {
   if (a === b) return true
   if (a == null || b == null) return a === b
   if (typeof a !== typeof b) return false
   if (typeof a !== 'object') return false
+  if (depth >= 10) return false
   if (Array.isArray(a) !== Array.isArray(b)) return false
   if (Array.isArray(a)) {
     if (a.length !== (b as unknown[]).length) return false
     for (let i = 0; i < a.length; i++) {
-      if (!isDeepEqual(a[i], (b as unknown[])[i])) return false
+      if (!isDeepEqual(a[i], (b as unknown[])[i], depth + 1)) return false
     }
     return true
   }
@@ -222,7 +223,7 @@ function isDeepEqual(a: unknown, b: unknown): boolean {
   if (keysA.length !== keysB.length) return false
   for (const key of keysA) {
     if (!Object.prototype.hasOwnProperty.call(bObj, key)) return false
-    if (!isDeepEqual(aObj[key], bObj[key])) return false
+    if (!isDeepEqual(aObj[key], bObj[key], depth + 1)) return false
   }
   return true
 }
@@ -533,11 +534,14 @@ export const useBotStore = create<BotStore>((set, get) => ({
           allBots = allBots.concat(raw.map(normalizeBot))
           hasMore = data.pagination?.hasNextPage ?? false
           page++
-          if (page > 10) break
+          if (page > 10) {
+            console.warn(`[BotStore] Pagination limit reached at page ${page}, got ${allBots.length} bots so far`)
+            break
+          }
         }
 
         if (allBots.length > 0 || page > 1) {
-          if (hasMore && allBots.length > 0) {
+          if (hasMore) {
             console.warn(`[BotStore] Partial hydration: got ${allBots.length} bots, more pages available`)
           }
           const currentBots = get().bots
@@ -679,7 +683,7 @@ export const useBotStore = create<BotStore>((set, get) => ({
       envVars: params.envVars?.length ? params.envVars : [{ id: genId(), key: 'BOT_TOKEN', value: '', isEncrypted: true, description: 'Telegram Bot Token from @BotFather' }],
       config: {
         pollingMode: 'polling',
-        webhookSecret: genWebhookSecret(),
+        webhookSecret: '',
         rateLimitPerMinute: 30,
         maxConcurrentRequests: 10,
         autoRestart: true,
@@ -959,6 +963,9 @@ export const useBotStore = create<BotStore>((set, get) => ({
     }
     if (dedupSet.has(dedupKey)) return
     dedupSet.add(dedupKey)
+    if (dedupSet.size > 500) {
+      dedupSet.clear()
+    }
     set((state) => ({
       bots: state.bots.map((b) => {
         if (b.id !== botId) return b

@@ -4,6 +4,11 @@ import { safeJsonParse, serializeBotListResponse, serializeBotResponse, getCurre
 import { validateBotCreate, sanitizeBotName, sanitizeBotDescription, sanitizeEmoji, sanitizeCustomIcon } from '@/lib/validation'
 import { decryptEnvVarsMaskedAsync, decryptEnvVarsAsync, encryptEnvVarsOnSaveAsync } from '@/lib/crypto'
 import { PAGINATION } from '@/lib/bot-constants'
+import { generateSecret } from '@/lib/utils'
+
+function generateWebhookSecret(): string {
+  return generateSecret()
+}
 
 /**
  * P0-1 OPT: Fields to select in list query.
@@ -164,11 +169,14 @@ export async function POST(request: Request) {
       codeBlocks: JSON.stringify(bot.codeBlocks || []),
       dependencies: JSON.stringify(bot.dependencies || []),
       envVars: JSON.stringify(processedEnvVars),
-      config: JSON.stringify(bot.config || {}),
+      config: JSON.stringify({
+        ...(bot.config as Record<string, unknown> || {}),
+        ...(!((bot.config as Record<string, unknown>)?.webhookSecret) ? { webhookSecret: generateWebhookSecret() } : {}),
+      }),
       stats: JSON.stringify(bot.stats || {}),
       projectFiles: JSON.stringify(bot.projectFiles || []),
       entryPoint: (bot.entryPoint as string) || '',
-      webhookSecret: ((bot.config as Record<string, unknown>)?.webhookSecret as string) || '',
+      webhookSecret: ((bot.config as Record<string, unknown>)?.webhookSecret as string) || generateWebhookSecret(),
       ownerId: userId,
     }
 

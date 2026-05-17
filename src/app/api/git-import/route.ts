@@ -2,6 +2,7 @@ import { spawn } from 'child_process'
 import { NextRequest, NextResponse } from 'next/server'
 import { readdir, stat, readFile, rm, mkdir } from 'fs/promises'
 import { join } from 'path'
+import { tmpdir } from 'os'
 import { lookup } from 'dns/promises'
 import { getCurrentUserId } from '@/lib/api-helpers'
 
@@ -323,7 +324,7 @@ export async function GET(request: NextRequest) {
   }
 
   // P3-3 FIX: Use crypto.randomUUID() for collision-safe temp directory names
-  const workDir = `/tmp/git-branches-${crypto.randomUUID()}`
+  const workDir = join(tmpdir(), `git-branches-${crypto.randomUUID()}`)
 
   try {
     await mkdir(workDir, { recursive: true })
@@ -432,7 +433,7 @@ export async function POST(request: NextRequest) {
 
     // P3-3 FIX: Use crypto.randomUUID() for collision-safe temp directory names
     const randomId = crypto.randomUUID()
-    const tempDir = `/tmp/git-import-${randomId}`
+    const tempDir = join(tmpdir(), `git-import-${randomId}`)
 
     try {
       // Create temp directory

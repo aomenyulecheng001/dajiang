@@ -8,7 +8,8 @@ import { resolveFromProjectRoot } from '@/lib/project-root'
 export { validateSessionAsync, deleteSession }
 
 // P2-API-11 FIX: Cache ensureDefaultAccount result to avoid unnecessary DB query on every login
-let _accountEnsured = false
+let _accountCheckTime = 0
+const ACCOUNT_CHECK_INTERVAL_MS = 60 * 1000
 
 /**
  * Ensure at least one admin account exists.
@@ -19,7 +20,7 @@ let _accountEnsured = false
  */
 export async function ensureDefaultAccount(): Promise<void> {
   // P2-API-11 FIX: Skip DB query after first successful call
-  if (_accountEnsured) return
+  if (Date.now() - _accountCheckTime < ACCOUNT_CHECK_INTERVAL_MS) return
   const count = await db.account.count()
   if (count === 0) {
     // Check if an initial password was provided via env var
@@ -66,7 +67,7 @@ export async function ensureDefaultAccount(): Promise<void> {
   // H1 FIX: Only set _accountEnsured AFTER the successful DB check/create,
   // not before the DB write. Previously set early (line 24) which meant a
   // failed DB write would permanently prevent account creation retries.
-  _accountEnsured = true
+  _accountCheckTime = Date.now()
 }
 
 /**

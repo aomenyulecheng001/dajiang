@@ -56,8 +56,10 @@ export async function GET(
     // ── Optimized: Total Messages + Daily Messages in parallel queries ──
     const sevenDaysAgo = new Date()
     sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7)
+    const oneDayAgo = new Date()
+    oneDayAgo.setHours(oneDayAgo.getHours() - 24)
 
-    const [totalResult, dailyResult] = await Promise.all([
+    const [totalResult, dailyResult, userResult, errors, hourlyResult, commandResult] = await Promise.all([
       db.$queryRaw<Array<{ totalCount: bigint }>>`
         SELECT COUNT(*) AS totalCount FROM BotMessage WHERE botId = ${botId}
       `,
@@ -68,6 +70,27 @@ export async function GET(
         GROUP BY DATE(timestamp)
         ORDER BY date DESC
       `,
+      db.$queryRaw<Array<{ cnt: bigint }>>`
+        SELECT COUNT(DISTINCT userId) as cnt FROM BotMessage WHERE botId = ${botId}
+      `,
+      db.botLog.count({
+        where: { botId, level: { in: ['error', 'critical'] } },
+      }),
+      db.$queryRaw<Array<{ hour: number; count: bigint }>>`
+        SELECT CAST(strftime('%H', timestamp) AS INTEGER) as hour, COUNT(*) as count
+        FROM BotMessage
+        WHERE botId = ${botId} AND timestamp >= ${oneDayAgo.toISOString()}
+        GROUP BY hour
+        ORDER BY hour ASC
+      `,
+      db.$queryRaw<Array<{ command: string; count: bigint }>>`
+        SELECT command, COUNT(*) as count
+        FROM BotMessage
+        WHERE botId = ${botId} AND command IS NOT NULL
+        GROUP BY command
+        ORDER BY count DESC
+        LIMIT 10
+      `,
     ])
 
     const messageCount = Number(totalResult[0]?.totalCount ?? 0)
@@ -76,40 +99,11 @@ export async function GET(
       count: Number(r.dayCount),
     }))
 
-    // ── Unique Users ───────────────────────────────────────────────────
-    const userResult = await db.$queryRaw<Array<{ cnt: bigint }>>`
-      SELECT COUNT(DISTINCT userId) as cnt FROM BotMessage WHERE botId = ${botId}
-    `
     const users = Number(userResult[0]?.cnt ?? 0)
 
-    // ── Error Count (both 'error' and 'critical' levels) ──────────────
-    const errors = await db.botLog.count({
-      where: { botId, level: { in: ['error', 'critical'] } },
-    })
-
-    // ── Hourly Activity (last 24 hours) ───────────────────────────────
-    const oneDayAgo = new Date()
-    oneDayAgo.setHours(oneDayAgo.getHours() - 24)
-    const hourlyResult = await db.$queryRaw<Array<{ hour: number; count: bigint }>>`
-      SELECT CAST(strftime('%H', timestamp) AS INTEGER) as hour, COUNT(*) as count
-      FROM BotMessage
-      WHERE botId = ${botId} AND timestamp >= ${oneDayAgo.toISOString()}
-      GROUP BY hour
-      ORDER BY hour ASC
-    `
-    // Build 24-hour array (fill missing hours with 0)
     const hourlyMap = new Map(hourlyResult.map(r => [r.hour, Number(r.count)]))
     const hourlyActivity = Array.from({ length: 24 }, (_, i) => hourlyMap.get(i) ?? 0)
 
-    // ── Top Commands (top 10) ─────────────────────────────────────────
-    const commandResult = await db.$queryRaw<Array<{ command: string; count: bigint }>>`
-      SELECT command, COUNT(*) as count
-      FROM BotMessage
-      WHERE botId = ${botId} AND command IS NOT NULL
-      GROUP BY command
-      ORDER BY count DESC
-      LIMIT 10
-    `
     const totalCommands = commandResult.reduce((sum, r) => sum + Number(r.count), 0)
     const topCommands = commandResult.map(r => ({
       command: r.command,

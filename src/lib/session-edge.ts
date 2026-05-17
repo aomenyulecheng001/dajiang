@@ -53,6 +53,7 @@ const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000 // 7 days
 
 const tokenVersionEdgeCache = new Map<string, { version: number; cachedAt: number }>()
 const EDGE_CACHE_TTL_MS = 30 * 1000
+const MAX_EDGE_CACHE_SIZE = 10000
 
 // SECURITY FIX (SEC-89): Reduced cleanup interval from 60 minutes to 5 minutes.
 const _edgeCacheCleanupInterval = setInterval(() => {
@@ -149,6 +150,17 @@ export async function validateSessionEdge(token: string): Promise<{ userId: stri
             const data = await res.json()
             if (typeof data.tokenVersion === 'number') {
               dbVersion = data.tokenVersion as number
+              if (tokenVersionEdgeCache.size >= MAX_EDGE_CACHE_SIZE) {
+                let oldestKey: string | null = null
+                let oldestTime = Infinity
+                for (const [k, v] of tokenVersionEdgeCache) {
+                  if (v.cachedAt < oldestTime) {
+                    oldestTime = v.cachedAt
+                    oldestKey = k
+                  }
+                }
+                if (oldestKey) tokenVersionEdgeCache.delete(oldestKey)
+              }
               tokenVersionEdgeCache.set(payload.userId, { version: dbVersion, cachedAt: now })
             }
           }

@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useRef } from 'react'
+import { useState, useRef, useMemo } from 'react'
 import { Info, Code, Settings, ScrollText, BarChart3, MessageSquare, Users, AlertTriangle } from 'lucide-react'
 import { OverviewTab } from './tabs/overview-tab'
 import { CodeTab } from './tabs/code-tab'
@@ -17,12 +17,8 @@ import { useT, useLocale } from '@/lib/i18n'
 import { TabErrorBoundary } from './tab-error-boundary'
 
 export function BotDetail() {
-  const rawBot = useBotStore((s) => s.bots.find((b) => b.id === s.selectedBotId))
-  const botRef = useRef(rawBot)
-  if (rawBot !== botRef.current) {
-    botRef.current = rawBot
-  }
-  const bot = botRef.current
+  const selectedBotId = useBotStore((s) => s.selectedBotId)
+  const bot = useBotStore((s) => s.bots.find((b) => b.id === selectedBotId))
   const [activeTab, setActiveTab] = useState('overview')
   const t = useT()
   const locale = useLocale()

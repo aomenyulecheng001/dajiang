@@ -180,7 +180,7 @@ export async function GET(
       }
 
       // Track the last log timestamp we've sent to avoid duplicates
-      let lastSentTimestamp = new Date()
+      let lastSentTimestamp = new Date(0)
       let closed = false
 
       // If already aborted (client disconnected while we were setting up), bail out
@@ -305,6 +305,8 @@ export async function GET(
       if (!streamClosed) {
         streamClosed = true
         activeSSEConnections--
+        const uc = activeSSEConnectionsByUser.get(userId) || 1
+        activeSSEConnectionsByUser.set(userId, Math.max(0, uc - 1))
       }
       if (pendingTimers.poll) clearInterval(pendingTimers.poll)
       if (pendingTimers.heartbeat) clearInterval(pendingTimers.heartbeat)
@@ -317,7 +319,9 @@ export async function GET(
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache, no-transform',
       'Connection': 'keep-alive',
-      'X-Accel-Buffering': 'no', // Disable nginx buffering
+      'X-Accel-Buffering': 'no',
+      'X-Content-Type-Options': 'nosniff',
+      'X-Frame-Options': 'DENY',
     },
   })
 }

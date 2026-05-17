@@ -83,20 +83,40 @@ function safeCompare(a: string, b: string): boolean {
  * Falls back to config.webhookSecret for backward compatibility.
  * Returns null if the bot doesn't exist or has no secret.
  */
+const WEBHOOK_SECRET_CACHE_TTL = 5 * 60 * 1000
+const webhookSecretCache = new Map<string, { secret: string | null; expiresAt: number }>()
+
+const _secretCacheCleanup = setInterval(() => {
+  const now = Date.now()
+  for (const [key, entry] of webhookSecretCache) {
+    if (now > entry.expiresAt) webhookSecretCache.delete(key)
+  }
+}, 60_000)
+if (_secretCacheCleanup.unref) _secretCacheCleanup.unref()
+
 async function getBotWebhookSecret(botId: string): Promise<string | null> {
+  const cached = webhookSecretCache.get(botId)
+  if (cached && Date.now() < cached.expiresAt) return cached.secret
+
   try {
     const bot = await db.bot.findUnique({
       where: { id: botId },
       select: { webhookSecret: true, config: true },
     })
-    if (!bot) return null
+    if (!bot) {
+      webhookSecretCache.set(botId, { secret: null, expiresAt: Date.now() + WEBHOOK_SECRET_CACHE_TTL })
+      return null
+    }
 
-    // P1 OPT: Use dedicated column first (no JSON.parse needed)
-    if (bot.webhookSecret) return bot.webhookSecret
-
-    // Fallback: check config JSON for legacy data
-    const config = safeJsonParse(bot.config, {}) as Record<string, unknown>
-    return (config.webhookSecret as string) || null
+    let secret: string | null
+    if (bot.webhookSecret) {
+      secret = bot.webhookSecret
+    } else {
+      const config = safeJsonParse(bot.config, {}) as Record<string, unknown>
+      secret = (config.webhookSecret as string) || null
+    }
+    webhookSecretCache.set(botId, { secret, expiresAt: Date.now() + WEBHOOK_SECRET_CACHE_TTL })
+    return secret
   } catch {
     return null
   }

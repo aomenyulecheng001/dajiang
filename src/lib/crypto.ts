@@ -181,8 +181,11 @@ export async function encryptAsync(text: string): Promise<string> {
  */
 function parseEncryptedText(encryptedText: string): [string, string, string] {
   const raw = encryptedText.startsWith(ENC_PREFIX) ? encryptedText.slice(ENC_PREFIX.length) : encryptedText
-  const [ivHex, authTagHex, encrypted] = raw.split(':')
-  return [ivHex, authTagHex, encrypted]
+  const parts = raw.split(':')
+  if (parts.length !== 3) {
+    throw new Error('Invalid encrypted text format: expected 3 colon-separated parts')
+  }
+  return [parts[0], parts[1], parts[2]]
 }
 
 /**

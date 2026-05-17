@@ -309,7 +309,7 @@ httpServer.on('request', async (req: IncomingMessage, res: ServerResponse) => {
   // P2-BR-7 FIX: Health check endpoint for container orchestration
   if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({ ok: true, bots: botProcesses.size, uptime: process.uptime() }))
+    res.end(JSON.stringify({ ok: true, bots: botProcesses.size }))
     return
   }
 

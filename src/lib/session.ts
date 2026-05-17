@@ -146,7 +146,7 @@ const _tokenVersionCleanupInterval = setInterval(() => {
       tokenVersionCache.delete(key)
     }
   }
-}, 5 * 60 * 1000)
+}, 30 * 1000)
 if (typeof (_tokenVersionCleanupInterval as ReturnType<typeof setInterval> & { unref?: () => void }).unref === 'function') {
   (_tokenVersionCleanupInterval as ReturnType<typeof setInterval> & { unref: () => void }).unref()
 }
@@ -259,8 +259,13 @@ interface SessionPayload {
 export function createSession(userId: string, username: string, tokenVersion: number = 0): string {
   // Clean up old entries from recentSessions
   const now = Date.now()
-  while (recentSessions.length > 0 && now - recentSessions[0].createdAt > SESSION_TTL_MS) {
-    recentSessions.shift()
+  const cutoff = now - SESSION_TTL_MS
+  let startIdx = 0
+  while (startIdx < recentSessions.length && recentSessions[startIdx].createdAt < cutoff) {
+    startIdx++
+  }
+  if (startIdx > 0) {
+    recentSessions.splice(0, startIdx)
   }
 
   // Enforce per-user session limit
@@ -328,7 +333,8 @@ export async function validateSessionAsync(token: string): Promise<{ userId: str
       return null
     }
     if (!revocationsLoaded) {
-      console.warn('[Session] Revocation list not yet loaded, skipping revocation check')
+      console.error('[Session] Revocation list not yet loaded — rejecting token for safety (fail-closed)')
+      return null
     }
 
     // Decode payload

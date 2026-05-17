@@ -70,7 +70,9 @@ export async function middleware(request: NextRequest) {
     .replace(/\/api\/bots\/([a-zA-Z0-9._-]+)(?=\/|$)/g, '/api/bots/:id')
   const config = getRateLimitConfig(method, normalizedPathname)
 
-  const result = rateLimit.check(`${ip}:${method}:${normalizedPathname}`, config)
+  const rateLimitKey = `${ip}:${method}:${pathname}`
+
+  const result = rateLimit.check(rateLimitKey, config)
 
   const headers = getRateLimitHeaders(result)
 

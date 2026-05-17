@@ -1,5 +1,6 @@
 import { NextRequest } from 'next/server'
 import { validateSessionAsync } from '@/lib/session'
+import { db } from '@/lib/db'
 
 const SESSION_COOKIE_NAME = 'session_token'
 
@@ -55,7 +56,7 @@ export async function getCurrentUserId(request: Request): Promise<string | null>
     if (!token) {
       try {
         const url = new URL(request.url)
-        if (url.pathname.includes('/logs/stream')) {
+        if (url.pathname.match(/^\/api\/bots\/[^/]+\/logs\/stream$/)) {
           token = url.searchParams.get('token')
         }
       } catch {
@@ -121,8 +122,21 @@ export function safeJsonParse<T>(str: string | null | undefined, fallback: T): T
 }
 
 export function isBotOwner(ownerId: string | null | undefined, userId: string): boolean {
-  if (!ownerId || ownerId === 'migrate-pending') return true
+  if (!ownerId) return true
+  if (ownerId === 'migrate-pending') return process.env.ALLOW_BOT_AUTO_CLAIM === 'true'
   return ownerId === userId
+}
+
+export async function getBotIfAuthorized(
+  request: Request,
+  botId: string,
+): Promise<{ bot: Record<string, unknown> & { ownerId: string | null } } | null> {
+  const userId = await getCurrentUserId(request)
+  if (!userId) return null
+  const bot = await db.bot.findUnique({ where: { id: botId } })
+  if (!bot) return null
+  if (!isBotOwner(bot.ownerId as string | null, userId)) return null
+  return bot as Record<string, unknown> & { ownerId: string | null }
 }
 
 /** Server-side bot token format validation.

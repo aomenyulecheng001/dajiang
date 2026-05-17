@@ -4,6 +4,11 @@
  * In-memory rate limiter using a sliding window algorithm.
  * No external dependencies required. Automatically cleans up expired entries.
  *
+ * Algorithm:
+ * - Maintains current and previous window counters
+ * - When checking, the effective count is: prevCount * (1 - elapsed/window) + currentCount
+ * - This prevents the 2x burst allowed by fixed-window at window boundaries
+ *
  * Usage:
  *   import { rateLimit } from '@/lib/rate-limit'
  *   const result = rateLimit.check(ip, { max: 60, window: 60 })
@@ -29,6 +34,7 @@ export interface RateLimitResult {
 interface WindowRecord {
   count: number
   windowStart: number
+  prevCount: number
 }
 
 // ─── Default Rate Limit Configs ──────────────────────────────────────────
@@ -79,9 +85,10 @@ export const RATE_LIMIT_WEBHOOK: RateLimitConfig = { max: 200, window: 60 }
  * Sliding window counter rate limiter.
  *
  * Algorithm:
- * - Each key (IP address) gets a window counter
- * - When the window expires, the counter is proportionally decayed
- * - If the key exceeds max requests, it's rate-limited
+ * - Each key maintains current window count and previous window count
+ * - Effective count = prevCount * (1 - elapsed/window) + currentCount
+ * - When the current window expires, currentCount becomes prevCount and resets to 1
+ * - This smoothly transitions between windows, preventing 2x burst at boundaries
  *
  * SECURITY NOTE (SEC-10): This in-memory rate limiter does not work in
  * multi-instance deployments. Each instance maintains its own counter,
@@ -116,7 +123,7 @@ class RateLimiter {
 
     // No existing record → allow first request
     if (!record) {
-      this.store.set(key, { count: 1, windowStart: now })
+      this.store.set(key, { count: 1, windowStart: now, prevCount: 0 })
       return {
         success: true,
         remaining: config.max - 1,
@@ -127,8 +134,9 @@ class RateLimiter {
 
     const elapsed = now - record.windowStart
 
-    // Window has expired → reset counter
+    // Window has expired → shift current to previous, start new window
     if (elapsed >= config.window) {
+      record.prevCount = record.count
       record.count = 1
       record.windowStart = now
       return {
@@ -139,10 +147,14 @@ class RateLimiter {
       }
     }
 
+    // Calculate sliding window count: weighted previous + current
+    const weight = 1 - (elapsed / config.window)
+    const effectiveCount = Math.ceil(record.prevCount * weight) + record.count
+
     // Window is still active → increment counter
     record.count++
 
-    if (record.count > config.max) {
+    if (effectiveCount > config.max) {
       return {
         success: false,
         remaining: 0,
@@ -153,7 +165,7 @@ class RateLimiter {
 
     return {
       success: true,
-      remaining: config.max - record.count,
+      remaining: Math.max(0, config.max - effectiveCount),
       resetAt: record.windowStart + config.window,
       limit: config.max,
     }

@@ -98,7 +98,8 @@ export async function POST(request: NextRequest) {
 
     const result = await authenticateUser(normalizedUsername, password)
     if (!result) {
-      console.warn(`[Auth] Failed login attempt for user: ${username}, IP: ${clientIp}`)
+      const maskedUsername = username.length > 2 ? username.slice(0, 2) + '***' : '***'
+      console.warn(`[Auth] Failed login attempt for user: ${maskedUsername}, IP: ${clientIp}`)
       const existing = failedLoginAttempts.get(lockoutKey) || { count: 0, lockedUntil: 0, createdAt: Date.now() }
       existing.count++
       if (existing.count >= MAX_FAILED_ATTEMPTS) {

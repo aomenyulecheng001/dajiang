@@ -1,7 +1,7 @@
 import { db } from '@/lib/db'
 import { NextResponse } from 'next/server'
 import { validateBotId } from '@/lib/validation'
-import { getCurrentUserId, isBotOwner } from '@/lib/api-helpers'
+import { getBotIfAuthorized } from '@/lib/api-helpers'
 
 const MAX_MESSAGE_LENGTH = 10000
 const MAX_SOURCE_LENGTH = 200
@@ -27,12 +27,7 @@ export async function POST(
       return NextResponse.json({ error: idErrors[0].message }, { status: 400 })
     }
 
-    const userId = await getCurrentUserId(request)
-    if (!userId) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
-    const ownershipBot = await db.bot.findUnique({ where: { id }, select: { ownerId: true } })
-    if (!ownershipBot || !isBotOwner(ownershipBot.ownerId, userId)) {
+    if (!await getBotIfAuthorized(request, id)) {
       return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
 
@@ -120,12 +115,7 @@ export async function GET(
       return NextResponse.json({ error: idErrors[0].message }, { status: 400 })
     }
 
-    const userId = await getCurrentUserId(request)
-    if (!userId) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
-    const ownershipBot = await db.bot.findUnique({ where: { id }, select: { ownerId: true } })
-    if (!ownershipBot || !isBotOwner(ownershipBot.ownerId, userId)) {
+    if (!await getBotIfAuthorized(request, id)) {
       return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
 

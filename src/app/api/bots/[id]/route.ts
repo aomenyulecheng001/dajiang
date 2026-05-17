@@ -71,13 +71,13 @@ export async function GET(
       return NextResponse.json({ error: idErrors[0].message }, { status: 400 })
     }
 
-    const { authorized } = await checkOwnership(request, id)
-    if (!authorized) {
-      return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
+    const userId = await getCurrentUserId(request)
+    if (!userId) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
     const bot = await db.bot.findUnique({ where: { id } })
-    if (!bot) {
+    if (!bot || !isBotOwner(bot.ownerId, userId)) {
       return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
 
