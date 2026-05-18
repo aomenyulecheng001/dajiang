@@ -77,7 +77,7 @@ export function KeyboardShortcuts({
         target.tagName === 'TEXTAREA' ||
         target.isContentEditable
 
-      if (e.nativeEvent?.isComposing || e.keyCode === 229) return
+      if (e.isComposing || e.keyCode === 229) return
 
       // Ctrl+K: Now handled by CommandPalette component — no duplicate
       if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
