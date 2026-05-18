@@ -410,7 +410,7 @@ export async function DELETE(
     }
 
     const { authorized, userId: deleteUserId } = await checkOwnership(request, id)
-    if (authorized !== true) {
+    if (!authorized || !deleteUserId) {
       return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
 
