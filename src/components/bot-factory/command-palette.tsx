@@ -176,6 +176,10 @@ export function CommandPalette() {
   // Clamp selectedIndex when filtered changes
   const clampedIndex = Math.min(selectedIndex, Math.max(filtered.length - 1, 0))
 
+  useEffect(() => {
+    setSelectedIndex(prev => Math.min(prev, Math.max(filtered.length - 1, 0)))
+  }, [filtered.length])
+
   // Keyboard shortcut to open
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {

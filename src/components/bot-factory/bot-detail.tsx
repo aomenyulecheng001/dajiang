@@ -9,6 +9,7 @@ import { LogsTab } from './tabs/logs-tab'
 import { MonitoringTab } from './tabs/monitoring-tab'
 import { Badge } from '@/components/ui/badge'
 import { cn, statusConfig, getStatusLabel, formatNumber } from '@/lib/utils'
+import { LANGUAGE_LABELS } from '@/lib/bot-constants'
 import { BotAvatar } from './bot-avatar'
 import { useBotStore } from '@/store/bot-store'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
@@ -17,8 +18,17 @@ import { useT, useLocale } from '@/lib/i18n'
 import { TabErrorBoundary } from './tab-error-boundary'
 
 export function BotDetail() {
-  const selectedBotId = useBotStore((s) => s.selectedBotId)
-  const bot = useBotStore((s) => s.bots.find((b) => b.id === selectedBotId))
+  // PERF OPT: Single stable selector reads selectedBotId from store state
+  // instead of closure. Previous approach used two separate subscriptions:
+  //   const selectedBotId = useBotStore((s) => s.selectedBotId)
+  //   const bot = useBotStore((s) => s.bots.find((b) => b.id === selectedBotId))
+  // This caused: (1) two subscriptions, (2) selector function recreation on
+  // every render due to closure over selectedBotId, (3) potential mismatch
+  // between selectedBotId and bot during re-renders.
+  const bot = useBotStore((s) => {
+    const selectedId = s.selectedBotId
+    return selectedId ? s.bots.find((b) => b.id === selectedId) : null
+  })
   const [activeTab, setActiveTab] = useState('overview')
   const t = useT()
   const locale = useLocale()
@@ -67,7 +77,7 @@ export function BotDetail() {
                 {statusLabel}
               </Badge>
               <span className="text-xs text-muted-foreground">
-                v{bot.version} · {bot.language === 'javascript' ? 'JavaScript' : bot.language === 'typescript' ? 'TypeScript' : bot.language === 'python' ? 'Python' : bot.language}
+                v{bot.version} · {LANGUAGE_LABELS[bot.language] || bot.language}
               </span>
             </div>
             <p className="text-sm text-muted-foreground/80 leading-relaxed max-w-lg mt-0.5">

@@ -4,30 +4,31 @@ import React, { useState, useEffect, useMemo } from 'react'
 import { Cpu, MemoryStick, RotateCcw, Clock, AlertTriangle, Activity } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
-import { useBotRunnerConnection, useBotStatuses, useResourceData } from '@/lib/bot-runner-context'
+import { useBotRunnerConnection, useBotStatus, useBotResourceData } from '@/lib/bot-runner-context'
 import { useT } from '@/lib/i18n'
 import { cn, formatUptimeShort } from '@/lib/utils'
+import { DEFAULT_MAX_MEMORY_MB } from '@/lib/bot-constants'
 
 // ─── Resource Monitor ──────────────────────────────────────────────────────
 
 export const ResourceMonitor = React.memo(function ResourceMonitor({ botId }: { botId: string }) {
   const t = useT()
   const { connected } = useBotRunnerConnection()
-  const botStatuses = useBotStatuses()
-  const resourceData = useResourceData()
+  // PERF OPT: Use per-bot hooks instead of full Map subscriptions.
+  // Previously used useBotStatuses()/useResourceData() which returned the
+  // entire Map, causing re-renders when ANY bot's status changed.
+  const status = useBotStatus(botId)
+  const resource = useBotResourceData(botId)
   const [mounted, setMounted] = useState(false)
 
   useEffect(() => {
     requestAnimationFrame(() => setMounted(true))
   }, [])
 
-  const status = botStatuses.get(botId)
-  const resource = resourceData.get(botId)
-
   const derived = useMemo(() => {
     const isRunning = status?.status === 'running'
     const memoryMb = resource?.memoryUsageMb ?? 0
-    const maxMemoryMb = 256
+    const maxMemoryMb = DEFAULT_MAX_MEMORY_MB
     const memoryPercent = maxMemoryMb > 0 ? Math.min((memoryMb / maxMemoryMb) * 100, 100) : 0
     const cpuPercent = resource?.cpuUsage ?? 0
     const hasCpuData = cpuPercent > 0 || memoryMb > 0

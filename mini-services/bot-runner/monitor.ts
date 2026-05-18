@@ -20,6 +20,12 @@ interface CpuSnapshot {
  * cpuUsage will default to 0. Cross-platform CPU monitoring would require
  * the `systeminformation` npm package or `os.cpus()` based heuristics.
  *
+ * CROSS-PLATFORM NOTE: On Windows/macOS, this returns null and cpuUsage
+ * defaults to 0. For production monitoring on these platforms, consider
+ * using the `systeminformation` npm package or `os.cpus()` based heuristics.
+ * The readProcessCpuCrossPlatform wrapper provides the extension point
+ * for adding platform-specific implementations.
+ *
  * P2-3 FIX: Uses readFileSync instead of execSync to avoid blocking shell.
  * Direct file reads are significantly faster and avoid shell interpretation.
  *
@@ -38,9 +44,9 @@ function readProcCpu(pid: number): CpuSnapshot | null {
     const fields = stat.substring(lastParen + 2).trim().split(/\s+/)
     // Fields after comm: 1-based index from after ')'
     // utime = index 13 (0-based), stime = index 14, starttime = index 21
-    const utime = parseInt(fields[13])
-    const stime = parseInt(fields[14])
-    const startTime = parseInt(fields[21])
+    const utime = parseInt(fields[11])
+    const stime = parseInt(fields[12])
+    const startTime = parseInt(fields[19])
 
     if (isNaN(utime) || isNaN(stime) || isNaN(startTime)) return null
 
@@ -71,6 +77,13 @@ function readProcCpu(pid: number): CpuSnapshot | null {
   }
 }
 
+async function readProcessCpuCrossPlatform(pid: number): Promise<CpuSnapshot | null> {
+  if (process.platform === 'linux') {
+    return readProcCpu(pid)
+  }
+  return null
+}
+
 // Store previous CPU snapshots per bot
 const cpuSnapshots = new Map<string, CpuSnapshot>()
 
@@ -79,8 +92,8 @@ const cpuSnapshots = new Map<string, CpuSnapshot>()
  * Uses delta between current and previous snapshot.
  * Returns 0 if no previous data or unable to read.
  */
-function calculateCpuUsage(botId: string, pid: number): number {
-  const current = readProcCpu(pid)
+async function calculateCpuUsage(botId: string, pid: number): Promise<number> {
+  const current = await readProcessCpuCrossPlatform(pid)
 
   if (!current) return 0
 
@@ -109,19 +122,19 @@ export function startMonitoring(botProcesses: Map<string, BotProcess>): void {
   // Avoid duplicate timers
   if (monitorTimer) return
 
-  monitorTimer = setInterval(() => {
+  monitorTimer = setInterval(async () => {
     for (const [botId, bot] of botProcesses.entries()) {
       if (bot.status !== 'running' || !bot.process || !bot.process.pid) continue
 
       try {
-        bot.memoryUsage = getChildProcessMemory(bot.process.pid)
+        bot.memoryUsage = await getChildProcessMemory(bot.process.pid)
       } catch {
         // Ignore monitoring errors
       }
 
       // P1-6 FIX: Calculate actual CPU usage
       try {
-        bot.cpuUsage = calculateCpuUsage(botId, bot.process.pid)
+        bot.cpuUsage = await calculateCpuUsage(botId, bot.process.pid)
       } catch {
         // If CPU calculation fails, leave previous value
       }
@@ -152,7 +165,7 @@ export function startMonitoring(botProcesses: Map<string, BotProcess>): void {
               appendLog(botId, '内存超限进程未响应 SIGTERM，强制终止...', 'warn')
               try { procRef.kill('SIGKILL') } catch { /* ignore */ }
             }
-          }, 5000)
+          }, 10000)
           forceKillTimer.unref() // BUG FIX: Don't let this timer prevent graceful shutdown
           // Clear force-kill timer if process exits naturally
           procRef.once('close', () => { clearTimeout(forceKillTimer) })
@@ -184,6 +197,7 @@ export function startMonitoring(botProcesses: Map<string, BotProcess>): void {
 
     io.emit('resources:update', resourceData)
   }, 3000)
+  monitorTimer.unref()
 }
 
 export function stopMonitoring(): void {

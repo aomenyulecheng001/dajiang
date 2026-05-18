@@ -259,7 +259,10 @@ export function validateBotCreate(body: Record<string, unknown>): ValidationResu
 }
 
 /**
- * Validate bot full-update payload (PUT — name is still required)
+ * Validate bot full-update payload (PUT — name is still required).
+ * Delegates to validateBotCreate since PUT requires all fields to be valid.
+ * Kept as a separate function for future divergence (e.g., PUT may allow
+ * omitting certain fields that POST requires).
  */
 export function validateBotUpdate(body: Record<string, unknown>): ValidationResult {
   return validateBotCreate(body)

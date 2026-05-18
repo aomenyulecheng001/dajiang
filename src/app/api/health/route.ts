@@ -37,7 +37,7 @@ export async function GET() {
       status: 'degraded',
       timestamp: new Date().toISOString(),
       responseTimeMs: Date.now() - startTime,
-      error: 'Database connection failed',
+      error: 'Service unavailable',
     }, { status: 503 })
   }
 }

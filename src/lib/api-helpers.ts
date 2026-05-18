@@ -98,7 +98,7 @@ export function serializeBotListResponse(bot: Record<string, unknown>): Record<s
     // projectFiles excluded from list query — fetched in detail view
     entryPoint: (bot.entryPoint as string) || undefined,
     // BUG FIX: Include lastDeployedAt so bot cards can show "needs restart" badge
-    lastDeployedAt: (bot.lastDeployedAt as string) || undefined,
+    lastDeployedAt: bot.lastDeployedAt instanceof Date ? bot.lastDeployedAt.toISOString() : (bot.lastDeployedAt as string || undefined),
     lastRunnerStatus: (bot.lastRunnerStatus as string) || undefined,
     // Token status not computed for list view
     tokenStatus: 'not_set' as const,
@@ -111,32 +111,48 @@ export function serializeBotListResponse(bot: Record<string, unknown>): Record<s
 }
 
 /** Safely parse a JSON string with a fallback value */
-export function safeJsonParse<T>(str: string | null | undefined, fallback: T): T {
+export function safeJsonParse<T>(str: string | null | undefined, fallback: T, fieldName?: string): T {
   if (!str) return fallback
   try {
     return JSON.parse(str) as T
-  } catch {
-    console.warn(`Failed to parse JSON field, using fallback. Length: ${str?.length}`)
+  } catch (e) {
+    const name = fieldName || 'unknown'
+    const preview = str.length > 100 ? str.slice(0, 100) + '...' : str
+    console.warn(`[safeJsonParse] Failed to parse JSON field "${name}" (length: ${str.length}, preview: "${preview}"): ${e instanceof Error ? e.message : e}`)
     return fallback
   }
 }
 
 export function isBotOwner(ownerId: string | null | undefined, userId: string): boolean {
-  if (!ownerId) return true
-  if (ownerId === 'migrate-pending') return process.env.ALLOW_BOT_AUTO_CLAIM === 'true'
+  if (!ownerId || ownerId === 'migrate-pending') {
+    return false
+  }
   return ownerId === userId
 }
 
+/**
+ * PERF OPT: Lightweight authorization check — only selects { id, ownerId }
+ * instead of all Bot fields. Previously fetched the entire row including
+ * large columns (projectFiles, code, envVars, codeBlocks) that were never
+ * used by callers. For a Bot with many project files, this avoids
+ * transferring 50-200KB of unnecessary data per authorization check.
+ *
+ * All current callers (logs/route.ts, messages/route.ts) only use the
+ * return value as a boolean: `if (!await getBotIfAuthorized(...))`.
+ */
 export async function getBotIfAuthorized(
   request: Request,
   botId: string,
-): Promise<{ bot: Record<string, unknown> & { ownerId: string | null } } | null> {
+): Promise<{ id: string; ownerId: string | null } | null> {
   const userId = await getCurrentUserId(request)
   if (!userId) return null
-  const bot = await db.bot.findUnique({ where: { id: botId } })
+  const bot = await db.bot.findUnique({
+    where: { id: botId },
+    select: { id: true, ownerId: true },
+  })
   if (!bot) return null
   if (!isBotOwner(bot.ownerId as string | null, userId)) return null
-  return bot as Record<string, unknown> & { ownerId: string | null }
+  return bot
 }
 
 /** Server-side bot token format validation.
@@ -213,7 +229,7 @@ export async function serializeBotResponse(
     projectFiles: safeJsonParse(bot.projectFiles as string, []),
     entryPoint: (bot.entryPoint as string) || undefined,
     // BUG FIX: Convert empty strings to undefined to match frontend type contract
-    lastDeployedAt: (bot.lastDeployedAt as string) || undefined,
+    lastDeployedAt: bot.lastDeployedAt instanceof Date ? bot.lastDeployedAt.toISOString() : (bot.lastDeployedAt as string || undefined),
     lastRunnerStatus: (bot.lastRunnerStatus as string) || undefined,
     tokenStatus,
     tokenPreview,

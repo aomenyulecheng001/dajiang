@@ -12,19 +12,8 @@ export async function fetchRevealEnvVars(botId: string): Promise<{ envVarsMap: R
   const locale = useI18nStore.getState().locale
   const t = (key: string) => getTranslation(locale, key as any)
   try {
-    const res = await fetch(`/api/bots/${botId}/env-vars/reveal`, { credentials: 'include' })
-    if (res.status === 401) {
-      import('@/store/auth-store').then(({ useAuthStore }) => {
-        const store = useAuthStore.getState()
-        if (store.isAuthenticated) {
-          store.setAuth(false, null, null)
-          import('sonner').then(({ toast }) => {
-            toast.error(t('common.sessionExpired'), { description: t('common.pleaseLoginAgain') })
-          }).catch(() => {})
-        }
-      }).catch(() => {})
-      return null
-    }
+    const { authFetch } = await import('@/store/bot-store')
+    const res = await authFetch(`/api/bots/${botId}/env-vars/reveal`)
     if (res.status === 429) {
       import('sonner').then(({ toast }) => {
         toast.error(t('common.tooManyRequests'))
@@ -40,7 +29,9 @@ export async function fetchRevealEnvVars(botId: string): Promise<{ envVarsMap: R
       const botToken = [envVarsMap.BOT_TOKEN, envVarsMap.TELEGRAM_BOT_TOKEN].filter(Boolean).slice(-1)[0] || ''
       return { envVarsMap, botToken }
     }
-  } catch { /* fall through */ }
+  } catch (err) {
+    console.warn('[deploy-utils] fetchRevealEnvVars failed:', err instanceof Error ? err.message : err)
+  }
   return null
 }
 

@@ -7,6 +7,7 @@ const MAX_TEXT_LENGTH = 5000
 const MAX_USER_ID_LENGTH = 200
 const MAX_USER_NAME_LENGTH = 200
 const MAX_COMMAND_LENGTH = 100
+const MAX_MESSAGES_PER_HOUR = 10000
 
 /**
  * POST /api/bots/[id]/messages
@@ -60,13 +61,23 @@ export async function POST(
         return NextResponse.json({ error: 'Batch size exceeds 100 messages' }, { status: 400 })
       }
 
-      const data = msgs.map(m => ({
-        botId: id,
-        userId: typeof m.userId === 'string' ? m.userId.slice(0, MAX_USER_ID_LENGTH) : '',
-        userName: typeof m.userName === 'string' ? m.userName.slice(0, MAX_USER_NAME_LENGTH) : '',
-        text: typeof m.text === 'string' ? m.text.slice(0, MAX_TEXT_LENGTH) : '',
-        command: typeof m.command === 'string' && m.command.trim() ? m.command.slice(0, MAX_COMMAND_LENGTH) : null,
-      }))
+      const data = msgs
+        .filter(m => typeof m.userId === 'string' && m.userId.trim())
+        .map(m => ({
+          botId: id,
+          userId: (m.userId as string).slice(0, MAX_USER_ID_LENGTH),
+          userName: typeof m.userName === 'string' ? m.userName.slice(0, MAX_USER_NAME_LENGTH) : '',
+          text: typeof m.text === 'string' ? m.text.slice(0, MAX_TEXT_LENGTH) : '',
+          command: typeof m.command === 'string' && m.command.trim() ? m.command.slice(0, MAX_COMMAND_LENGTH) : null,
+        }))
+
+      // P1-5 FIX: Apply same rate limit to batch path
+      const recentBatchCount = await db.botMessage.count({
+        where: { botId: id, timestamp: { gte: new Date(Date.now() - 60 * 60 * 1000) } },
+      })
+      if (recentBatchCount + data.length > MAX_MESSAGES_PER_HOUR) {
+        return NextResponse.json({ error: 'Rate limit exceeded' }, { status: 429 })
+      }
 
       const result = await db.botMessage.createMany({ data })
       return NextResponse.json({ created: result.count }, { status: 201 })
@@ -78,8 +89,24 @@ export async function POST(
 
     const msgUserId = (body.userId as string).slice(0, MAX_USER_ID_LENGTH)
     const userName = typeof body.userName === 'string' ? (body.userName as string).slice(0, MAX_USER_NAME_LENGTH) : ''
-    const messageText = typeof body.text === 'string' ? (body.text as string).slice(0, MAX_TEXT_LENGTH) : ''
     const command = typeof body.command === 'string' && body.command.trim() ? (body.command as string).slice(0, MAX_COMMAND_LENGTH) : null
+
+    if (typeof body.text === 'string' && body.text.length > MAX_TEXT_LENGTH) {
+      return NextResponse.json(
+        { error: `Message text too long (max ${MAX_TEXT_LENGTH} characters)` },
+        { status: 400 }
+      )
+    }
+    const messageText = typeof body.text === 'string' ? body.text : ''
+    const recentCount = await db.botMessage.count({
+      where: { botId: id, timestamp: { gte: new Date(Date.now() - 60 * 60 * 1000) } },
+    })
+    if (recentCount >= MAX_MESSAGES_PER_HOUR) {
+      return NextResponse.json(
+        { error: 'Rate limit: too many messages in the last hour' },
+        { status: 429 }
+      )
+    }
 
     const message = await db.botMessage.create({
       data: {

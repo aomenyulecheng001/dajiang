@@ -14,6 +14,51 @@ export const LOGS_DIR = resolve(dirname(fileURLToPath(import.meta.url)), 'logs')
 // P3-6 FIX: Only use sync mkdirSync at module init time (acceptable for startup)
 mkdirSync(LOGS_DIR, { recursive: true })
 
+// ─── Sensitive Data Filtering (Security Fix) ──────────────────────────────
+
+/**
+ * Patterns for detecting and redacting sensitive information in logs.
+ * FIX: Prevents accidental leakage of tokens, passwords, API keys, etc.
+ */
+// CANONICAL SOURCE: These patterns must be kept in sync with
+// src/lib/security-utils.ts SENSITIVE_DATA_PATTERNS.
+// Any changes here should be mirrored there and vice versa.
+const SENSITIVE_PATTERNS: Array<{ pattern: RegExp; replacement: string }> = [
+  // Bot tokens (Telegram, Discord, Slack format)
+  { pattern: /\d{9,}:[a-zA-Z0-9_-]{30,}/g, replacement: '[BOT_TOKEN_REDACTED]' },
+  // Generic bot_token patterns
+  { pattern: /bot[_-]?token["\s:=]+[a-zA-Z0-9:_-]+/gi, replacement: 'bot_token=[REDACTED]' },
+  // API keys
+  { pattern: /api[_-]?key["\s:=]+[a-zA-Z0-9_-]+/gi, replacement: 'api_key=[REDACTED]' },
+  // Passwords
+  { pattern: /password["\s:=]+[^\s]+/gi, replacement: 'password=[REDACTED]' },
+  // Secrets
+  { pattern: /secret["\s:=]+[^\s]+/gi, replacement: 'secret=[REDACTED]' },
+  // Authorization headers
+  { pattern: /authorization["\s:=]+bearer\s+[a-zA-Z0-9._-]+/gi, replacement: 'authorization=Bearer [REDACTED]' },
+  // JWT tokens
+  { pattern: /eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*/g, replacement: '[JWT_REDACTED]' },
+  // Connection strings with passwords
+  { pattern: /:\/\/[^:]+:[^@]+@/g, replacement: '://[USER]:[PASS]@' },
+  // Private keys (PEM format start)
+  { pattern: /-----BEGIN\s+(?:RSA\s+)?PRIVATE\s+KEY-----[\s\S]*?-----END\s+(?:RSA\s+)?PRIVATE\s+KEY-----/g, replacement: '[PRIVATE_KEY_REDACTED]' },
+]
+
+/**
+ * Sanitize a log message by redacting sensitive information.
+ * FIX: Prevents sensitive data from being written to log files.
+ * 
+ * @param message - The original log message
+ * @returns The sanitized message with sensitive data replaced
+ */
+export function sanitizeLogMessage(message: string): string {
+  let sanitized = message
+  for (const { pattern, replacement } of SENSITIVE_PATTERNS) {
+    sanitized = sanitized.replace(pattern, replacement)
+  }
+  return sanitized
+}
+
 // ─── Shared State (imported from modules that need them) ──────────────────
 
 // We use a getter pattern so the state can be set after module initialization
@@ -78,17 +123,21 @@ export function appendLog(botId: string, message: string, level: 'info' | 'warn'
   const bot = _botProcesses?.get(botId)
   if (!bot) return
 
+  // FIX: Sanitize message to remove sensitive information before logging
+  const safeMessage = sanitizeLogMessage(message)
+  
   const timestamp = new Date().toISOString()
-  const logLine = JSON.stringify({ timestamp, level, message })
+  const logLine = JSON.stringify({ timestamp, level, message: safeMessage })
 
   bot.logBuffer.push(logLine)
   if (bot.logBuffer.length > bot.maxLogLines) {
-    bot.logBuffer = bot.logBuffer.slice(-MAX_LOG_LINES)
+    bot.logBuffer = bot.logBuffer.slice(-bot.maxLogLines)
   }
 
   // P2-34 FIX: Handle ENOSPC (disk full) errors specifically instead of silently ignoring
   // P2-BR-8 FIX: Use async appendFile instead of sync appendFileSync to avoid blocking event loop
-  appendFile(join(LOGS_DIR, `${sanitizeBotId(botId)}.log`), `${timestamp} [${level}] ${message}\n`, 'utf-8')
+  // FIX: Also sanitize the message written to file
+  appendFile(join(LOGS_DIR, `${sanitizeBotId(botId)}.log`), `${timestamp} [${level}] ${safeMessage}\n`, 'utf-8')
     .then(() => { _enospcWarned = false }) // Reset flag on successful write
     .catch((err: any) => {
       if (err.code === 'ENOSPC') {
@@ -103,13 +152,20 @@ export function appendLog(botId: string, message: string, level: 'info' | 'warn'
     })
 
   // Broadcast to connected WebSocket clients
-  io.emit('bot:log', { botId, timestamp, level, message })
+  io.emit('bot:log', { botId, timestamp, level, message: safeMessage })
 }
+
+export const MAX_DEPLOY_LOG_LINES = 1000
 
 export function appendDeployLog(botId: string, message: string) {
   const status = _deployStatus?.get(botId)
   if (status) {
-    status.logs.push(`[${new Date().toISOString()}] ${message}`)
-    io.emit('deploy:progress', { botId, ...status })
+    const sanitizedMessage = sanitizeLogMessage(message)
+    const logLine = `[${new Date().toISOString()}] ${sanitizedMessage}`
+    status.logs.push(logLine)
+    if (status.logs.length > MAX_DEPLOY_LOG_LINES) {
+      status.logs = status.logs.slice(-MAX_DEPLOY_LOG_LINES)
+    }
+    io.emit('deploy:log', { botId, log: logLine })
   }
 }

@@ -1,5 +1,10 @@
 import { create } from 'zustand'
 
+// SECURITY NOTE: Login credentials (username/password) exist briefly in JavaScript
+// memory during form submission. This is standard for SPAs but means an XSS
+// vulnerability could expose them. Mitigate by: (1) strict CSP headers,
+// (2) sanitizing all user-rendered content, (3) avoiding innerHTML.
+
 interface AuthState {
   isAuthenticated: boolean
   isLoading: boolean
@@ -21,8 +26,8 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   },
   setLoading: (loading) => set({ isLoading: loading }),
   updateUsername: (newUsername: string) => set({ username: newUsername }),
-  logout: () => {
-    fetch('/api/auth/logout', {
+  logout: async () => {
+    await fetch('/api/auth/logout', {
       method: 'POST',
       credentials: 'include',
     }).catch(() => {})

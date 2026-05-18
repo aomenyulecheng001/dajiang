@@ -48,7 +48,7 @@ export function ConfigTab() {
     if (isRunning) {
       toast.success(description || t('configTab.saved'), {
         id: 'config-changed',
-        description: t('configTab.restartRequired') || 'Changes will take effect after restart',
+        description: t('configTab.restartRequired'),
       })
     } else {
       toast.success(description || t('configTab.saved'), { id: 'config-changed' })
@@ -67,7 +67,13 @@ export function ConfigTab() {
 
   const saveEdit = (field: string) => {
     const num = parseInt(editValue, 10)
-    if (isNaN(num) || num <= 0) {
+    if (isNaN(num) || num < 0) {
+      toast.error(t('configTab.invalidNumber'))
+      return
+    }
+    if (field === 'timeout' && num === 0) {
+      // 0 means "no timeout" — valid for timeout field
+    } else if (field !== 'timeout' && num <= 0) {
       toast.error(t('configTab.invalidNumber'))
       return
     }
@@ -118,7 +124,7 @@ export function ConfigTab() {
         <div className="flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50/60 dark:border-amber-500/20 dark:bg-amber-500/5 p-3">
           <AlertTriangle className="size-4 text-amber-500 shrink-0" />
           <span className="text-[13px] text-amber-700 dark:text-amber-400">
-            {t('configTab.restartRequired') || 'Changes will take effect after restart'}
+            {t('configTab.restartRequired')}
           </span>
         </div>
       )}

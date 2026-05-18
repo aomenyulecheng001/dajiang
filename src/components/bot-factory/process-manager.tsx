@@ -1,10 +1,10 @@
 'use client'
 
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect } from 'react'
 import { Server, MemoryStick, Cpu, Clock, Activity } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
-import { useBotRunnerConnection, useBotStatuses, useResourceData } from '@/lib/bot-runner-context'
+import { useBotRunnerConnection, useBotStatus, useBotResourceData } from '@/lib/bot-runner-context'
 import { useBotStore } from '@/store/bot-store'
 import { useT } from '@/lib/i18n'
 import { cn, formatUptimeShort } from '@/lib/utils'
@@ -26,11 +26,12 @@ export function ProcessManager() {
   // causing re-renders on any bot's status/resource change even though we only
   // need data for the selected bot. Split contexts allow more granular subscriptions.
   const { connected } = useBotRunnerConnection()
-  const botStatuses = useBotStatuses()
-  const resourceData = useResourceData()
   const selectedBotId = useBotStore((s) => s.selectedBotId)
-  const botStatus = useMemo(() => botStatuses.get(selectedBotId || ''), [botStatuses, selectedBotId])
-  const botResource = useMemo(() => resourceData.get(selectedBotId || ''), [resourceData, selectedBotId])
+  // PERF OPT: Use per-bot hooks instead of full Map subscriptions.
+  // Previously used useBotStatuses()/useResourceData() which returned the
+  // entire Map, causing re-renders when ANY bot's status changed.
+  const botStatus = useBotStatus(selectedBotId || '')
+  const botResource = useBotResourceData(selectedBotId || '')
   const [mounted, setMounted] = useState(false)
 
   useEffect(() => {
@@ -126,7 +127,7 @@ export function ProcessManager() {
               <div className="flex items-center gap-1.5">
                 <StatusBadge status={proc.status} t={t} />
               </div>
-              <div className="text-muted-foreground">PID: <span className="text-foreground font-mono">{proc.pid || '—'}</span></div>
+              <div className="text-muted-foreground">{t('resourceMonitor.pid')}: <span className="text-foreground font-mono">{proc.pid || '—'}</span></div>
               <div className="text-muted-foreground">
                 <MemoryStick className="size-2.5 inline mr-0.5" />
                 {proc.resource?.memoryUsageMb?.toFixed(1) || '0.0'} {t('resourceMonitor.mb')}

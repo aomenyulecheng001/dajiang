@@ -151,9 +151,11 @@ class RateLimiter {
     const weight = 1 - (elapsed / config.window)
     const effectiveCount = Math.ceil(record.prevCount * weight) + record.count
 
-    // Window is still active → increment counter
-    record.count++
-
+    // BUG FIX (BUG-4): Check if request would exceed limit BEFORE incrementing.
+    // Previously, record.count++ was called before the limit check, meaning
+    // rejected requests still incremented the counter. This caused:
+    // 1. Inflated count values making the next window's sliding calculation too aggressive
+    // 2. Rejected requests "consuming" quota, making it harder for legitimate requests
     if (effectiveCount > config.max) {
       return {
         success: false,
@@ -163,16 +165,21 @@ class RateLimiter {
       }
     }
 
+    // Only increment counter for allowed requests
+    record.count++
+
     return {
       success: true,
-      remaining: Math.max(0, config.max - effectiveCount),
+      remaining: Math.max(0, config.max - effectiveCount - 1),
       resetAt: record.windowStart + config.window,
       limit: config.max,
     }
   }
 
   /**
-   * Get current rate limit status without incrementing counter
+   * Get current rate limit status without incrementing counter.
+   * BUG FIX: Now uses the same sliding window algorithm as check()
+   * for consistent results. Previously used fixed-window count only.
    */
   peek(key: string, config: RateLimitConfig): RateLimitResult {
     const now = Math.floor(Date.now() / 1000)
@@ -197,7 +204,10 @@ class RateLimiter {
       }
     }
 
-    const remaining = Math.max(0, config.max - record.count)
+    // BUG FIX: Use sliding window calculation consistent with check()
+    const weight = 1 - (elapsed / config.window)
+    const effectiveCount = Math.ceil(record.prevCount * weight) + record.count
+    const remaining = Math.max(0, config.max - effectiveCount)
     return {
       success: remaining > 0,
       remaining,

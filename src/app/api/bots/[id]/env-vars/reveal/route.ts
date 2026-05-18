@@ -17,6 +17,7 @@ import { validateBotId } from '@/lib/validation'
 import { decryptEnvVarsAsync } from '@/lib/crypto'
 
 const REVEAL_RATE_LIMIT = { max: 10, windowMs: 60_000 }
+const MAX_REVEAL_RATE_ENTRIES = 5000
 const revealRateMap = new Map<string, { count: number; resetAt: number }>()
 
 // Cleanup expired entries every 5 minutes to prevent unbounded memory growth
@@ -29,6 +30,12 @@ const _revealCleanupTimer = setInterval(() => {
 if (_revealCleanupTimer.unref) _revealCleanupTimer.unref()
 
 function checkRevealLimit(key: string): boolean {
+  if (revealRateMap.size >= MAX_REVEAL_RATE_ENTRIES) {
+    const now = Date.now()
+    for (const [k, entry] of revealRateMap) {
+      if (now > entry.resetAt) revealRateMap.delete(k)
+    }
+  }
   const now = Date.now()
   const entry = revealRateMap.get(key)
   if (!entry || now > entry.resetAt) {
@@ -67,16 +74,11 @@ export async function GET(
       return NextResponse.json({ error: idErrors[0].message }, { status: 400 })
     }
 
-    const ownershipBot = await db.bot.findUnique({ where: { id }, select: { ownerId: true } })
-    if (!ownershipBot || !isBotOwner(ownershipBot.ownerId, userId)) {
-      return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
-    }
-
     const bot = await db.bot.findUnique({
       where: { id },
-      select: { id: true, envVars: true },
+      select: { id: true, ownerId: true, envVars: true },
     })
-    if (!bot) {
+    if (!bot || !isBotOwner(bot.ownerId, userId)) {
       return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
 

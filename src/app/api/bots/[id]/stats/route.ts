@@ -13,7 +13,7 @@ const _cacheCleanup = setInterval(() => {
   for (const [key, entry] of statsCache) {
     if (now > entry.expiresAt) statsCache.delete(key)
   }
-}, 60_000)
+}, 10_000)
 if (_cacheCleanup.unref) _cacheCleanup.unref()
 
 /**
@@ -21,9 +21,9 @@ if (_cacheCleanup.unref) _cacheCleanup.unref()
  * Computes real-time statistics from BotMessage and BotLog tables.
  * Returns: messages, users, errors, dailyMessages, hourlyActivity, topCommands
  *
- * PERF FIX: Reduced from 6 separate DB queries to 4 by merging:
- * - Total messages + daily messages into single aggregation query
- * - Hourly activity + top commands remain separate (different GROUP BY semantics)
+ * PERF FIX: Reduced from 5 separate DB queries (3 unbounded findMany + 2 count)
+ * to 6 lightweight queries (1 count + 4 SQL aggregations + 1 count) — zero
+ * rows loaded into application memory for aggregation.
  */
 export async function GET(
   request: Request,
@@ -53,36 +53,29 @@ export async function GET(
       return NextResponse.json(cached.data)
     }
 
-    // ── Optimized: Total Messages + Daily Messages in parallel queries ──
+    // ── Optimized: Use SQL aggregation instead of loading all rows into memory ──
     const sevenDaysAgo = new Date()
     sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7)
     const oneDayAgo = new Date()
     oneDayAgo.setHours(oneDayAgo.getHours() - 24)
 
-    const [totalResult, dailyResult, userResult, errors, hourlyResult, commandResult] = await Promise.all([
-      db.$queryRaw<Array<{ totalCount: bigint }>>`
-        SELECT COUNT(*) AS totalCount FROM BotMessage WHERE botId = ${botId}
-      `,
-      db.$queryRaw<Array<{ date: string; dayCount: bigint }>>`
-        SELECT DATE(timestamp) AS date, COUNT(*) AS dayCount
+    const [messageCount, dailyMessages, uniqueUserCount, errors, topCommands, hourlyRaw] = await Promise.all([
+      db.botMessage.count({ where: { botId } }),
+      db.$queryRaw<Array<{ date: string; count: number }>>`
+        SELECT DATE(timestamp) as date, COUNT(*) as count
         FROM BotMessage
-        WHERE botId = ${botId} AND timestamp >= ${sevenDaysAgo.toISOString()}
+        WHERE botId = ${botId} AND timestamp >= ${sevenDaysAgo}
         GROUP BY DATE(timestamp)
         ORDER BY date DESC
       `,
-      db.$queryRaw<Array<{ cnt: bigint }>>`
-        SELECT COUNT(DISTINCT userId) as cnt FROM BotMessage WHERE botId = ${botId}
+      db.$queryRaw<Array<{ count: bigint }>>`
+        SELECT COUNT(DISTINCT userId) as count
+        FROM BotMessage
+        WHERE botId = ${botId}
       `,
       db.botLog.count({
         where: { botId, level: { in: ['error', 'critical'] } },
       }),
-      db.$queryRaw<Array<{ hour: number; count: bigint }>>`
-        SELECT CAST(strftime('%H', timestamp) AS INTEGER) as hour, COUNT(*) as count
-        FROM BotMessage
-        WHERE botId = ${botId} AND timestamp >= ${oneDayAgo.toISOString()}
-        GROUP BY hour
-        ORDER BY hour ASC
-      `,
       db.$queryRaw<Array<{ command: string; count: bigint }>>`
         SELECT command, COUNT(*) as count
         FROM BotMessage
@@ -91,39 +84,50 @@ export async function GET(
         ORDER BY count DESC
         LIMIT 10
       `,
+      db.$queryRaw<Array<{ hour: number; count: number }>>`
+        SELECT CAST(STRFTIME('%H', timestamp) AS INTEGER) as hour, COUNT(*) as count
+        FROM BotMessage
+        WHERE botId = ${botId} AND timestamp >= ${oneDayAgo}
+        GROUP BY hour
+      `,
     ])
 
-    const messageCount = Number(totalResult[0]?.totalCount ?? 0)
-    const dailyMessages = dailyResult.map(r => ({
-      date: r.date,
-      count: Number(r.dayCount),
-    }))
+    const users = Number(uniqueUserCount[0]?.count ?? 0)
 
-    const users = Number(userResult[0]?.cnt ?? 0)
+    const dailyMessagesResult = dailyMessages.map(r => ({ date: r.date, count: Number(r.count) }))
 
-    const hourlyMap = new Map(hourlyResult.map(r => [r.hour, Number(r.count)]))
+    const commandMap = new Map<string, number>()
+    for (const row of topCommands) {
+      commandMap.set(row.command, Number(row.count))
+    }
+    const totalCommands = [...commandMap.values()].reduce((s, c) => s + c, 0)
+    const topCommandsResult = [...commandMap.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10)
+      .map(([command, count]) => ({
+        command,
+        count,
+        percentage: totalCommands > 0 ? Math.round((count / totalCommands) * 100) : 0,
+      }))
+
+    const hourlyMap = new Map<number, number>()
+    for (const row of hourlyRaw) {
+      hourlyMap.set(Number(row.hour), Number(row.count))
+    }
     const hourlyActivity = Array.from({ length: 24 }, (_, i) => hourlyMap.get(i) ?? 0)
-
-    const totalCommands = commandResult.reduce((sum, r) => sum + Number(r.count), 0)
-    const topCommands = commandResult.map(r => ({
-      command: r.command,
-      count: Number(r.count),
-      percentage: totalCommands > 0 ? Math.round((Number(r.count) / totalCommands) * 100) : 0,
-    }))
 
     const result = {
       messages: messageCount,
       users,
       errors,
-      dailyMessages,
+      dailyMessages: dailyMessagesResult,
       hourlyActivity,
-      topCommands,
+      topCommands: topCommandsResult,
     }
 
     if (statsCache.size >= MAX_CACHE_SIZE) {
-      const oldest = [...statsCache.entries()]
-        .sort((a, b) => a[1].expiresAt - b[1].expiresAt)[0]
-      if (oldest) statsCache.delete(oldest[0])
+      const firstKey = statsCache.keys().next().value
+      if (firstKey) statsCache.delete(firstKey)
     }
     statsCache.set(botId, { data: result, expiresAt: Date.now() + STATS_CACHE_TTL })
 

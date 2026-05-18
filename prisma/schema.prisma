@@ -9,13 +9,13 @@ datasource db {
 
 model Bot {
   id            String   @id @default(cuid())
-  name          String   @unique
+  name          String
   description   String
   emoji         String   @default("🤖")
   customIcon    String   @default("")
   /// Bot status: "inactive" | "active" | "deploying" | "error" (validated at app layer)
   status        String   @default("inactive")
-  /// Bot health: "unknown" | "healthy" | "degraded" | "unhealthy" (validated at app layer)
+  /// Bot health: "unknown" | "healthy" | "warning" | "critical" (validated at app layer)
   health        String   @default("unknown")
   /// Bot language: "javascript" | "typescript" | "python" (validated at app layer)
   language      String   @default("typescript")
@@ -36,14 +36,13 @@ model Bot {
   projectFiles  String   @default("[]")
   entryPoint      String   @default("")
   lastRunnerStatus String   @default("")
-  /// ISO-8601 datetime string — SQLite has no native DateTime type
-  lastDeployedAt   String   @default("")
+  lastDeployedAt   DateTime?
   webhookSecret  String   @default("")
   createdAt       DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
-  ownerId       String   @default("migrate-pending")
-  owner         Account  @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  ownerId       String
+  owner         Account  @relation(fields: [ownerId], references: [id], onDelete: Restrict)
 
   logEntries    BotLog[]
   messages      BotMessage[]
@@ -53,6 +52,7 @@ model Bot {
   @@index([createdAt])
   @@index([name])
   @@index([ownerId])
+  @@unique([ownerId, name])
 }
 
 model BotLog {
@@ -66,8 +66,10 @@ model BotLog {
   source    String   @default("")
 
   @@index([botId, timestamp])
-  @@index([botId, id])
+  // REMOVED: @@index([botId, id]) — redundant with PK index on `id` and
+  // the more useful @@index([botId, timestamp]) for time-ordered queries.
   @@index([botId, level])
+  @@index([timestamp])
   @@index([botId, timestamp, level])
 }
 
@@ -84,6 +86,7 @@ model BotMessage {
   @@index([botId, timestamp])
   @@index([botId, userId])
   @@index([botId, command])
+  @@index([timestamp])
 }
 
 model Account {

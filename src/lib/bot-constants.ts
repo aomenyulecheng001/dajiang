@@ -23,10 +23,12 @@ export const SENSITIVE_KEY_PATTERNS = [
   'auth',
   'apikey',
   'api_key',
+  'access_key',
   'private',
-  'key',
   'credential',
 ]
+
+export const DEFAULT_MAX_MEMORY_MB = 256
 
 export const LANGUAGE_LABELS: Record<string, string> = {
   javascript: 'JavaScript',

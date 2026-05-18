@@ -16,6 +16,7 @@ type EventHandler = (event: string, data: unknown) => void
 
 interface Subscription {
   unsubscribe: () => void
+  active: boolean
 }
 
 class EventBus {
@@ -48,18 +49,19 @@ class EventBus {
     if (!handlers) {
       if (this.handlers.size >= EventBus.MAX_CHANNELS) {
         console.warn(`[EventBus] Max channels (${EventBus.MAX_CHANNELS}) reached, rejecting subscription to "${channel}"`)
-        return { unsubscribe: () => {} }
+        return { unsubscribe: () => {}, active: false }
       }
       handlers = new Set()
       this.handlers.set(channel, handlers)
     }
     if (handlers.size >= EventBus.MAX_SUBSCRIBERS_PER_CHANNEL) {
       console.warn(`[EventBus] Max subscribers (${EventBus.MAX_SUBSCRIBERS_PER_CHANNEL}) reached for channel "${channel}"`)
-      return { unsubscribe: () => {} }
+      return { unsubscribe: () => {}, active: false }
     }
     handlers.add(handler)
 
     return {
+      active: true,
       unsubscribe: () => {
         const h = this.handlers.get(channel)
         if (h) {

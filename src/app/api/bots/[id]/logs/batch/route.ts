@@ -2,6 +2,7 @@ import { db } from '@/lib/db'
 import { NextResponse } from 'next/server'
 import { validateBotId } from '@/lib/validation'
 import { getCurrentUserId, isBotOwner } from '@/lib/api-helpers'
+import { eventBus } from '@/lib/event-bus'
 
 const MAX_MESSAGE_LENGTH = 10000
 const MAX_SOURCE_LENGTH = 200
@@ -98,20 +99,35 @@ export async function POST(
       entries.push({ botId: id, level, message, source })
     }
 
-    // PERF FIX: Single bulk insert instead of N individual creates.
-    // Uses createMany which maps to a single INSERT statement in SQLite.
-    // Note: skipDuplicates is not supported in SQLite (PG/MySQL only).
-    // Duplicate IDs are unlikely in practice (batch-generated with timestamps).
-    const result = await db.botLog.createMany({
-      data: entries,
+    const createdLogs = await db.$transaction(async (tx) => {
+      const before = new Date()
+      const result = await tx.botLog.createMany({ data: entries })
+      return tx.botLog.findMany({
+        where: { botId: id, timestamp: { gte: before } },
+        orderBy: { id: 'asc' },
+      })
     })
 
+    for (const log of createdLogs) {
+      eventBus.emit(`bot:${id}`, 'log', {
+        id: log.id,
+        botId: id,
+        level: log.level,
+        message: log.message,
+        source: log.source,
+        timestamp: log.timestamp.toISOString(),
+      })
+    }
+
     return NextResponse.json({
-      created: result.count,
-      logs: entries.map((e, idx) => ({
-        id: `batch-${Date.now()}-${idx}`,
-        ...e,
-        timestamp: new Date().toISOString(),
+      created: createdLogs.length,
+      logs: createdLogs.map(log => ({
+        id: log.id,
+        botId: log.botId,
+        level: log.level,
+        message: log.message,
+        source: log.source,
+        timestamp: log.timestamp.toISOString(),
       })),
     }, { status: 201 })
   } catch (error) {

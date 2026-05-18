@@ -58,6 +58,20 @@ export async function POST(request: NextRequest) {
     // Sanitize: trim whitespace before validation
     const newUsername = rawUsername.trim()
 
+    // N2 FIX: Server-side username format validation (must match client-side rules)
+    if (newUsername.length < 3 || newUsername.length > 30) {
+      return NextResponse.json(
+        { error: 'Username must be between 3 and 30 characters' },
+        { status: 400 }
+      )
+    }
+    if (!/^[a-zA-Z0-9_]+$/.test(newUsername)) {
+      return NextResponse.json(
+        { error: 'Username can only contain letters, numbers, and underscores' },
+        { status: 400 }
+      )
+    }
+
     // BUG FIX: Verify the account exists in the DB before attempting update.
     // The session token contains a userId, but after a server restart with
     // a fresh HMAC_SECRET, stale tokens from previous sessions might pass
@@ -66,7 +80,7 @@ export async function POST(request: NextRequest) {
     // any inconsistency and return a clear error instead of "User not found".
     const account = await db.account.findUnique({ where: { id: session.userId } })
     if (!account) {
-      console.warn(`[Auth] Update account: session userId ${session.userId} not found in DB. Token username: ${session.username}`)
+      console.warn('[Auth] Update account: session user not found in DB')
       return NextResponse.json(
         { error: 'Session is invalid — please log in again' },
         { status: 401 }

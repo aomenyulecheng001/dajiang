@@ -2,7 +2,7 @@
  * Bot Runner Service - Telegram Bot Process Manager
  * 
  * This service manages the lifecycle of Telegram bot processes:
- * - Generate bot code from templates
+ * - Generate bot code from custom code or project files
  * - Install dependencies (npm install / pip install)
  * - Start / Stop / Restart bot processes
  * - Stream real-time logs via WebSocket (Socket.IO)
@@ -13,12 +13,12 @@
 
 import { existsSync, readFileSync } from 'fs'
 import { readdir, access, rm } from 'fs/promises'
-import { timingSafeEqual, createHash } from 'crypto'
+import { randomBytes, timingSafeEqual, createHash, createHmac } from 'crypto'
 import type { IncomingMessage, ServerResponse } from 'http'
 import type { BotProcess, DeployStage } from './types'
 import { PORT, CONFIG_DIR, loadBotConfigAsync, BOTS_DIR, sanitizeBotId, getBotDir } from './utils'
 import { MAX_LOG_LINES, setLogState, cleanupOldLogs, startLogCleanup, stopLogCleanup, LOGS_DIR } from './log-manager'
-import { templates } from './templates'
+
 import { httpServer, io } from './socket'
 import { handleBotExit, startBotProcess, stopBotProcess, clearAllRestartTimers, intentionalStopSet } from './process-manager'
 import { registerHandlers } from './handlers'
@@ -44,6 +44,14 @@ function loadRunnerSecret(): string {
 
 const RUNNER_SECRET = loadRunnerSecret()
 
+if (!RUNNER_SECRET && process.env.NODE_ENV === 'production') {
+  console.error('[FATAL] RUNNER_SECRET is empty in production. Refusing to start without authentication.')
+  process.exit(1)
+}
+if (!RUNNER_SECRET) {
+  console.warn('[WARN] RUNNER_SECRET is empty — all HTTP endpoints are unauthenticated. Set RUNNER_SECRET for production.')
+}
+
 // ─── Wire Up Log Manager ─────────────────────────────────────────────────
 
 setLogState(botProcesses, deployStatus)
@@ -51,13 +59,13 @@ setLogState(botProcesses, deployStatus)
 // ─── Create Bound Process Functions ──────────────────────────────────────
 
 /** Bound startBotProcess that carries botProcesses reference */
-function boundStartBotProcess(botId: string): void {
-  startBotProcess(botId, botProcesses, boundHandleBotExit)
+async function boundStartBotProcess(botId: string): Promise<void> {
+  await startBotProcess(botId, botProcesses, boundHandleBotExit)
 }
 
 /** Bound handleBotExit that carries botProcesses and startBotProcess references */
-function boundHandleBotExit(botId: string, code: number | null, signal: string | null, exitedProcess?: import('child_process').ChildProcess): void {
-  handleBotExit(botId, code, signal, botProcesses, boundStartBotProcess, exitedProcess)
+async function boundHandleBotExit(botId: string, code: number | null, signal: string | null, exitedProcess?: import('child_process').ChildProcess): Promise<void> {
+  await handleBotExit(botId, code, signal, botProcesses, boundStartBotProcess, exitedProcess)
 }
 
 /** Bound stopBotProcess that carries botProcesses reference */
@@ -83,51 +91,52 @@ startLogCleanup() // P2-33 FIX: Start periodic log cleanup every 6 hours
  * 2. If header present → load bot config and compare against stored webhookSecret
  * 3. If bot has no webhookSecret in config → allow (not configured)
  */
-async function verifyWebhookSecret(req: IncomingMessage, botId: string): Promise<boolean> {
+async function verifyWebhookSecret(req: IncomingMessage, botId: string, body?: string): Promise<boolean> {
+  const signature = req.headers['x-webhook-signature'] as string | undefined
   const forwardedSecret = req.headers['x-webhook-secret'] as string | undefined
-  if (!forwardedSecret) {
-    // SECURITY FIX: If the bot has a webhookSecret configured, the header MUST be present.
-    // Previously, missing header was allowed for backward compatibility, but this means
-    // anyone can send forged webhook updates to bots with secrets configured.
-    // Load the bot config first to check if a secret is required.
+
+  if (!signature && !forwardedSecret) {
     const config = await loadBotConfigAsync(botId)
     if (!config) {
-      // Unknown bot — reject
       console.warn(`[Webhook] Unknown bot ${botId}, rejecting webhook`)
       return false
     }
     const storedSecret = config.envVars?.WEBHOOK_SECRET || config.webhookSecret
     if (storedSecret) {
-      // Bot has a secret configured but no header was provided — reject
-      console.warn(`[Webhook] ⚠️ No X-Webhook-Secret header for bot ${botId} with configured secret — rejecting`)
+      console.warn(`[Webhook] No auth header for bot ${botId} with configured secret — rejecting`)
       return false
     }
-    // Bot has no webhook secret configured — allow (not set up for secret verification)
     return true
   }
-  // Load the bot's config from disk to verify the secret
-  // P2-BR-10 FIX: Use async loadBotConfigAsync
   const config = await loadBotConfigAsync(botId)
   if (!config) {
-    // Bot config not found — reject (unknown bot)
     console.warn(`[Webhook] Unknown bot ${botId}, rejecting webhook`)
     return false
   }
   const storedSecret = config.envVars?.WEBHOOK_SECRET || config.webhookSecret
   if (!storedSecret) {
-    // Bot has no webhook secret configured — allow (not set up for secret verification)
     return true
   }
-  // P2-28 FIX: Use SHA-256 hashing + timing-safe comparison to prevent timing attacks.
-  // Same approach as Socket.IO auth in socket.ts — hashing ensures equal-length
-  // buffers, eliminating the length-leaking `a.length !== b.length` early return.
-  const tokenHash = createHash('sha256').update(forwardedSecret, 'utf-8').digest()
-  const secretHash = createHash('sha256').update(storedSecret, 'utf-8').digest()
-  if (!timingSafeEqual(tokenHash, secretHash)) {
-    console.warn(`[Webhook] Invalid webhook secret for bot ${botId}`)
-    return false
+  if (signature && body) {
+    const expectedSig = createHmac('sha256', storedSecret).update(body).digest('hex')
+    const expectedHash = createHash('sha256').update(`sha256=${expectedSig}`, 'utf-8').digest()
+    const providedHash = createHash('sha256').update(signature, 'utf-8').digest()
+    if (!timingSafeEqual(expectedHash, providedHash)) {
+      console.warn(`[Webhook] Invalid webhook signature for bot ${botId}`)
+      return false
+    }
+    return true
   }
-  return true
+  if (forwardedSecret) {
+    const tokenHash = createHash('sha256').update(forwardedSecret, 'utf-8').digest()
+    const secretHash = createHash('sha256').update(storedSecret, 'utf-8').digest()
+    if (!timingSafeEqual(tokenHash, secretHash)) {
+      console.warn(`[Webhook] Invalid webhook secret for bot ${botId}`)
+      return false
+    }
+    return true
+  }
+  return false
 }
 
 httpServer.on('request', async (req: IncomingMessage, res: ServerResponse) => {
@@ -145,22 +154,13 @@ httpServer.on('request', async (req: IncomingMessage, res: ServerResponse) => {
     const rawBotId = req.url.replace('/webhook/', '').split('?')[0]
     const botId = sanitizeBotId(rawBotId)
 
-    // Validate botId format
     if (!botId || botId !== rawBotId) {
       res.writeHead(400, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ ok: false, error: 'Invalid bot ID' }))
       return
     }
 
-    // P0-4 FIX: Verify webhook secret (now async)
-    if (!(await verifyWebhookSecret(req, botId))) {
-      res.writeHead(403, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ ok: false, error: 'Invalid webhook secret' }))
-      return
-    }
-
-    // Read request body with size limit
-    const MAX_WEBHOOK_BODY_SIZE = 1 * 1024 * 1024 // 1MB
+    const MAX_WEBHOOK_BODY_SIZE = 1 * 1024 * 1024
     const chunks: Buffer[] = []
     let totalSize = 0
     for await (const chunk of req) {
@@ -174,7 +174,12 @@ httpServer.on('request', async (req: IncomingMessage, res: ServerResponse) => {
     }
     const body = Buffer.concat(chunks).toString()
 
-    // Find the corresponding bot process
+    if (!(await verifyWebhookSecret(req, botId, body))) {
+      res.writeHead(403, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ ok: false, error: 'Invalid webhook secret' }))
+      return
+    }
+
     const bot = botProcesses.get(botId)
     if (bot?.process?.stdin && !bot.process.stdin.destroyed) {
       let parsedBody: unknown
@@ -308,8 +313,24 @@ httpServer.on('request', async (req: IncomingMessage, res: ServerResponse) => {
 
   // P2-BR-7 FIX: Health check endpoint for container orchestration
   if (req.method === 'GET' && req.url === '/health') {
+    // P0-4 FIX: Require runner-secret for health endpoint to prevent information leakage
+    if (RUNNER_SECRET) {
+      const authHeader = req.headers['x-runner-secret'] as string | undefined
+      if (!authHeader) {
+        res.writeHead(403, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: false, error: 'Unauthorized' }))
+        return
+      }
+      const tokenHash = createHash('sha256').update(authHeader, 'utf-8').digest()
+      const secretHash = createHash('sha256').update(RUNNER_SECRET, 'utf-8').digest()
+      if (!timingSafeEqual(tokenHash, secretHash)) {
+        res.writeHead(403, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: false, error: 'Unauthorized' }))
+        return
+      }
+    }
     res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({ ok: true, bots: botProcesses.size }))
+    res.end(JSON.stringify({ ok: true }))
     return
   }
 
@@ -369,6 +390,12 @@ async function recoverBotConfigs() {
           maxRestarts: 5,
           maxMemoryMb: 256,
         })
+        // P1-19 FIX: Track bots that were running before shutdown for auto-restart
+        const runningMarker = `${CONFIG_DIR}/${botId}.running`
+        if (existsSync(runningMarker)) {
+          const botEntry = botProcesses.get(botId)!
+          botEntry._wasRunning = true
+        }
         loaded++
       }
     }
@@ -385,11 +412,26 @@ httpServer.listen(PORT, async () => {
   // Await to ensure configs are loaded before accepting connections
   await recoverBotConfigs()
 
+  // P1-19 FIX: Auto-start bots that were running before shutdown
+  const autoStartBots: string[] = []
+  for (const [id, bot] of botProcesses.entries()) {
+    if ((bot as any)._wasRunning) {
+      autoStartBots.push(id)
+      delete (bot as any)._wasRunning
+    }
+  }
+  if (autoStartBots.length > 0) {
+    console.log(`[Startup] Auto-starting ${autoStartBots.length} previously running bot(s): ${autoStartBots.join(', ')}`)
+    for (const botId of autoStartBots) {
+      await boundStartBotProcess(botId).catch(err => console.error(`[Startup] Failed to auto-start ${botId}:`, err))
+    }
+  }
+
   console.log(``)
   console.log(`🚀 Bot Runner Service`)
   console.log(`   Port: ${PORT}`)
   console.log(`   Bots Dir: ${BOTS_DIR}`)
-  console.log(`   Templates: ${Array.from(templates.keys()).join(', ')}`)
+  console.log(`   Templates: removed`)
   console.log(``)
 })
 

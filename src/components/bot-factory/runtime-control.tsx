@@ -9,9 +9,10 @@ import { Card, CardContent } from '@/components/ui/card'
 import { cn, isValidBotToken, formatUptimeShort } from '@/lib/utils'
 import { useBotRunnerConnection, useBotRunnerActions } from '@/lib/bot-runner-context'
 import { useBotStore } from '@/store/bot-store'
-import { useT } from '@/lib/i18n'
+import { useT, useI18nStore } from '@/lib/i18n'
 import { toast } from 'sonner'
 import { fetchRevealEnvVars, hasMaskedEnvVars, buildEnvVarsFallback, buildDeployConfig } from '@/lib/deploy-utils'
+import { authFetch } from '@/store/bot-store'
 
 // ─── Runtime Control Panel (Compact Design) ────────────────────────────────────
 
@@ -80,9 +81,8 @@ export function RuntimeControl({ botId, botName, botLanguage, botTemplate }: { b
   const handleStartService = async () => {
     setIsStartingService(true)
     try {
-      const res = await fetch('/api/bots/runner/start-service', {
+      const res = await authFetch('/api/bots/runner/start-service', {
         method: 'POST',
-        credentials: 'include',
       })
       if (res.ok) {
         toast.success(t('runtime.serviceStarted'))
@@ -115,18 +115,24 @@ export function RuntimeControl({ botId, botName, botLanguage, botTemplate }: { b
     let realEnvVarsMap: Record<string, string> = {}
     let realBotToken = botToken
 
-    const revealed = await fetchRevealEnvVars(botId)
-    if (revealed) {
-      realEnvVarsMap = revealed.envVarsMap
-      realBotToken = revealed.botToken
-    } else {
-      const envSource = freshBot || bot
-      if (hasMaskedEnvVars(envSource?.envVars || [])) {
-        toast.error(t('runtime.envRevealFailed'))
-        setLocalPending(null)
-        return
+    try {
+      const revealed = await fetchRevealEnvVars(botId)
+      if (revealed) {
+        realEnvVarsMap = revealed.envVarsMap
+        realBotToken = revealed.botToken
+      } else {
+        const envSource = freshBot || bot
+        if (hasMaskedEnvVars(envSource?.envVars || [])) {
+          toast.error(t('runtime.envRevealFailed'))
+          setLocalPending(null)
+          return
+        }
+        realEnvVarsMap = buildEnvVarsFallback(envSource?.envVars || [])
       }
-      realEnvVarsMap = buildEnvVarsFallback(envSource?.envVars || [])
+    } catch {
+      toast.error(t('runtime.envRevealFailed'))
+      setLocalPending(null)
+      return
     }
 
     const deployBot_ = freshBot || bot
@@ -499,12 +505,12 @@ export function RuntimeControl({ botId, botName, botLanguage, botTemplate }: { b
                   {status.startedAt && (
                     <div className="rounded-md bg-muted/30 p-2">
                       <div className="text-muted-foreground">{t('runtime.startedAt')}</div>
-                      <div className="font-medium mt-0.5">{new Date(status.startedAt).toLocaleTimeString()}</div>
+                      <div className="font-medium mt-0.5">{new Date(status.startedAt).toLocaleTimeString(useI18nStore.getState().locale, { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</div>
                     </div>
                   )}
                   {status.pid && (
                     <div className="rounded-md bg-muted/30 p-2">
-                      <div className="text-muted-foreground">PID</div>
+                      <div className="text-muted-foreground">{t('resourceMonitor.pid')}</div>
                       <div className="font-mono font-medium mt-0.5">{status.pid}</div>
                     </div>
                   )}

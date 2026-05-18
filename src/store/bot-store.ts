@@ -103,12 +103,16 @@ export function authFetch(url: string, init: RequestInit = {}): Promise<Response
      // Import dynamically to avoid circular dependency at module load time
      import('@/store/auth-store').then(({ useAuthStore }) => {
        const store = useAuthStore.getState()
-       // Only clear if currently authenticated (prevent double-clear)
        if (store.isAuthenticated) {
          store.setAuth(false, null, null)
-         // Show a toast so the user knows why they were logged out
          import('sonner').then(({ toast }) => {
-           toast.error('Session expired', { description: 'Please log in again.' })
+           import('@/lib/i18n').then(({ useI18nStore, getTranslation }) => {
+             const locale = useI18nStore.getState().locale
+             const t = (k: string) => getTranslation(locale, k)
+             toast.error(t('common.sessionExpired'), { description: t('common.pleaseLogInAgain') })
+           }).catch(() => {
+             toast.error('Session expired', { description: 'Please log in again.' })
+           })
          }).catch(() => {})
        }
      }).catch(() => {})
@@ -117,7 +121,7 @@ export function authFetch(url: string, init: RequestInit = {}): Promise<Response
  })
 }
 
-let dbBotIds = new Set<string>()
+const dbBotIds = new Set<string>()
 const persistTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const MAX_LOGS_PER_BOT = 200
 const logDedupKeys = new Map<string, Set<string>>()
@@ -221,8 +225,14 @@ function isDeepEqual(a: unknown, b: unknown, depth: number = 0): boolean {
   const keysA = Object.keys(aObj)
   const keysB = Object.keys(bObj)
   if (keysA.length !== keysB.length) return false
+  if (keysA.length > 20) {
+    const bKeysSet = new Set(keysB)
+    for (const key of keysA) {
+      if (!bKeysSet.has(key)) return false
+    }
+  }
   for (const key of keysA) {
-    if (!Object.prototype.hasOwnProperty.call(bObj, key)) return false
+    if (keysA.length <= 20 && !Object.prototype.hasOwnProperty.call(bObj, key)) return false
     if (!isDeepEqual(aObj[key], bObj[key], depth + 1)) return false
   }
   return true
@@ -240,7 +250,7 @@ function computePatchDiff(bot: Bot, prev: Record<string, unknown> | undefined): 
     patchData[key] = value
   }
   for (const key of Object.keys(patchData)) {
-    if (patchData[key] === undefined) patchData[key] = ''
+    if (patchData[key] === undefined) delete patchData[key]
   }
   return Object.keys(patchData).length > 0 ? patchData : null
 }
@@ -358,6 +368,7 @@ async function persistNewBot(bot: Bot): Promise<string | null> {
   try {
     const res = await authFetch('/api/bots', {
       method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(bot),
     })
     if (res.ok) {
@@ -386,7 +397,10 @@ async function persistNewBot(bot: Bot): Promise<string | null> {
  */
 async function deleteBotFromDB(botId: string): Promise<boolean> {
   try {
-    const res = await authFetch(`/api/bots/${botId}`, { method: 'DELETE' })
+    const res = await authFetch(`/api/bots/${botId}`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+    })
     if (res.ok) {
       dbBotIds.delete(botId)
       return true
@@ -405,6 +419,7 @@ async function deleteBotFromDB(botId: string): Promise<boolean> {
 function persistLogEntry(botId: string, entry: Omit<LogEntry, 'id'>) {
   authFetch(`/api/bots/${botId}/logs`, {
     method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(entry),
   }).catch((e) => {
     console.warn(`Failed to persist log for bot ${botId}:`, e)
@@ -683,7 +698,11 @@ export const useBotStore = create<BotStore>((set, get) => ({
       envVars: params.envVars?.length ? params.envVars : [{ id: genId(), key: 'BOT_TOKEN', value: '', isEncrypted: true, description: 'Telegram Bot Token from @BotFather' }],
       config: {
         pollingMode: 'polling',
-        webhookSecret: '',
+        // BUG FIX (BUG-6): Do not include webhookSecret in client-created config.
+        // The server POST handler generates a webhookSecret when config doesn't have one.
+        // Including an empty string here causes the server to keep the empty value
+        // instead of generating a new one, and subsequent PATCH requests with
+        // webhookSecret: '' would clear the server-generated secret.
         rateLimitPerMinute: 30,
         maxConcurrentRequests: 10,
         autoRestart: true,
@@ -716,7 +735,15 @@ export const useBotStore = create<BotStore>((set, get) => ({
 
     persistNewBot(newBot).then((serverId) => {
       clearTimeout(creationTimeout)
-      if (!serverId) return
+      if (!serverId) {
+        // BUG FIX: Notify user when bot creation fails so they know the bot
+        // was not persisted. The bot remains in the local store for UX continuity,
+        // but the user should be aware it may be lost on refresh.
+        const locale = useI18nStore.getState().locale
+        const t = (key: string, params?: Record<string, string | number>) => getTranslation(locale, key as any, params)
+        toast.error(t('common.saveFailed'), { description: t('common.saveFailedDesc') })
+        return
+      }
       dbBotIds.add(serverId)
 
       if (serverId !== newBot.id) {
@@ -964,7 +991,9 @@ export const useBotStore = create<BotStore>((set, get) => ({
     if (dedupSet.has(dedupKey)) return
     dedupSet.add(dedupKey)
     if (dedupSet.size > 500) {
-      dedupSet.clear()
+      const keys = [...dedupSet]
+      const toRemove = keys.slice(0, keys.length - 400)
+      for (const k of toRemove) dedupSet.delete(k)
     }
     set((state) => ({
       bots: state.bots.map((b) => {

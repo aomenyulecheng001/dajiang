@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useCallback } from 'react'
 import { toast } from 'sonner'
 import { Plus, Trash2, Check, X, Pencil } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
@@ -54,13 +54,13 @@ export function DependenciesTab() {
   const t = useT()
   const editNameRef = useRef<HTMLInputElement>(null)
 
-  const cancelInlineEdit = () => {
+  const cancelInlineEdit = useCallback(() => {
     setEditingDepId(null)
     setEditName('')
     setEditVersion('')
     setEditDesc('')
     setEditRequired(true)
-  }
+  }, [])
 
   // Focus input when editing starts
   useEffect(() => {
@@ -68,7 +68,7 @@ export function DependenciesTab() {
       editNameRef.current.focus()
       editNameRef.current.select()
     }
-  }, [editingDepId])
+  }, [editingDepId, cancelInlineEdit])
 
   // Click-outside handler for inline editing
   useEffect(() => {
@@ -98,7 +98,7 @@ export function DependenciesTab() {
       document.removeEventListener('mousedown', handleClickOutside)
       document.removeEventListener('keydown', handleKeyDown)
     }
-  }, [editingDepId])
+  }, [editingDepId, cancelInlineEdit])
 
   if (!bot) return null
 

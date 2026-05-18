@@ -50,7 +50,9 @@ export interface BotMessageEvent {
   command?: string
 }
 
-export interface BotLogEntry {
+// Socket event log entry (lighter than DB BotLogEntry in @/types/bot)
+// DB version has: id, botId, timestamp, level, message, source
+export interface SocketBotLogEntry {
   botId: string
   timestamp: string
   level: 'info' | 'warn' | 'error' | 'debug' | 'critical'
@@ -85,7 +87,7 @@ interface BotRunnerConnectionContextType {
 interface BotRunnerDataContextType {
   botStatuses: Map<string, BotRunnerStatus>
   deployProgresses: Map<string, DeployProgress>
-  botLogs: Map<string, BotLogEntry[]>
+  botLogs: Map<string, SocketBotLogEntry[]>
   resourceData: Map<string, ResourceData>
   deployBot: (_config: DeployConfig) => boolean
   stopBot: (_botId: string) => void
@@ -95,7 +97,7 @@ interface BotRunnerDataContextType {
   requestLogs: (_botId: string) => void
   getBotStatus: (_botId: string) => BotRunnerStatus | undefined
   getDeployProgress: (_botId: string) => DeployProgress | undefined
-  getBotLogs: (_botId: string) => BotLogEntry[]
+  getBotLogs: (_botId: string) => SocketBotLogEntry[]
   getResourceData: (_botId: string) => ResourceData | undefined
   subscribe: (_event: string, _callback: (..._args: unknown[]) => void) => () => void
 }
@@ -109,13 +111,19 @@ interface BotRunnerActionsContextType {
   requestLogs: (_botId: string) => void
   getBotStatus: (_botId: string) => BotRunnerStatus | undefined
   getDeployProgress: (_botId: string) => DeployProgress | undefined
-  getBotLogs: (_botId: string) => BotLogEntry[]
+  getBotLogs: (_botId: string) => SocketBotLogEntry[]
   getResourceData: (_botId: string) => ResourceData | undefined
   subscribe: (_event: string, _callback: (..._args: unknown[]) => void) => () => void
 }
 
 interface BotRunnerContextType extends BotRunnerConnectionContextType, BotRunnerDataContextType {}
 
+// PERF NOTE: 7 Contexts are created here, but the combinedValue useMemo depends on
+// dataValue which depends on all Map states. This means any Map change invalidates
+// combinedValue, making the split less effective than intended. To fully benefit,
+// each Map Context should have its own Provider with independent state updates,
+// and consumers should use the specific Context they need (e.g., useBotStatuses)
+// rather than the combined useBotRunner() hook.
 const BotRunnerConnectionContext = createContext<BotRunnerConnectionContextType | null>(null)
 const BotRunnerActionsContext = createContext<BotRunnerActionsContextType | null>(null)
 const BotRunnerDataContext = createContext<BotRunnerDataContextType | null>(null)
@@ -123,7 +131,7 @@ const BotRunnerContext = createContext<BotRunnerContextType | null>(null)
 const BotStatusesContext = createContext<Map<string, BotRunnerStatus>>(new Map())
 const ResourceDataContext = createContext<Map<string, ResourceData>>(new Map())
 const DeployProgressContext = createContext<Map<string, DeployProgress>>(new Map())
-const BotLogsContext = createContext<Map<string, BotLogEntry[]>>(new Map())
+const BotLogsContext = createContext<Map<string, SocketBotLogEntry[]>>(new Map())
 
 // ─── Provider ────────────────────────────────────────────────────────────
 
@@ -139,6 +147,13 @@ const BOT_RUNNER_URL = (typeof window !== 'undefined' && (window as unknown as R
 // state forever if the socket disconnects during the stop sequence.
 const STOPPING_STATE_TIMEOUT_MS = 15_000
 
+// TODO: Refactor this 1000+ line provider into smaller hooks:
+// - useSocketConnection: Socket.IO connect/reconnect/disconnect logic
+// - useLogBatching: Log dedup, batching, and persistence
+// - useMessageBatching: Message batching and persistence
+// - useDeployProgress: Deploy progress tracking and stale cleanup
+// - useResourceMonitoring: Resource data updates
+// This will improve testability and reduce cognitive load.
 export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated)
   const socketRef = useRef<Socket | null>(null)
@@ -148,7 +163,7 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
   const [connectionError, setConnectionError] = useState<string | null>(null)
   const [botStatuses, setBotStatuses] = useState<Map<string, BotRunnerStatus>>(new Map())
   const [deployProgresses, setDeployProgresses] = useState<Map<string, DeployProgress>>(new Map())
-  const [botLogs, setBotLogs] = useState<Map<string, BotLogEntry[]>>(new Map())
+  const [botLogs, setBotLogs] = useState<Map<string, SocketBotLogEntry[]>>(new Map())
   const [resourceData, setResourceData] = useState<Map<string, ResourceData>>(new Map())
   const listenersRef = useRef<Map<string, Set<(..._args: unknown[]) => void>>>(new Map())
   const cancelledRef = useRef(false)
@@ -214,7 +229,7 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
         let token = cachedTokenRef.current
 
         if (!token) {
-          const res = await fetch('/api/auth/runner-token', { credentials: 'include' })
+          const res = await authFetch('/api/auth/runner-token')
           if (!res.ok) {
             // Don't retry on auth failures (401) — wait for auth state change
             if (res.status === 401) return
@@ -357,19 +372,22 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
           }
 
           const { syncRunnerStatus, bots } = useBotStore.getState()
-          // Sync bots that ARE in runner data
-          data.bots.forEach(b => syncRunnerStatus(b.id, b.status))
-          // FIX: Mark store bots that are 'active' but NOT in runner data as 'stopped'.
-          // When the runner sends init, it only includes currently-running bots.
-          // Bots that were previously running but have since stopped/crashed are absent.
-          // Without this, their Zustand store status remains 'active' forever,
-          // causing the header badge and bot card to incorrectly show "运行中".
-          const runnerBotIds = new Set(data.bots.map(b => b.id))
-          bots.forEach(b => {
-            if (b.status === 'active' && !runnerBotIds.has(b.id)) {
-              syncRunnerStatus(b.id, 'stopped')
-            }
-          })
+          // P1-16 FIX: Debounce PATCH requests to avoid request storm on reconnect
+          setTimeout(() => {
+            // Sync bots that ARE in runner data
+            data.bots.forEach(b => syncRunnerStatus(b.id, b.status))
+            // FIX: Mark store bots that are 'active' but NOT in runner data as 'stopped'.
+            // When the runner sends init, it only includes currently-running bots.
+            // Bots that were previously running but have since stopped/crashed are absent.
+            // Without this, their Zustand store status remains 'active' forever,
+            // causing the header badge and bot card to incorrectly show "运行中".
+            const runnerBotIds = new Set(data.bots.map(b => b.id))
+            bots.forEach(b => {
+              if (b.status === 'active' && !runnerBotIds.has(b.id)) {
+                syncRunnerStatus(b.id, 'stopped')
+              }
+            })
+          }, 100)
 
           const currentBotIds = new Set(bots.map(b => b.id))
           if (logSyncTimerRef.current) {
@@ -526,7 +544,7 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
         }
         flushLogBatchRef.current = flushLogBatch
 
-        socket.on('bot:log', (data: BotLogEntry) => {
+        socket.on('bot:log', (data: SocketBotLogEntry) => {
           const dedupKey = `${data.botId}:${data.timestamp}:${data.message}`
           if (recentLogKeysRef.current.has(dedupKey)) return
           recentLogKeysRef.current.add(dedupKey)
@@ -637,9 +655,6 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
         })
 
         socket.on('deploy:progress', (data: DeployProgress) => {
-          // BUG FIX: Ignore deploy progress events for cancelled deploys.
-          // When a deploy is cancelled (stage='idle'), the deployProgresses Map
-          // should be cleared. Don't re-add stale progress data.
           if (data.stage === 'idle') {
             setDeployProgresses(prev => {
               if (!prev.has(data.botId)) return prev
@@ -650,11 +665,28 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
           } else {
             setDeployProgresses(prev => {
               const next = new Map(prev)
-              next.set(data.botId, data)
+              const existing = prev.get(data.botId)
+              next.set(data.botId, {
+                ...data,
+                logs: data.logs?.length ? data.logs : existing?.logs || [],
+              })
               return next
             })
           }
           listenersRef.current.get('deploy:progress')?.forEach(cb => cb(data as unknown))
+        })
+
+        socket.on('deploy:log', (data: { botId: string; log: string }) => {
+          setDeployProgresses(prev => {
+            const existing = prev.get(data.botId)
+            if (!existing) return prev
+            const next = new Map(prev)
+            next.set(data.botId, {
+              ...existing,
+              logs: [...existing.logs, data.log],
+            })
+            return next
+          })
         })
 
         socket.on('bot:logs', (data: { botId: string; logs: string[] }) => {
@@ -711,9 +743,8 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
         socketRef.current = socket
       } catch {
         if (retryCount === 0) {
-          fetch('/api/bots/runner/start-service', {
+          authFetch('/api/bots/runner/start-service', {
             method: 'POST',
-            credentials: 'include',
           }).catch(() => {})
         }
         retryCount++
@@ -884,7 +915,7 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
   botStatusesRef.current = botStatuses
   const deployProgressesRef = useRef(deployProgresses)
   deployProgressesRef.current = deployProgresses
-  const botLogsRef = useRef<Map<string, BotLogEntry[]>>(new Map())
+  const botLogsRef = useRef<Map<string, SocketBotLogEntry[]>>(new Map())
   // REACT-102: botLogsRef mirrors the botLogs state for direct mutation without
   // triggering re-renders. To maintain consistency, ALWAYS update botLogsRef.current
   // BEFORE calling setBotLogs(). This ensures that any synchronous read from the ref
@@ -1006,4 +1037,37 @@ export function useDeployProgress() {
 
 export function useBotLogs() {
   return useContext(BotLogsContext)
+}
+
+/**
+ * PERF OPT: Per-bot status hook that reduces unnecessary re-render cascades.
+ *
+ * Problem: useBotStatuses() returns the entire Map. When ANY bot's status
+ * changes, the Map reference changes, causing ALL consumers to re-render.
+ * For a dashboard with N bots, a status update for bot A triggers re-renders
+ * in components that only care about bot B.
+ *
+ * Solution: This hook subscribes to the full Map context (unavoidable with
+ * React Context), but returns a stable reference when the specific bot's
+ * status object hasn't changed. This means:
+ *   - The component still re-renders when the Map changes (React Context limitation)
+ *   - But useMemo/useEffect dependencies on the returned value won't trigger
+ *     if the specific bot's status reference is the same
+ *   - Combined with React.memo on the component, this prevents child re-renders
+ *
+ * For full optimization, pair this with a container/wrapper pattern that
+ * extracts per-bot data and passes it as props to a React.memo'd inner component.
+ */
+export function useBotStatus(botId: string): BotRunnerStatus | undefined {
+  const statuses = useContext(BotStatusesContext)
+  return statuses.get(botId)
+}
+
+/**
+ * PERF OPT: Per-bot resource data hook. Same pattern as useBotStatus.
+ * Returns the specific bot's resource data from the context Map.
+ */
+export function useBotResourceData(botId: string): ResourceData | undefined {
+  const resources = useContext(ResourceDataContext)
+  return resources.get(botId)
 }

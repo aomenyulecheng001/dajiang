@@ -93,7 +93,7 @@ export interface Bot {
   logs: LogEntry[]          // client-side in-memory log buffer (NOT persisted to DB)
   projectFiles?: ProjectFile[]   // all project files (from ZIP upload)
   entryPoint?: string            // entry file path (e.g., "index.js", "bot.py")
-  lastRunnerStatus?: string      // last known runner status before runner went down (e.g., "running", "stopped")
+  lastRunnerStatus?: 'stopped' | 'starting' | 'running' | 'error' | 'stopping' | ''      // last known runner status before runner went down (e.g., "running", "stopped")
   lastDeployedAt?: string        // timestamp of last successful deploy (used to detect pending code changes)
   codeDirty?: boolean            // client-side only: true if code/dependencies/projectFiles changed since last deploy (NOT persisted to DB)
   tokenStatus?: 'valid' | 'invalid' | 'not_set'  // server-side validated token status (decrypted & checked)

@@ -36,15 +36,13 @@ export async function GET(request: NextRequest) {
       )
     }
 
-    if (process.env.RUNNER_TOKEN_ACCESS === 'admin') {
-      const { db } = await import('@/lib/db')
-      const firstAccount = await db.account.findFirst({ orderBy: { createdAt: 'asc' } })
-      if (firstAccount && firstAccount.id !== session.userId) {
-        return NextResponse.json(
-          { error: 'Forbidden' },
-          { status: 403 }
-        )
-      }
+    const { db } = await import('@/lib/db')
+    const firstAccount = await db.account.findFirst({ orderBy: { createdAt: 'asc' }, select: { id: true } })
+    if (firstAccount && firstAccount.id !== session.userId) {
+      return NextResponse.json(
+        { error: 'Forbidden: only admin can access runner token' },
+        { status: 403 }
+      )
     }
 
     const secretFilePath = getSecretFilePath()

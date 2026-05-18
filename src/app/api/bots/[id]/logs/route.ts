@@ -2,6 +2,7 @@ import { db } from '@/lib/db'
 import { NextResponse } from 'next/server'
 import { validateBotId } from '@/lib/validation'
 import { getBotIfAuthorized } from '@/lib/api-helpers'
+import { eventBus } from '@/lib/event-bus'
 
 const MAX_MESSAGE_LENGTH = 10000
 const MAX_SOURCE_LENGTH = 200
@@ -72,6 +73,22 @@ export async function POST(
     // NOTE: Old log cleanup is handled by a scheduled task, not on every write.
     // This avoids unnecessary DB load on high-frequency log endpoints.
 
+    if (body.message && body.message.length > 10000) {
+      return NextResponse.json(
+        { error: 'Log message too long (max 10000 characters)' },
+        { status: 400 }
+      )
+    }
+    const recentLogCount = await db.botLog.count({
+      where: { botId: id, timestamp: { gte: new Date(Date.now() - 60 * 60 * 1000) } },
+    })
+    if (recentLogCount >= 10000) {
+      return NextResponse.json(
+        { error: 'Rate limit: too many log entries in the last hour' },
+        { status: 429 }
+      )
+    }
+
     const logEntry = await db.botLog.create({
       data: {
         botId: id,
@@ -79,6 +96,18 @@ export async function POST(
         message,
         source,
       },
+    })
+
+    // P1 OPT: Emit log event to EventBus for instant SSE push.
+    // Without this, SSE clients must wait for the next DB poll (3s interval)
+    // to receive new logs. With EventBus, logs appear in real-time.
+    eventBus.emit(`bot:${id}`, 'log', {
+      id: logEntry.id,
+      botId: logEntry.botId,
+      level: logEntry.level,
+      message: logEntry.message,
+      source: logEntry.source,
+      timestamp: logEntry.timestamp.toISOString(),
     })
 
     return NextResponse.json({

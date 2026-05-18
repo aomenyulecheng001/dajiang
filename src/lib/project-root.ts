@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from 'fs'
-import { join, resolve } from 'path'
+import { join, resolve, sep } from 'path'
 
 /**
  * In standalone mode (output: "standalone"), the server.js calls process.chdir(__dirname)
@@ -41,7 +41,7 @@ export function getProjectRoot(): string {
 
   // Strategy 3: If cwd is inside .next/standalone, go up to project root
   // .next/standalone is always 2 levels deep from the project root
-  if (cwd.includes('.next/standalone') || cwd.includes('.next\\standalone')) {
+  if (cwd.includes(`${sep}.next${sep}standalone${sep}`) || cwd.endsWith(`${sep}.next${sep}standalone`)) {
     const parentDir = resolve(cwd, '..', '..')
     if (existsSync(join(parentDir, 'mini-services'))) {
       _projectRoot = parentDir

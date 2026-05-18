@@ -335,9 +335,8 @@ export async function GET(request: NextRequest) {
       branches,
     })
   } catch (err) {
-    const message = err instanceof Error ? err.message : 'Unknown error'
     return NextResponse.json(
-      { success: false, error: `Failed to fetch branches: ${message}` },
+      { success: false, error: 'Failed to fetch branches' },
       { status: 500 },
     )
   } finally {
@@ -502,6 +501,13 @@ export async function POST(request: NextRequest) {
       return NextResponse.json(
         { success: false, error: 'The specified branch was not found in the repository.' },
         { status: 422 },
+      )
+    }
+
+    if (message.includes('Permission denied') || message.includes('could not read from remote repository') || message.includes('Host key verification failed')) {
+      return NextResponse.json(
+        { success: false, error: 'SSH authentication failed. The server may not have the required SSH key configured. Please use HTTPS URL instead.' },
+        { status: 403 },
       )
     }
 

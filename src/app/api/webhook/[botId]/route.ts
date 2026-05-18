@@ -1,19 +1,58 @@
 import { NextResponse } from 'next/server'
-import { timingSafeEqual, createHash } from 'crypto'
 import { db } from '@/lib/db'
 import { BOT_RUNNER_URL } from '@/lib/bot-runner-url'
 import { safeJsonParse } from '@/lib/api-helpers'
+import { redactSensitiveData, SECURE_ERROR_RESPONSES, timingSafeCompare } from '@/lib/security-utils'
+import { validateBotId } from '@/lib/validation'
 
 // SEC FIX: Track consecutive webhook failures per bot for alerting.
 // Logs at ERROR level only when threshold is exceeded to avoid log flooding.
 const WEBHOOK_FAILURE_ALERT_THRESHOLD = 10
+const MAX_WEBHOOK_FAILURE_ENTRIES = 5000
 const webhookFailureCounts = new Map<string, { count: number; lastFailureAt: number }>()
+
+// P1-10 FIX: Per-bot rate limit for message recording to prevent DB flooding
+const WEBHOOK_MSG_RATE_LIMIT = { max: 1000, windowMs: 60_000 }
+const MAX_WEBHOOK_RATE_ENTRIES = 5000
+const webhookMsgRateMap = new Map<string, { count: number; resetAt: number }>()
+
+const _rateCleanupTimer = setInterval(() => {
+  const now = Date.now()
+  for (const [key, entry] of webhookMsgRateMap) {
+    if (now > entry.resetAt) webhookMsgRateMap.delete(key)
+  }
+  if (webhookMsgRateMap.size > MAX_WEBHOOK_RATE_ENTRIES) {
+    const entries = [...webhookMsgRateMap.entries()].sort((a, b) => a[1].resetAt - b[1].resetAt)
+    for (const [key] of entries.slice(0, entries.length - Math.floor(MAX_WEBHOOK_RATE_ENTRIES * 0.8))) {
+      webhookMsgRateMap.delete(key)
+    }
+  }
+}, 60_000)
+if (_rateCleanupTimer.unref) _rateCleanupTimer.unref()
+
+function checkWebhookMsgRate(botId: string): boolean {
+  const now = Date.now()
+  const entry = webhookMsgRateMap.get(botId)
+  if (!entry || now > entry.resetAt) {
+    webhookMsgRateMap.set(botId, { count: 1, resetAt: now + WEBHOOK_MSG_RATE_LIMIT.windowMs })
+    return true
+  }
+  if (entry.count >= WEBHOOK_MSG_RATE_LIMIT.max) return false
+  entry.count++
+  return true
+}
 
 const _failureCleanupTimer = setInterval(() => {
   const now = Date.now()
   for (const [botId, entry] of webhookFailureCounts) {
     if (now - entry.lastFailureAt > 30 * 60 * 1000) {
       webhookFailureCounts.delete(botId)
+    }
+  }
+  if (webhookFailureCounts.size > MAX_WEBHOOK_FAILURE_ENTRIES) {
+    const entries = [...webhookFailureCounts.entries()].sort((a, b) => a[1].lastFailureAt - b[1].lastFailureAt)
+    for (const [key] of entries.slice(0, entries.length - Math.floor(MAX_WEBHOOK_FAILURE_ENTRIES * 0.8))) {
+      webhookFailureCounts.delete(key)
     }
   }
 }, 10 * 60 * 1000)
@@ -26,6 +65,10 @@ if (_failureCleanupTimer.unref) _failureCleanupTimer.unref()
  */
 async function recordTelegramMessage(botId: string, update: Record<string, unknown>) {
   try {
+    if (!checkWebhookMsgRate(botId)) {
+      console.warn(`[Webhook] Message rate limit exceeded for bot ${botId}`)
+      return
+    }
     // Support message, edited_message, and callback_query
     const u = update as Record<string, unknown>
     const msg = (u.message || u.edited_message || (u as Record<string, unknown>).callback_query && ((u as Record<string, unknown>).callback_query as Record<string, unknown>).message) as Record<string, unknown> | undefined
@@ -63,27 +106,13 @@ async function recordTelegramMessage(botId: string, update: Record<string, unkno
 }
 
 /**
- * P1-1 FIX: Timing-safe string comparison to prevent timing attacks.
- * Regular `!==` comparison leaks information about string contents
- * through response time variations.
- */
-function safeCompare(a: string, b: string): boolean {
-  const aBuf = Buffer.from(a, 'utf-8')
-  const bBuf = Buffer.from(b, 'utf-8')
-  // SECURITY FIX: Hash both values first, then compare hashes.
-  // This eliminates timing differences from length mismatch.
-  const aHash = createHash('sha256').update(aBuf).digest()
-  const bHash = createHash('sha256').update(bBuf).digest()
-  return timingSafeEqual(aHash, bHash)
-}
-
-/**
  * Get the webhookSecret for a bot from the database.
  * P1 OPT: Reads from dedicated webhookSecret column instead of parsing config JSON.
  * Falls back to config.webhookSecret for backward compatibility.
  * Returns null if the bot doesn't exist or has no secret.
  */
 const WEBHOOK_SECRET_CACHE_TTL = 5 * 60 * 1000
+const MAX_WEBHOOK_SECRET_CACHE = 500
 const webhookSecretCache = new Map<string, { secret: string | null; expiresAt: number }>()
 
 const _secretCacheCleanup = setInterval(() => {
@@ -104,6 +133,14 @@ async function getBotWebhookSecret(botId: string): Promise<string | null> {
       select: { webhookSecret: true, config: true },
     })
     if (!bot) {
+      if (webhookSecretCache.size >= MAX_WEBHOOK_SECRET_CACHE) {
+        let oldestKey: string | null = null
+        let oldestTime = Infinity
+        for (const [k, v] of webhookSecretCache) {
+          if (v.expiresAt < oldestTime) { oldestTime = v.expiresAt; oldestKey = k }
+        }
+        if (oldestKey) webhookSecretCache.delete(oldestKey)
+      }
       webhookSecretCache.set(botId, { secret: null, expiresAt: Date.now() + WEBHOOK_SECRET_CACHE_TTL })
       return null
     }
@@ -114,6 +151,14 @@ async function getBotWebhookSecret(botId: string): Promise<string | null> {
     } else {
       const config = safeJsonParse(bot.config, {}) as Record<string, unknown>
       secret = (config.webhookSecret as string) || null
+    }
+    if (webhookSecretCache.size >= MAX_WEBHOOK_SECRET_CACHE) {
+      let oldestKey: string | null = null
+      let oldestTime = Infinity
+      for (const [k, v] of webhookSecretCache) {
+        if (v.expiresAt < oldestTime) { oldestTime = v.expiresAt; oldestKey = k }
+      }
+      if (oldestKey) webhookSecretCache.delete(oldestKey)
     }
     webhookSecretCache.set(botId, { secret, expiresAt: Date.now() + WEBHOOK_SECRET_CACHE_TTL })
     return secret
@@ -142,9 +187,9 @@ export async function POST(
     return NextResponse.json({ ok: false, description: 'Invalid request' }, { status: 400 })
   }
 
-  // Validate botId format (prevent path traversal)
-  if (!botId || botId.length > 100 || !/^[a-zA-Z0-9._-]+$/.test(botId)) {
-    return NextResponse.json({ ok: false, description: 'Invalid bot ID' }, { status: 400 })
+  const idErrors = validateBotId(botId)
+  if (idErrors.length > 0) {
+    return NextResponse.json({ ok: false, description: idErrors[0].message }, { status: 400 })
   }
 
   try {
@@ -157,26 +202,27 @@ export async function POST(
     if (storedSecret) {
       // Bot has a webhookSecret configured — require matching header
       if (!secretFromHeader) {
-         
-        console.warn(`[Webhook] Rejected request for bot ${botId}: missing secret_token header`)
+        // FIX: Use generic error message that doesn't reveal bot existence
+        console.warn(`[Webhook] Rejected request: missing secret_token header`)
         return NextResponse.json(
-          { ok: false, description: 'Missing secret_token header' },
+          SECURE_ERROR_RESPONSES.UNAUTHORIZED,
           { status: 401 }
         )
       }
-      if (!safeCompare(secretFromHeader, storedSecret)) {
-         
-        console.warn(`[Webhook] Rejected request for bot ${botId}: invalid secret_token`)
+      if (!timingSafeCompare(secretFromHeader, storedSecret)) {
+        // FIX: Use generic error message that doesn't reveal bot existence
+        console.warn(`[Webhook] Rejected request: invalid secret_token`)
         return NextResponse.json(
-          { ok: false, description: 'Invalid secret_token' },
+          SECURE_ERROR_RESPONSES.FORBIDDEN,
           { status: 403 }
         )
       }
     }
     if (!storedSecret) {
-      console.error(`[Webhook] REJECTED: Bot ${botId} has no webhookSecret configured. All webhook requests must be authenticated. Set a webhook secret for this bot.`)
+      // FIX: Use generic error message that doesn't reveal bot existence
+      console.error(`[Webhook] REJECTED: Bot has no webhookSecret configured. All webhook requests must be authenticated.`)
       return NextResponse.json(
-        { ok: false, description: 'Webhook not configured: missing secret_token. Set a webhook secret for this bot.' },
+        SECURE_ERROR_RESPONSES.UNAUTHORIZED,
         { status: 401 }
       )
     }
@@ -208,14 +254,20 @@ export async function POST(
     // Forward to bot-runner service via HTTP
     try {
       const runnerUrl = `${BOT_RUNNER_URL}/webhook/${encodeURIComponent(botId)}`
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      }
+      if (storedSecret) {
+        const crypto = await import('crypto')
+        const bodyStr = JSON.stringify(parsed)
+        const signature = crypto.createHmac('sha256', storedSecret).update(bodyStr).digest('hex')
+        headers['X-Webhook-Signature'] = `sha256=${signature}`
+      }
       const response = await fetch(runnerUrl, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Webhook-Secret': storedSecret || '',
-        },
+        headers,
         body: JSON.stringify(parsed),
-        signal: AbortSignal.timeout(10000), // 10s timeout
+        signal: AbortSignal.timeout(10000),
       })
 
       if (!response.ok) {
@@ -227,8 +279,8 @@ export async function POST(
         if (entry.count >= WEBHOOK_FAILURE_ALERT_THRESHOLD && entry.count % WEBHOOK_FAILURE_ALERT_THRESHOLD === 0) {
           console.error(`[Webhook] ALERT: Bot ${botId} has ${entry.count} consecutive webhook failures (runner returned ${response.status}). Check bot-runner status!`)
         } else {
-          console.warn(`[Webhook] Bot-runner returned ${response.status} for bot ${botId} (${entry.count} consecutive): ${errText}`)
-        }
+        console.warn(`[Webhook] Bot-runner returned ${response.status} for bot ${botId} (${entry.count} consecutive): ${redactSensitiveData(errText)}`)
+      }
         return NextResponse.json(
           { ok: false, description: 'Bot-runner error, please retry' },
           { status: 502 }
@@ -294,10 +346,10 @@ export async function GET(
   const storedSecret = await getBotWebhookSecret(botId)
   const secretFromHeader = request.headers.get('x-telegram-bot-api-secret-token')
   if (!storedSecret) {
-    return NextResponse.json({ ok: false, description: 'Webhook not configured: missing secret_token' }, { status: 401 })
+    return NextResponse.json({ ok: false, error: 'Authentication required' }, { status: 401 })
   }
-  if (!secretFromHeader || !safeCompare(secretFromHeader, storedSecret)) {
-    return NextResponse.json({ ok: false, description: 'Unauthorized' }, { status: 401 })
+  if (!secretFromHeader || !timingSafeCompare(secretFromHeader, storedSecret)) {
+    return NextResponse.json({ ok: false, error: 'Authentication required' }, { status: 401 })
   }
 
   // Forward verification to bot-runner

@@ -89,6 +89,7 @@ export const BotCard = React.memo(function BotCard({ bot, viewMode }: BotCardPro
   const { connected } = useBotRunnerConnection()
   const { getBotStatus, deployBot, stopBot } = useBotRunnerActions()
   const pendingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const startingRef = useRef(false)
 
   // Safety timeout: clear localPending after 30s if runner never responded
   useEffect(() => {
@@ -155,12 +156,16 @@ export const BotCard = React.memo(function BotCard({ bot, viewMode }: BotCardPro
 
   // Handlers
   const handleStart = async () => {
+    if (startingRef.current) return
+    startingRef.current = true
     if (!connected) {
       toast.error(t('runtime.serviceNotConnected'))
+      startingRef.current = false
       return
     }
     if (!hasValidToken) {
       toast.error(t('runtime.tokenRequired'))
+      startingRef.current = false
       return
     }
 
@@ -174,29 +179,40 @@ export const BotCard = React.memo(function BotCard({ bot, viewMode }: BotCardPro
     } catch {
       toast.error(t('runtime.serviceNotConnected'))
       setLocalPending(null)
+      startingRef.current = false
       return
     }
 
     const fullBot = useBotStore.getState().bots.find(b => b.id === bot.id) || bot
 
-    const revealed = await fetchRevealEnvVars(bot.id)
-    if (revealed) {
-      realEnvVarsMap = revealed.envVarsMap
-      realBotToken = revealed.botToken
-    } else {
-      if (hasMaskedEnvVars(fullBot.envVars)) {
-        toast.error(t('runtime.envRevealFailed'))
-        setLocalPending(null)
-        return
+    try {
+      const revealed = await fetchRevealEnvVars(bot.id)
+      if (revealed) {
+        realEnvVarsMap = revealed.envVarsMap
+        realBotToken = revealed.botToken
+      } else {
+        if (hasMaskedEnvVars(fullBot.envVars)) {
+          toast.error(t('runtime.envRevealFailed'))
+          setLocalPending(null)
+          startingRef.current = false
+          return
+        }
+        realEnvVarsMap = buildEnvVarsFallback(fullBot.envVars)
       }
-      realEnvVarsMap = buildEnvVarsFallback(fullBot.envVars)
+    } catch {
+      toast.error(t('runtime.envRevealFailed'))
+      setLocalPending(null)
+      startingRef.current = false
+      return
     }
 
     const deploySuccess = deployBot(buildDeployConfig(bot.id, fullBot, realEnvVarsMap, realBotToken))
     if (!deploySuccess) {
       setLocalPending(null)
+      startingRef.current = false
       return
     }
+    startingRef.current = false
     toast.success(t('botCard.starting', { name: bot.name }))
   }
 

@@ -6,6 +6,7 @@ import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover
 import { cn } from '@/lib/utils'
 import { EMOJI_OPTIONS } from '@/lib/bot-constants'
 import { useT } from '@/lib/i18n'
+import { toast } from 'sonner'
 
 // Max file size for custom icon upload: 512KB
 const MAX_ICON_SIZE = 512 * 1024
@@ -36,11 +37,17 @@ export function BotIconPicker({
 
       // Validate file type
       if (!file.type.startsWith('image/')) {
+        toast.error(t('createBot.invalidFileType'))
         return
       }
 
-      // Validate file size
+      if (file.type === 'image/svg+xml') {
+        toast.error(t('createBot.svgNotAllowed'))
+        return
+      }
+
       if (file.size > MAX_ICON_SIZE) {
+        toast.error(t('createBot.fileTooLarge'))
         return
       }
 
@@ -146,7 +153,7 @@ export function BotIconPicker({
                 ref={fileInputRef}
                 type="file"
                 className="hidden"
-                accept="image/png,image/jpeg,image/svg+xml,image/webp,image/gif"
+                accept="image/png,image/jpeg,image/webp,image/gif"
                 onChange={handleFileChange}
               />
             </div>

@@ -22,7 +22,7 @@ export async function GET(request: NextRequest) {
       )
     }
 
-    const account = await db.account.findUnique({ where: { id: session.userId } })
+    const account = await db.account.findUnique({ where: { id: session.userId }, select: { username: true } })
     if (!account) {
       return NextResponse.json(
         { valid: false, error: 'Account no longer exists' },

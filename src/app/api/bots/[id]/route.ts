@@ -18,16 +18,29 @@ async function checkOwnership(request: Request, botId: string): Promise<{ author
   // before the ownerId feature was added). Auto-claim is only allowed when
   // ALLOW_BOT_AUTO_CLAIM is explicitly set to 'true' (single-user dev mode).
   // For multi-tenant deployments, orphaned bots require admin assignment.
-  if (bot.ownerId === null || bot.ownerId === 'migrate-pending') {
+  if (!bot.ownerId || bot.ownerId === 'migrate-pending') {
     if (process.env.ALLOW_BOT_AUTO_CLAIM === 'true') {
+      // SECURITY: Only admin (first account) can claim unowned bots.
+      // This prevents any logged-in user from taking over bots that
+      // were created before the ownership system was in place.
+      const firstAccount = await db.account.findFirst({ orderBy: { createdAt: 'asc' }, select: { id: true } })
+      if (firstAccount && firstAccount.id !== userId) {
+        return { authorized: false, userId }
+      }
       const whereClause = bot.ownerId === 'migrate-pending'
         ? { id: botId, ownerId: 'migrate-pending' }
-        : { id: botId, ownerId: null as unknown as string }
+        : { id: botId, ownerId: '' }
       const result = await db.bot.updateMany({
         where: whereClause,
         data: { ownerId: userId },
       })
       if (result.count === 0) {
+        // P1-3 FIX: Concurrent claim may have already assigned this user as owner.
+        // Re-check to avoid rejecting the legitimate owner.
+        const currentBot = await db.bot.findUnique({ where: { id: botId }, select: { ownerId: true } })
+        if (currentBot && currentBot.ownerId === userId) {
+          return { authorized: true, userId }
+        }
         return { authorized: false, userId }
       }
       return { authorized: true, userId }
@@ -76,7 +89,17 @@ export async function GET(
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    const bot = await db.bot.findUnique({ where: { id } })
+    const bot = await db.bot.findUnique({
+      where: { id },
+      select: {
+        id: true, name: true, description: true, emoji: true, customIcon: true,
+        status: true, health: true, language: true, template: true, version: true,
+        code: true, codeBlocks: true, dependencies: true, envVars: true, config: true,
+        stats: true, projectFiles: true, entryPoint: true, lastRunnerStatus: true,
+        lastDeployedAt: true, webhookSecret: true, createdAt: true, updatedAt: true,
+        ownerId: true,
+      },
+    })
     if (!bot || !isBotOwner(bot.ownerId, userId)) {
       return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
@@ -107,7 +130,7 @@ export async function PUT(
     }
 
     const { authorized } = await checkOwnership(request, id)
-    if (!authorized) {
+    if (authorized !== true) {
       return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
 
@@ -146,66 +169,64 @@ export async function PUT(
     // the placeholder and destroying the real secret.
     const incomingEnvVars = (bot.envVars as { key: string; value: string; isEncrypted?: boolean }[]) || []
     
-    // PERF FIX (SQLite): Move heavy work OUTSIDE the transaction.
-    const existingBot = await db.bot.findUnique({
-      where: { id },
-      select: { envVars: true, config: true, webhookSecret: true },
-    })
-    if (!existingBot) {
-      return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
-    }
-    const existingEnvVarsForMerge = safeJsonParse(existingBot.envVars, []) as { key: string; value: string; isEncrypted?: boolean }[]
-    const mergedEnvVars = incomingEnvVars.map((incoming) => {
-      if (incoming.value === ENCRYPTED_PLACEHOLDER && incoming.isEncrypted) {
-        const existing = existingEnvVarsForMerge.find((e) => e.key === incoming.key)
-        if (existing && existing.isEncrypted) {
-          return { ...incoming, value: existing.value }
-        }
+    const updated = await db.$transaction(async (tx) => {
+      const existingBot = await tx.bot.findUnique({
+        where: { id },
+        select: { envVars: true, config: true, webhookSecret: true },
+      })
+      if (!existingBot) {
+        throw new Error('BOT_NOT_FOUND')
       }
-      return incoming
-    })
-    // PERF FIX: Only re-encrypt env vars whose values actually changed.
-    const needsReEncrypt = mergedEnvVars.filter(
-      (v) => !existingEnvVarsForMerge.some(
-        (e) => e.key === v.key && e.value === v.value && v.isEncrypted,
-      ),
-    )
-    const processedEnvVars = needsReEncrypt.length > 0
-      ? await encryptEnvVarsOnSaveAsync(mergedEnvVars)
-      : mergedEnvVars
-    // SECURITY FIX: Merge incoming config with existing DB config to preserve webhookSecret.
-    const existingConfig = safeJsonParse(existingBot.config, {}) as Record<string, unknown>
-    const configObj = { ...existingConfig, ...((bot.config as Record<string, unknown>) || {}) }
-    // Preserve the DB's webhookSecret if the client didn't send one
-    if (!(('webhookSecret' in ((bot.config as Record<string, unknown>) || {}))) && existingBot.webhookSecret) {
-      configObj.webhookSecret = existingBot.webhookSecret
-    }
-    const updateData = {
-      name: sanitizeBotName(bot.name),
-      description: sanitizeBotDescription(bot.description),
-      emoji: sanitizeEmoji(bot.emoji),
-      customIcon: sanitizeCustomIcon(bot.customIcon),
-      status: VALID_BOT_STATUSES.includes(bot.status as BotStatus) ? (bot.status as BotStatus) : 'inactive',
-      health: VALID_BOT_HEALTHS.includes(bot.health as BotHealth) ? (bot.health as BotHealth) : 'unknown',
-      language: (bot.language as string) || 'typescript',
-      template: (bot.template as string) || 'custom',
-      version: (bot.version as string) || '1.0.0',
-      code: (bot.code as string) || '',
-      codeBlocks: JSON.stringify(bot.codeBlocks || []),
-      dependencies: JSON.stringify(bot.dependencies || []),
-      envVars: JSON.stringify(processedEnvVars),
-      config: JSON.stringify(configObj),
-      stats: JSON.stringify(bot.stats || {}),
-      projectFiles: JSON.stringify(bot.projectFiles || []),
-      entryPoint: (bot.entryPoint as string) || '',
-      lastRunnerStatus: (bot.lastRunnerStatus as string) || '',
-      lastDeployedAt: (bot.lastDeployedAt as string) || '',
-      webhookSecret: (configObj.webhookSecret as string) || '',
-    }
+      const existingEnvVarsForMerge = safeJsonParse(existingBot.envVars, []) as { key: string; value: string; isEncrypted?: boolean }[]
+      const mergedEnvVars = incomingEnvVars.map((incoming) => {
+        if (incoming.value === ENCRYPTED_PLACEHOLDER && incoming.isEncrypted) {
+          const existing = existingEnvVarsForMerge.find((e) => e.key === incoming.key)
+          if (existing && existing.isEncrypted) {
+            return { ...incoming, value: existing.value }
+          }
+        }
+        return incoming
+      })
+      const needsReEncrypt = mergedEnvVars.filter(
+        (v) => !existingEnvVarsForMerge.some(
+          (e) => e.key === v.key && e.value === v.value && v.isEncrypted,
+        ),
+      )
+      const processedEnvVars = needsReEncrypt.length > 0
+        ? await encryptEnvVarsOnSaveAsync(mergedEnvVars)
+        : mergedEnvVars
+      const existingConfig = safeJsonParse(existingBot.config, {}) as Record<string, unknown>
+      const configObj = { ...existingConfig, ...((bot.config as Record<string, unknown>) || {}) }
+      if (!(('webhookSecret' in ((bot.config as Record<string, unknown>) || {}))) && existingBot.webhookSecret) {
+        configObj.webhookSecret = existingBot.webhookSecret
+      }
+      const updateData = {
+        name: sanitizeBotName(bot.name),
+        description: sanitizeBotDescription(bot.description),
+        emoji: sanitizeEmoji(bot.emoji),
+        customIcon: sanitizeCustomIcon(bot.customIcon),
+        status: VALID_BOT_STATUSES.includes(bot.status as BotStatus) ? (bot.status as BotStatus) : 'inactive',
+        health: VALID_BOT_HEALTHS.includes(bot.health as BotHealth) ? (bot.health as BotHealth) : 'unknown',
+        language: (bot.language as string) || 'typescript',
+        template: (bot.template as string) || 'custom',
+        version: (bot.version as string) || '1.0.0',
+        code: (bot.code as string) || '',
+        codeBlocks: JSON.stringify(bot.codeBlocks || []),
+        dependencies: JSON.stringify(bot.dependencies || []),
+        envVars: JSON.stringify(processedEnvVars),
+        config: JSON.stringify(configObj),
+        stats: JSON.stringify(bot.stats || {}),
+        projectFiles: JSON.stringify(bot.projectFiles || []),
+        entryPoint: (bot.entryPoint as string) || '',
+        lastRunnerStatus: (bot.lastRunnerStatus as string) || '',
+        lastDeployedAt: (bot.lastDeployedAt as string) ? new Date(bot.lastDeployedAt as string) : null,
+        webhookSecret: (configObj.webhookSecret as string) || '',
+      }
 
-    const updated = await db.bot.update({
-      where: { id },
-      data: updateData,
+      return tx.bot.update({
+        where: { id },
+        data: updateData,
+      })
     })
 
     // P1 OPT: Emit status event to event bus for instant SSE push
@@ -242,7 +263,7 @@ export async function PATCH(
     }
 
     const { authorized } = await checkOwnership(request, id)
-    if (!authorized) {
+    if (authorized !== true) {
       return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
 
@@ -274,101 +295,86 @@ export async function PATCH(
       )
     }
 
-    // PERF FIX (SQLite): Move heavy work OUTSIDE the transaction.
-    // SQLite interactive transactions add significant overhead. Since SQLite
-    // is single-connection, a direct update is atomic enough for this use case.
-
-    // Step 1: Read existing data (outside transaction)
-    const existing = await db.bot.findUnique({
-      where: { id },
-      select: {
-        status: true,
-        health: true,
-        language: true,
-        template: true,
-        version: true,
-        envVars: true,
-        config: true,
-        webhookSecret: true,
-      },
-    })
-    if (!existing) {
-      return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
-    }
-
-    // Step 2: Build update data — only include provided fields (outside transaction)
-    const updateData: Record<string, unknown> = {}
-
-    if ('name' in body) updateData.name = sanitizeBotName(body.name)
-    if ('description' in body) updateData.description = sanitizeBotDescription(body.description)
-    if ('emoji' in body) updateData.emoji = sanitizeEmoji(body.emoji)
-    if ('customIcon' in body) updateData.customIcon = sanitizeCustomIcon(body.customIcon)
-    if ('status' in body) {
-      updateData.status = VALID_BOT_STATUSES.includes(body.status as BotStatus) ? (body.status as BotStatus) : existing.status
-    }
-    if ('health' in body) {
-      updateData.health = VALID_BOT_HEALTHS.includes(body.health as BotHealth) ? (body.health as BotHealth) : existing.health
-    }
-    if ('language' in body) updateData.language = (body.language as string) || existing.language
-    if ('template' in body) updateData.template = (body.template as string) || existing.template
-    if ('version' in body) updateData.version = (body.version as string) || existing.version
-    if ('code' in body) updateData.code = (body.code as string) || ''
-    if ('codeBlocks' in body) updateData.codeBlocks = JSON.stringify(body.codeBlocks || [])
-    if ('dependencies' in body) updateData.dependencies = JSON.stringify(body.dependencies || [])
-    if ('envVars' in body) {
-      const incomingEnvVars = (body.envVars as { key: string; value: string; isEncrypted?: boolean }[]) || []
-      // BUG FIX: Merge masked env vars with existing DB values.
-      const existingEnvVars = safeJsonParse(existing.envVars, []) as { key: string; value: string; isEncrypted?: boolean }[]
-      const mergedEnvVars = incomingEnvVars.map((incoming) => {
-        if (incoming.value === ENCRYPTED_PLACEHOLDER && incoming.isEncrypted) {
-          const existingVar = existingEnvVars.find((e) => e.key === incoming.key)
-          if (existingVar && existingVar.isEncrypted) {
-            return { ...incoming, value: existingVar.value }
-          }
-        }
-        return incoming
+    const updated = await db.$transaction(async (tx) => {
+      const existing = await tx.bot.findUnique({
+        where: { id },
+        select: {
+          status: true,
+          health: true,
+          language: true,
+          template: true,
+          version: true,
+          envVars: true,
+          config: true,
+          webhookSecret: true,
+        },
       })
-      // PERF FIX: Only re-encrypt vars whose values actually changed.
-      const needsReEncrypt = mergedEnvVars.filter(
-        (v) => !existingEnvVars.some(
-          (e) => e.key === v.key && e.value === v.value && v.isEncrypted,
-        ),
-      )
-      const processedEnvVars = needsReEncrypt.length > 0
-        ? await encryptEnvVarsOnSaveAsync(mergedEnvVars)
-        : mergedEnvVars
-      updateData.envVars = JSON.stringify(processedEnvVars)
-    }
-    if ('config' in body) {
-      // SECURITY FIX: Merge incoming config with existing DB config to preserve
-      // webhookSecret. The client-side config comes from serializeBotResponse which
-      // strips webhookSecret for security. Without this merge, every config PATCH
-      // would erase webhookSecret from the config JSON column, and a subsequent PUT
-      // would read the (now missing) webhookSecret from config and clear the
-      // dedicated webhookSecret column.
-      const existingConfig = safeJsonParse(existing.config, {}) as Record<string, unknown>
-      const incomingConfig = (body.config as Record<string, unknown>) || {}
-      const mergedConfig = { ...existingConfig, ...incomingConfig }
-      // Preserve the DB's webhookSecret if the client didn't send one
-      if (!('webhookSecret' in incomingConfig) && existing.webhookSecret) {
-        mergedConfig.webhookSecret = existing.webhookSecret
+      if (!existing) {
+        throw new Error('BOT_NOT_FOUND')
       }
-      updateData.config = JSON.stringify(mergedConfig)
-      // Update dedicated webhookSecret column if client explicitly sent one
-      if ('webhookSecret' in incomingConfig) {
-        updateData.webhookSecret = (incomingConfig.webhookSecret as string) || ''
-      }
-    }
-    if ('stats' in body) updateData.stats = JSON.stringify(body.stats || {})
-    if ('projectFiles' in body) updateData.projectFiles = JSON.stringify(body.projectFiles || [])
-    if ('entryPoint' in body) updateData.entryPoint = (body.entryPoint as string) || ''
-    if ('lastRunnerStatus' in body) updateData.lastRunnerStatus = (body.lastRunnerStatus as string) || ''
-    if ('lastDeployedAt' in body) updateData.lastDeployedAt = (body.lastDeployedAt as string) || ''
 
-    // Step 3: Atomic update (single write — SQLite guarantees atomicity)
-    const updated = await db.bot.update({
-      where: { id },
-      data: updateData,
+      const updateData: Record<string, unknown> = {}
+
+      if ('name' in body) updateData.name = sanitizeBotName(body.name)
+      if ('description' in body) updateData.description = sanitizeBotDescription(body.description)
+      if ('emoji' in body) updateData.emoji = sanitizeEmoji(body.emoji)
+      if ('customIcon' in body) updateData.customIcon = sanitizeCustomIcon(body.customIcon)
+      if ('status' in body) {
+        updateData.status = VALID_BOT_STATUSES.includes(body.status as BotStatus) ? (body.status as BotStatus) : existing.status
+      }
+      if ('health' in body) {
+        updateData.health = VALID_BOT_HEALTHS.includes(body.health as BotHealth) ? (body.health as BotHealth) : existing.health
+      }
+      if ('language' in body) updateData.language = (body.language as string) || existing.language
+      if ('template' in body) updateData.template = (body.template as string) || existing.template
+      if ('version' in body) updateData.version = (body.version as string) || existing.version
+      if ('code' in body) updateData.code = (body.code as string) || ''
+      if ('codeBlocks' in body) updateData.codeBlocks = JSON.stringify(body.codeBlocks || [])
+      if ('dependencies' in body) updateData.dependencies = JSON.stringify(body.dependencies || [])
+      if ('envVars' in body) {
+        const incomingEnvVars = (body.envVars as { key: string; value: string; isEncrypted?: boolean }[]) || []
+        const existingEnvVars = safeJsonParse(existing.envVars, []) as { key: string; value: string; isEncrypted?: boolean }[]
+        const mergedEnvVars = incomingEnvVars.map((incoming) => {
+          if (incoming.value === ENCRYPTED_PLACEHOLDER && incoming.isEncrypted) {
+            const existingVar = existingEnvVars.find((e) => e.key === incoming.key)
+            if (existingVar && existingVar.isEncrypted) {
+              return { ...incoming, value: existingVar.value }
+            }
+          }
+          return incoming
+        })
+        const needsReEncrypt = mergedEnvVars.filter(
+          (v) => !existingEnvVars.some(
+            (e) => e.key === v.key && e.value === v.value && v.isEncrypted,
+          ),
+        )
+        const processedEnvVars = needsReEncrypt.length > 0
+          ? await encryptEnvVarsOnSaveAsync(mergedEnvVars)
+          : mergedEnvVars
+        updateData.envVars = JSON.stringify(processedEnvVars)
+      }
+      if ('config' in body) {
+        const existingConfig = safeJsonParse(existing.config, {}) as Record<string, unknown>
+        const incomingConfig = (body.config as Record<string, unknown>) || {}
+        const mergedConfig = { ...existingConfig, ...incomingConfig }
+        if (!('webhookSecret' in incomingConfig) && existing.webhookSecret) {
+          mergedConfig.webhookSecret = existing.webhookSecret
+        }
+        updateData.config = JSON.stringify(mergedConfig)
+        if ('webhookSecret' in incomingConfig) {
+          updateData.webhookSecret = (incomingConfig.webhookSecret as string) || ''
+        }
+      }
+      if ('stats' in body) updateData.stats = JSON.stringify(body.stats || {})
+      if ('projectFiles' in body) updateData.projectFiles = JSON.stringify(body.projectFiles || [])
+      if ('entryPoint' in body) updateData.entryPoint = (body.entryPoint as string) || ''
+      if ('lastRunnerStatus' in body) updateData.lastRunnerStatus = (body.lastRunnerStatus as string) || ''
+      if ('lastDeployedAt' in body) updateData.lastDeployedAt = (body.lastDeployedAt as string) ? new Date(body.lastDeployedAt as string) : null
+
+      return tx.bot.update({
+        where: { id },
+        data: updateData,
+      })
     })
 
     // P1 OPT: Emit status event to event bus for instant SSE push
@@ -404,14 +410,29 @@ export async function DELETE(
     }
 
     const { authorized, userId: deleteUserId } = await checkOwnership(request, id)
-    if (!authorized) {
+    if (authorized !== true) {
       return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
 
-    // P0-3 OPT: Removed redundant findUnique before delete.
-    // Directly attempt delete — if record doesn't exist, Prisma throws P2025.
-    // This saves 1 DB query per DELETE request.
-    await db.bot.delete({ where: { id } })
+    let deletedBot: { id: string; ownerId: string | null } | null = null
+    try {
+      deletedBot = await db.$transaction(async (tx) => {
+        const bot = await tx.bot.findUnique({ where: { id }, select: { ownerId: true } })
+        if (!bot || !isBotOwner(bot.ownerId, deleteUserId)) {
+          throw new Error('BOT_NOT_FOUND')
+        }
+        return tx.bot.delete({ where: { id } })
+      })
+    } catch (err) {
+      if (err instanceof Error && err.message === 'BOT_NOT_FOUND') {
+        return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
+      }
+      throw err
+    }
+
+    if (!deletedBot) {
+      return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
+    }
 
     // SECURITY FIX (SEC-86): Audit log for bot deletion
     console.info(`[Audit] Bot deleted: id=${id}, owner=${deleteUserId || 'unknown'}`)
@@ -446,27 +467,18 @@ export async function DELETE(
 
     // P1-FIX: Notify bot-runner to stop process and clean up disk AFTER successful DB delete.
     // Fire-and-forget: if runner is unreachable, the process will eventually be cleaned up on restart.
-    try {
-      const runnerSecret = await getRunnerSecret()
-      const runnerUrl = `${BOT_RUNNER_URL}/cleanup/${encodeURIComponent(id)}`
-      const headers: Record<string, string> = {}
-      if (runnerSecret) {
-        headers['X-Runner-Secret'] = runnerSecret
-      }
-      const cleanupRes = await fetch(runnerUrl, {
-        method: 'DELETE',
-        headers,
-        signal: AbortSignal.timeout(5000),
-      })
-      // BUG FIX: Log cleanup failure with more detail so we can diagnose
-      // why bot files remain on disk after deletion.
-      if (!cleanupRes.ok) {
-        const body = await cleanupRes.text().catch(() => '')
-        console.error(`[DELETE] Bot-runner cleanup failed for bot ${id}: HTTP ${cleanupRes.status} ${body}`)
-      }
-    } catch (err) {
-      console.error(`[DELETE] Bot-runner unreachable for cleanup of bot ${id}:`, err instanceof Error ? err.message : err)
+    const runnerSecret = await getRunnerSecret()
+    const runnerUrl = `${BOT_RUNNER_URL}/cleanup/${encodeURIComponent(id)}`
+    const headers: Record<string, string> = {}
+    if (runnerSecret) {
+      headers['X-Runner-Secret'] = runnerSecret
     }
+    // P1-2 FIX: Return success immediately, run cleanup async to avoid blocking response
+    fetch(runnerUrl, {
+      method: 'DELETE',
+      headers,
+      signal: AbortSignal.timeout(10000),
+    }).catch(err => console.warn('[Delete] Runner cleanup failed:', err instanceof Error ? err.message : err))
 
     return NextResponse.json({ success: true })
   } catch (error) {

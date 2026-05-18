@@ -127,8 +127,17 @@ async function loadRevocations(): Promise<void> {
         revokedTokenSignatures.set(hash, { expiresAt: Number(expires) })
       }
     }
-  } catch { /* ignore */ }
-  revocationsLoaded = true
+    // BUG FIX: Only set revocationsLoaded=true on successful read.
+    // Previously, catch also set this flag, meaning a failed file read
+    // would allow revoked tokens to bypass the in-memory revocation check.
+    revocationsLoaded = true
+  } catch (error) {
+    // SECURITY: If we cannot load the revocation list, do NOT set revocationsLoaded=true.
+    // This causes validateSessionAsync to reject all tokens (fail-closed) until
+    // the file can be read. This is safer than silently accepting revoked tokens.
+    console.error('[Session] CRITICAL: Failed to load revocation list — all tokens will be rejected until this is resolved:', error instanceof Error ? error.message : 'unknown')
+    // Do NOT set revocationsLoaded = true here
+  }
 }
 
 loadRevocations().catch(() => { /* ignore */ })
@@ -394,14 +403,13 @@ export async function deleteSession(token: string): Promise<boolean> {
     const dotIndex = token.indexOf('.')
     if (dotIndex === -1) return false
 
-    const payloadStr = base64UrlDecode(token.slice(0, dotIndex))
-    const payload: SessionPayload = JSON.parse(payloadStr)
     const signature = token.slice(dotIndex + 1)
-
     const valid = await hmacVerify(token.slice(0, dotIndex), signature)
     if (!valid) return false
 
-    // Add to revocation list with TTL-based expiration
+    const payloadStr = base64UrlDecode(token.slice(0, dotIndex))
+    const payload: SessionPayload = JSON.parse(payloadStr)
+
     const hashedSig = await hashSignature(signature)
     const expiresAt = payload.createdAt + SESSION_TTL_MS
     revokedTokenSignatures.set(hashedSig, { expiresAt })

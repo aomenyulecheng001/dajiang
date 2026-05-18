@@ -73,13 +73,26 @@ function isValidBotId(botId: string): boolean {
     && /^[a-zA-Z0-9._-]+$/.test(botId)
 }
 
+/**
+ * FIX: Safe wrapper for sanitizeBotId that returns empty string on error
+ * instead of throwing. Used in handlers where we want to silently ignore
+ * invalid IDs rather than crash the handler.
+ */
+function safeSanitizeBotId(botId: string): string {
+  try {
+    return sanitizeBotId(botId)
+  } catch {
+    return ''
+  }
+}
+
 // ─── Handler Registration ─────────────────────────────────────────────────
 
 export function registerHandlers(
   io: Server,
   botProcesses: Map<string, BotProcess>,
   deployStatus: Map<string, { stage: DeployStage; progress: number; error?: string; logs: string[] }>,
-  startBotProcess: (botId: string) => void,
+  startBotProcess: (botId: string) => Promise<void>,
   stopBotProcess: (botId: string) => void,
 ): void {
 
@@ -87,6 +100,8 @@ export function registerHandlers(
     console.log(`[Socket] 客户端连接: ${socket.id}`)
 
     // Send current state (filter out BOT_TOKEN from env var names)
+const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIKEY', 'API_KEY', 'ACCESS_KEY', 'PRIVATE', 'CREDENTIAL', 'DATABASE_URL']
+
     socket.emit('init', {
       bots: Array.from(botProcesses.entries()).map(([id, bot]) => ({
         id: bot.id,
@@ -98,7 +113,9 @@ export function registerHandlers(
         stoppedAt: bot.stoppedAt,
         exitCode: bot.exitCode,
         error: bot.error,
-        envVars: Object.keys(bot.envVars).filter(k => k !== 'BOT_TOKEN'),
+        envVars: Object.keys(bot.envVars).filter(k =>
+          !SENSITIVE_ENV_PATTERNS.some(p => k.toUpperCase().includes(p))
+        ),
       })),
     })
 
@@ -109,7 +126,11 @@ export function registerHandlers(
         socket.emit('bot:status', { botId: data.botId, status: 'error', error: 'Invalid bot ID format' })
         return
       }
-      const botId = sanitizeBotId(data.botId)
+      const botId = safeSanitizeBotId(data.botId)
+      if (!botId) {
+        socket.emit('bot:status', { botId: data.botId, status: 'error', error: 'Invalid bot ID' })
+        return
+      }
 
       // BUG FIX: Cancel any existing deploy for this bot instead of rejecting.
       // Previously, a second deploy while one was in progress would show
@@ -144,7 +165,8 @@ export function registerHandlers(
     // Stop a bot
     socket.on('bot:stop', (data: { botId: string }) => {
       if (!isValidBotId(data.botId)) return
-      const botId = sanitizeBotId(data.botId)
+      const botId = safeSanitizeBotId(data.botId)
+      if (!botId) return
       console.log(`[Stop] ${botId}`)
 
       // BUG FIX: Cancel any in-progress deploy for this bot.
@@ -163,7 +185,11 @@ export function registerHandlers(
         socket.emit('bot:status', { botId: data.botId, status: 'error', error: 'Invalid bot ID format' })
         return
       }
-      const botId = sanitizeBotId(data.botId)
+      const botId = safeSanitizeBotId(data.botId)
+      if (!botId) {
+        socket.emit('bot:status', { botId: data.botId, status: 'error', error: 'Invalid bot ID' })
+        return
+      }
       console.log(`[Start] ${botId}`)
 
       // BUG FIX: Cancel any pending auto-restart timer before manual start.
@@ -177,7 +203,7 @@ export function registerHandlers(
       if (bot && (bot.status === 'stopped' || bot.status === 'error')) {
         bot.logBuffer = []
         bot.restartCount = 0 // Reset restart count on manual start
-        startBotProcess(botId)
+        await startBotProcess(botId)
       } else if (!bot) {
         socket.emit('bot:status', { botId, status: 'error', error: 'Bot not found. Please deploy first.' })
       }
@@ -189,7 +215,11 @@ export function registerHandlers(
         socket.emit('bot:status', { botId: data.botId, status: 'error', error: 'Invalid bot ID format' })
         return
       }
-      const botId = sanitizeBotId(data.botId)
+      const botId = safeSanitizeBotId(data.botId)
+      if (!botId) {
+        socket.emit('bot:status', { botId: data.botId, status: 'error', error: 'Invalid bot ID' })
+        return
+      }
       console.log(`[Restart] ${botId}`)
 
       // BUG FIX: Cancel any pending auto-restart timer to prevent double-start
@@ -222,7 +252,7 @@ export function registerHandlers(
             b.restartCount = 0 // Reset restart count on manual restart
             b.logBuffer = []
             clearIntentionalStop(botId)
-            startBotProcess(botId)
+            startBotProcess(botId).catch(e => console.error('[Restart timeout] start failed:', e))
           }
         }, 6000)
         restartTimeout.unref()
@@ -234,7 +264,7 @@ export function registerHandlers(
             b.restartCount = 0 // Reset restart count on manual restart
             b.logBuffer = []
             clearIntentionalStop(botId)
-            startBotProcess(botId)
+            startBotProcess(botId).catch(e => console.error('[Restart close] start failed:', e))
           }
         })
       } else {
@@ -244,7 +274,7 @@ export function registerHandlers(
           b.restartCount = 0
           b.logBuffer = []
           clearIntentionalStop(botId)
-          startBotProcess(botId)
+          await startBotProcess(botId)
         }
       }
     })
@@ -252,7 +282,8 @@ export function registerHandlers(
     // Delete a bot
     socket.on('bot:delete', (data: { botId: string }) => {
       if (!isValidBotId(data.botId)) return
-      const botId = sanitizeBotId(data.botId)
+      const botId = safeSanitizeBotId(data.botId)
+      if (!botId) return
       console.log(`[Delete] ${botId}`)
       // BUG FIX: Cancel auto-restart timer before stopping for delete
       cancelRestartTimer(botId)
@@ -274,17 +305,20 @@ export function registerHandlers(
         try {
           await access(botDir).then(() => rm(botDir, { recursive: true, force: true })).catch(() => {})
         } catch { /* ignore */ }
-        // Also delete persisted config
         const configPath = join(CONFIG_DIR, `${botId}.json`)
         try {
           await access(configPath).then(() => rm(configPath, { force: true })).catch(() => {})
+        } catch { /* ignore */ }
+        const logPath = join(LOGS_DIR, `${botId}.log`)
+        try {
+          await access(logPath).then(() => rm(logPath, { force: true })).catch(() => {})
         } catch { /* ignore */ }
         botProcesses.delete(botId)
         deployStatus.delete(botId)
         // Clean up tracking sets to prevent memory leak and stale state
         intentionalStopSet.delete(botId)
         memoryKilledSet.delete(botId)
-        socket.emit('bot:deleted', { botId })
+        io.emit('bot:deleted', { botId })
       }
 
       // Use event-driven approach: listen for process close event with timeout fallback
@@ -304,7 +338,8 @@ export function registerHandlers(
     socket.on('bot:logs', (data: { botId: string }) => {
       // BUG FIX: Validate botId like all other handlers
       if (!isValidBotId(data.botId)) return
-      const botId = sanitizeBotId(data.botId)
+      const botId = safeSanitizeBotId(data.botId)
+      if (!botId) return
       const bot = botProcesses.get(botId)
       if (bot) {
         socket.emit('bot:logs', { botId, logs: bot.logBuffer.slice(-100) })
@@ -314,7 +349,8 @@ export function registerHandlers(
     // Get deploy status
     socket.on('deploy:status', (data: { botId: string }) => {
       if (!isValidBotId(data.botId)) return
-      const botId = sanitizeBotId(data.botId)
+      const botId = safeSanitizeBotId(data.botId)
+      if (!botId) return
       const status = deployStatus.get(botId)
       socket.emit('deploy:progress', {
         botId,
@@ -330,7 +366,11 @@ export function registerHandlers(
         socket.emit('bot:status', { botId: data.botId, status: 'error', error: 'Invalid bot ID format' })
         return
       }
-      const botId = sanitizeBotId(data.botId)
+      const botId = safeSanitizeBotId(data.botId)
+      if (!botId) {
+        socket.emit('bot:status', { botId: data.botId, status: 'error', error: 'Invalid bot ID' })
+        return
+      }
 
       // Cancel any existing deploy for this bot
       cancelActiveDeploy(botId)
@@ -394,7 +434,11 @@ export function registerHandlers(
           callback?.({ success: false, error: 'Invalid bot ID format' })
           return
         }
-        const botId = sanitizeBotId(rawBotId)
+        const botId = safeSanitizeBotId(rawBotId)
+        if (!botId) {
+          callback?.({ success: false, error: 'Invalid bot ID' })
+          return
+        }
 
         // BUG FIX: Cancel auto-restart timer and mark intentional stop
         cancelRestartTimer(botId)
@@ -417,7 +461,7 @@ export function registerHandlers(
               b.restartCount = 0
               b.logBuffer = []
               clearIntentionalStop(botId)
-              startBotProcess(botId)
+              startBotProcess(botId).catch(e => console.error('[PM2 restart timeout] start failed:', e))
             }
           }, 6000)
           restartTimeout.unref()
@@ -429,7 +473,7 @@ export function registerHandlers(
               b.restartCount = 0
               b.logBuffer = []
               clearIntentionalStop(botId)
-              startBotProcess(botId)
+              startBotProcess(botId).catch(e => console.error('[PM2 restart close] start failed:', e))
             }
           })
         } else {
@@ -438,7 +482,7 @@ export function registerHandlers(
             b.restartCount = 0
             b.logBuffer = []
             clearIntentionalStop(botId)
-            startBotProcess(botId)
+            await startBotProcess(botId)
           }
         }
 
@@ -454,7 +498,11 @@ export function registerHandlers(
           callback?.({ success: false, error: 'Invalid bot ID format' })
           return
         }
-        const botId = sanitizeBotId(rawBotId)
+        const botId = safeSanitizeBotId(rawBotId)
+        if (!botId) {
+          callback?.({ success: false, error: 'Invalid bot ID' })
+          return
+        }
         // Cancel any in-progress deploy and auto-restart timer
         cancelActiveDeploy(botId)
         cancelRestartTimer(botId)
@@ -471,7 +519,11 @@ export function registerHandlers(
           callback?.({ success: false, error: 'Invalid bot ID format' })
           return
         }
-        const botId = sanitizeBotId(rawBotId)
+        const botId = safeSanitizeBotId(rawBotId)
+        if (!botId) {
+          callback?.({ success: false, error: 'Invalid bot ID' })
+          return
+        }
         console.log(`[PM2:Delete] ${botId}`)
         // BUG FIX: Cancel auto-restart timer and active deploy before stopping for delete
         cancelRestartTimer(botId)
@@ -535,7 +587,8 @@ export function registerHandlers(
     socket.on('pm2:resources', (rawBotId: string, callback) => {
       // BUG FIX: Validate botId like all other handlers
       if (!isValidBotId(rawBotId)) return callback?.(null)
-      const botId = sanitizeBotId(rawBotId)
+      const botId = safeSanitizeBotId(rawBotId)
+      if (!botId) return callback?.(null)
       const bot = botProcesses.get(botId)
       if (!bot) return callback?.(null)
       callback?.({

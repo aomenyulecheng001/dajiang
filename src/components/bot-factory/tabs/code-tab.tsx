@@ -34,11 +34,16 @@ const SyntaxHighlighter = dynamic(
 
 let _oneDark: Record<string, React.CSSProperties> | null = null
 let _oneLight: Record<string, React.CSSProperties> | null = null
-async function loadStyles() {
-  if (_oneDark && _oneLight) return
-  const styles = await import('react-syntax-highlighter/dist/esm/styles/prism')
-  _oneDark = styles.oneDark
-  _oneLight = styles.oneLight
+let _stylesPromise: Promise<void> | null = null
+function loadStyles() {
+  if (_oneDark && _oneLight) return Promise.resolve()
+  if (!_stylesPromise) {
+    _stylesPromise = import('react-syntax-highlighter/dist/esm/styles/prism').then(styles => {
+      _oneDark = styles.oneDark
+      _oneLight = styles.oneLight
+    })
+  }
+  return _stylesPromise
 }
 import type { CodeBlock, BotLanguage } from '@/types/bot'
 

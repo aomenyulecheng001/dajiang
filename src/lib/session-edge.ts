@@ -7,6 +7,8 @@
  * Used exclusively in middleware.ts for request authentication.
  */
 
+import { safeUnref } from '@/lib/logger'
+
 if (process.env.NODE_ENV === 'production' && (!process.env.NEXT_PUBLIC_APP_URL || process.env.NEXT_PUBLIC_APP_URL === 'http://localhost:3000')) {
   console.error('WARNING: NEXT_PUBLIC_APP_URL is not configured or set to localhost. Edge Runtime token validation may fail.')
   console.error('Set NEXT_PUBLIC_APP_URL to your actual application URL (e.g., "https://your-domain.com")')
@@ -18,34 +20,30 @@ function getHmacSecret(): string {
     return process.env.HMAC_SECRET
   }
   console.error('[session-edge] FATAL: HMAC_SECRET environment variable is not set!')
-  console.error('[session-edge] Using random per-process secret. Tokens will not survive restarts.')
-  // BUG FIX (BUG-104): Same fix as session.ts — try to read the shared
-  // .hmac-secret file so both Edge and Node.js runtimes use the same key.
-  // Edge Runtime cannot use require('fs'), but it CAN use fetch() to read
-  // the file via the internal API. However, since getHmacSecret() is called
-  // at module load time (synchronously), we cannot use async fetch here.
-  // Instead, we rely on the Node.js runtime (session.ts) to have already
-  // created the .hmac-secret file, and we try to read it synchronously.
-  // In practice, Edge Runtime middleware should always have HMAC_SECRET set.
+  console.error('[session-edge] Attempting to read from .hmac-secret file...')
   try {
-    // In some Edge Runtime environments, Node.js APIs are partially available
     if (typeof require === 'function') {
       const fs = require('fs') as typeof import('fs')
       const path = require('path') as typeof import('path')
       const secretFile = path.join(
-        (typeof process !== 'undefined' && process.env && process.env.PROJECT_ROOT) || '/',
+        (typeof process !== 'undefined' && process.env && process.env.PROJECT_ROOT) || process.cwd() || '/',
         '.hmac-secret'
       )
       if (fs.existsSync(secretFile)) {
         const existing = fs.readFileSync(secretFile, 'utf-8').trim()
-        if (existing.length >= 32) return existing
+        if (existing.length >= 32) {
+          console.error('[session-edge] Loaded HMAC secret from .hmac-secret file')
+          return existing
+        }
       }
     }
   } catch {
-    // Edge Runtime doesn't support require() — fall through to random
+    // Edge Runtime doesn't support require() — fall through
   }
-  const bytes = crypto.getRandomValues(new Uint8Array(32))
-  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('')
+  console.error('[session-edge] CRITICAL: No HMAC_SECRET available. Edge Runtime CANNOT validate tokens.')
+  console.error('[session-edge] Set HMAC_SECRET env var or ensure .hmac-secret file exists.')
+  console.error('[session-edge] All middleware auth checks will reject tokens until this is fixed.')
+  return ''
 }
 
 const HMAC_SECRET = getHmacSecret()
@@ -64,9 +62,7 @@ const _edgeCacheCleanupInterval = setInterval(() => {
     }
   }
 }, 5 * 60 * 1000)
-if (typeof (_edgeCacheCleanupInterval as ReturnType<typeof setInterval> & { unref?: () => void }).unref === 'function') {
-  (_edgeCacheCleanupInterval as ReturnType<typeof setInterval> & { unref: () => void }).unref()
-}
+safeUnref(_edgeCacheCleanupInterval)
 
 interface SessionPayload {
   userId: string
@@ -111,6 +107,11 @@ function base64UrlDecode(str: string): string {
 // ─── Session Validation ─────────────────────────────────────────────────
 export async function validateSessionEdge(token: string): Promise<{ userId: string; username: string } | null> {
   try {
+    if (!HMAC_SECRET) {
+      console.error('[session-edge] No HMAC secret — cannot validate any tokens')
+      return null
+    }
+
     const dotIndex = token.indexOf('.')
     if (dotIndex === -1) return null
 

@@ -55,18 +55,21 @@ const ALLOWED_ORIGINS = (() => {
   if (serverOrigin) {
     const trimmed = serverOrigin.endsWith('/') ? serverOrigin.slice(0, -1) : serverOrigin
     origins.push(trimmed)
-    // HTTP/HTTPS COMPAT: If SERVER_ORIGIN is HTTPS, also allow the HTTP variant
-    // (for reverse proxy setups where the external URL is HTTPS but internal is HTTP)
-    // and vice versa. This ensures Socket.IO works regardless of deployment protocol.
-    if (trimmed.startsWith('https://')) {
-      origins.push(trimmed.replace('https://', 'http://'))
-    } else if (trimmed.startsWith('http://')) {
-      origins.push(trimmed.replace('http://', 'https://'))
+    if (isDev) {
+      if (trimmed.startsWith('https://')) {
+        origins.push(trimmed.replace('https://', 'http://'))
+      } else if (trimmed.startsWith('http://')) {
+        origins.push(trimmed.replace('http://', 'https://'))
+      }
     }
   }
   // Fallback: if no origins are configured, allow localhost (safe default for dev)
   if (origins.length === 0) {
-    origins.push('http://localhost:3000', 'http://127.0.0.1:3000')
+    if (process.env.NODE_ENV === 'production') {
+      console.error('[Socket] No CORS origins configured in production. Set SERVER_ORIGIN env var. Rejecting all origins.')
+    } else {
+      origins.push('http://localhost:3000', 'http://127.0.0.1:3000')
+    }
   }
   return origins
 })()

@@ -87,6 +87,8 @@ export function AccountSettingsDialog({ open, onOpenChange }: AccountSettingsDia
         setNewUsername('')
         onOpenChange(false)
       } else {
+        // NOTE: Error matching depends on server English error messages.
+        // If i18n is needed, server should return error codes instead.
         if (data.error?.toLowerCase().includes('taken') || data.error?.toLowerCase().includes('already')) {
           setUsernameError(t('auth.usernameTaken'))
         } else {
@@ -142,7 +144,7 @@ export function AccountSettingsDialog({ open, onOpenChange }: AccountSettingsDia
                   <UserCircle className="size-4 text-muted-foreground" />
                   {username}
                   <span className="ml-auto">
-                    <Badge label="Admin" />
+                    <Badge label={t('common.admin')} />
                   </span>
                 </div>
               </div>

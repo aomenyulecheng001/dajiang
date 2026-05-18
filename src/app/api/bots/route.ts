@@ -61,7 +61,10 @@ export async function GET(request: Request) {
     const pageSize = Math.min(PAGINATION.MAX_PAGE_SIZE, Math.max(1, parseInt(searchParams.get('pageSize') || String(PAGINATION.DEFAULT_PAGE_SIZE), 10) || PAGINATION.DEFAULT_PAGE_SIZE))
     const skip = (page - 1) * pageSize
 
-    const where = { OR: [{ ownerId: userId }, { ownerId: 'migrate-pending' }] }
+    // P1-10 FIX: Show migrate-pending bots to admin when ALLOW_BOT_AUTO_CLAIM is set
+    const where = process.env.ALLOW_BOT_AUTO_CLAIM === 'true'
+      ? { OR: [{ ownerId: userId }, { ownerId: 'migrate-pending' }] }
+      : { ownerId: userId }
 
     const [bots, total] = await Promise.all([
       db.bot.findMany({
@@ -169,14 +172,20 @@ export async function POST(request: Request) {
       codeBlocks: JSON.stringify(bot.codeBlocks || []),
       dependencies: JSON.stringify(bot.dependencies || []),
       envVars: JSON.stringify(processedEnvVars),
+      // DEPRECATED: webhookSecret in config JSON is kept for backward compatibility only.
+      // The canonical storage is the dedicated Bot.webhookSecret column.
+      // New code should read/write only the column, not the config JSON.
+      // P1-1 FIX: Generate webhookSecret once and reuse in both config and column
+      const existingWebhookSecret = (bot.config as Record<string, unknown>)?.webhookSecret as string | undefined
+      const webhookSecret = existingWebhookSecret || generateWebhookSecret()
       config: JSON.stringify({
         ...(bot.config as Record<string, unknown> || {}),
-        ...(!((bot.config as Record<string, unknown>)?.webhookSecret) ? { webhookSecret: generateWebhookSecret() } : {}),
+        ...(existingWebhookSecret ? {} : { webhookSecret }),
       }),
       stats: JSON.stringify(bot.stats || {}),
       projectFiles: JSON.stringify(bot.projectFiles || []),
       entryPoint: (bot.entryPoint as string) || '',
-      webhookSecret: ((bot.config as Record<string, unknown>)?.webhookSecret as string) || generateWebhookSecret(),
+      webhookSecret,
       ownerId: userId,
     }
 

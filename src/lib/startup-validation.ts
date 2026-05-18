@@ -16,12 +16,16 @@ export function validateRequiredEnvVars(): void {
   // If not set, a random one is generated on each restart, invalidating all sessions
   if (!process.env.HMAC_SECRET) {
     warnings.push('HMAC_SECRET is not set. Session tokens will not survive server restarts. Set this to a stable hex string in production.')
+  } else if (process.env.HMAC_SECRET.length < 32) {
+    warnings.push(`HMAC_SECRET is too short (${process.env.HMAC_SECRET.length} chars). Minimum 32 characters recommended for security.`)
   }
 
   // ENCRYPTION_KEY — required for encrypting sensitive data (BOT_TOKENs, API keys)
   // If not set, a random one is generated, making previously encrypted data unreadable
   if (!process.env.ENCRYPTION_KEY) {
     warnings.push('ENCRYPTION_KEY is not set. Encrypted data (BOT_TOKENs, API keys) will be lost on server restart. Set this to a stable hex string in production.')
+  } else if (process.env.ENCRYPTION_KEY.length < 32) {
+    warnings.push(`ENCRYPTION_KEY is too short (${process.env.ENCRYPTION_KEY.length} chars). Minimum 32 characters recommended for security.`)
   }
 
   // DATABASE_URL — required for Prisma

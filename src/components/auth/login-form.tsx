@@ -52,12 +52,10 @@ export function LoginForm() {
 
       setAuth(true, data.username || username.trim(), null)
 
-      try {
-        fetch('/api/bots/runner/start-service', {
-          method: 'POST',
-          credentials: 'include',
-        }).catch(() => {})
-      } catch { /* ignore */ }
+      fetch('/api/bots/runner/start-service', {
+        method: 'POST',
+        credentials: 'include',
+      }).catch(() => {})
 
       toast.success(t('auth.loginWelcome', { username: data.username || username.trim() }))
     } catch {
@@ -94,7 +92,7 @@ export function LoginForm() {
             🤖
           </div>
           <h1 className="text-3xl font-bold tracking-tight bg-gradient-to-r from-cyan-600 to-blue-600 bg-clip-text text-transparent">
-            Bot Factory
+            {t('auth.appTitle')}
           </h1>
           <p className="mt-2 text-sm text-muted-foreground">
             {t('auth.subtitle')}

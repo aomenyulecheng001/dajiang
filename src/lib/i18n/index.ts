@@ -13,7 +13,7 @@ const translations = { en, zh };
 function interpolate(template: string, params?: Record<string, string | number>): string {
   if (!params) return template;
   return Object.entries(params).reduce(
-    (str, [key, val]) => str.replace(new RegExp(`\\{${key}\\}`, 'g'), String(val)),
+    (str, [key, val]) => str.replaceAll(`{${key}}`, String(val)),
     template
   );
 }

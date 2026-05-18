@@ -55,9 +55,9 @@ function fillMissingDays(data: { date: string; count: number }[]): { date: strin
   // Generate last 7 days including today
   for (let i = 6; i >= 0; i--) {
     const d = new Date()
-    d.setDate(d.getDate() - i)
+    d.setUTCDate(d.getUTCDate() - i)
     const pad = (n: number) => String(n).padStart(2, '0')
-    const dateStr = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` // Local date YYYY-MM-DD
+    const dateStr = `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`
     result.push({ date: dateStr, count: dataMap.get(dateStr) ?? 0 })
   }
 

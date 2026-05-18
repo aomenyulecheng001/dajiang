@@ -50,6 +50,7 @@ export function Header({ searchInputRef, onShortcutsOpen }: HeaderProps) {
   const searchQuery = useBotStore(s => s.searchQuery)
   const setSearchQuery = useBotStore(s => s.setSearchQuery)
   const [localSearch, setLocalSearch] = useState(searchQuery)
+  useEffect(() => { setLocalSearch(searchQuery) }, [searchQuery])
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const handleSearchChange = (value: string) => {

@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { rateLimit, getRateLimitConfig, getRateLimitHeaders } from '@/lib/rate-limit'
+import { validateSessionEdge } from '@/lib/session-edge'
 
 if (process.env.NODE_ENV === 'production' && !process.env.TRUSTED_PROXIES) {
   console.error('WARNING: TRUSTED_PROXIES is not configured. All users share a single rate limit bucket.')
@@ -70,7 +71,11 @@ export async function middleware(request: NextRequest) {
     .replace(/\/api\/bots\/([a-zA-Z0-9._-]+)(?=\/|$)/g, '/api/bots/:id')
   const config = getRateLimitConfig(method, normalizedPathname)
 
-  const rateLimitKey = `${ip}:${method}:${pathname}`
+  const normalizedPath = pathname
+    .replace(/\/api\/bots\/([a-zA-Z0-9._-]+)(?=\/|$)/g, '/api/bots/:id')
+    .replace(/\/[a-f0-9-]{36}/g, '/:id')
+    .replace(/\/\d+/g, '/:num')
+  const rateLimitKey = `${ip}:${method}:${normalizedPath}`
 
   const result = rateLimit.check(rateLimitKey, config)
 
@@ -97,10 +102,46 @@ export async function middleware(request: NextRequest) {
     )
   }
 
-  // Session verification is handled by each API route via getCurrentUserId()
-  // which runs in Node.js Runtime with full access to HMAC_SECRET and the database.
-  // This middleware does NOT verify sessions because Edge Runtime cannot access
-  // process.env.HMAC_SECRET (it's not available in the V8 isolate).
+  // C1 FIX: Session verification in middleware using Edge-compatible validation.
+  // Previously, each API route handled auth independently, meaning any route
+  // that forgot to call getCurrentUserId() was fully exposed. Now middleware
+  // enforces auth at the edge for all non-public routes.
+  if (!isPublicRoute(pathname)) {
+    let token: string | null = null
+
+    const cookieToken = request.cookies.get('session_token')?.value
+    if (cookieToken) {
+      token = cookieToken
+    }
+
+    if (!token) {
+      const authHeader = request.headers.get('authorization')
+      if (authHeader?.startsWith('Bearer ')) {
+        token = authHeader.slice(7)
+      }
+    }
+
+    if (!token && pathname.match(/^\/api\/bots\/[^/]+\/logs\/stream$/)) {
+      try {
+        token = request.nextUrl.searchParams.get('token')
+      } catch { /* ignore */ }
+    }
+
+    if (!token) {
+      return NextResponse.json(
+        { error: 'Authentication required', code: 'AUTH_REQUIRED' },
+        { status: 401 },
+      )
+    }
+
+    const session = await validateSessionEdge(token)
+    if (!session) {
+      return NextResponse.json(
+        { error: 'Invalid or expired session', code: 'AUTH_EXPIRED' },
+        { status: 401 },
+      )
+    }
+  }
 
   const response = NextResponse.next()
   for (const [key, value] of Object.entries(headers)) {

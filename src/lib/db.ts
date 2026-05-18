@@ -13,8 +13,7 @@ export const db =
         : ['error', 'warn'],
   })
 
-if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = db
-else if (!globalForPrisma.prisma) globalForPrisma.prisma = db
+if (!globalForPrisma.prisma) globalForPrisma.prisma = db
 
 // SQLite performance and reliability PRAGMAs.
 // These must run AFTER the client is created but BEFORE any queries.
@@ -24,23 +23,24 @@ else if (!globalForPrisma.prisma) globalForPrisma.prisma = db
 // - synchronous=NORMAL: safe enough with WAL + checkpoint, much faster than FULL
 // - cache_size: 64MB page cache for better read performance
 // - foreign_keys=ON: enable CASCADE deletes (SQLite defaults to OFF)
-let _pragmasPromise: Promise<void> | null = null
+let _pragmaPromise: Promise<void> | null = null
+
 export async function applySqlitePragmas(): Promise<void> {
-  if (_pragmasPromise) return _pragmasPromise
-  _pragmasPromise = (async () => {
+  if (_pragmaPromise) return _pragmaPromise
+  _pragmaPromise = (async () => {
     try {
-      // All PRAGMAs that might return results use $queryRawUnsafe
-      await db.$queryRawUnsafe('PRAGMA journal_mode=WAL')
-      await db.$queryRawUnsafe('PRAGMA busy_timeout=5000')
-      await db.$queryRawUnsafe('PRAGMA journal_size_limit=67108864')
-      await db.$queryRawUnsafe('PRAGMA synchronous=NORMAL')
-      await db.$queryRawUnsafe('PRAGMA cache_size=-64000')
-      await db.$queryRawUnsafe('PRAGMA foreign_keys=ON')
-    } catch {
-      // Non-fatal: PRAGMA errors mean SQLite is working with defaults
+      await db.$executeRawUnsafe('PRAGMA journal_mode=WAL')
+      await db.$executeRawUnsafe('PRAGMA busy_timeout=5000')
+      await db.$executeRawUnsafe('PRAGMA journal_size_limit=67108864')
+      await db.$executeRawUnsafe('PRAGMA synchronous=NORMAL')
+      await db.$executeRawUnsafe('PRAGMA cache_size=-64000')
+      await db.$executeRawUnsafe('PRAGMA foreign_keys=ON')
+    } catch (err) {
+      _pragmaPromise = null
+      console.error('[DB] PRAGMA application failed — SQLite will use defaults. foreign_keys may be OFF, meaning CASCADE deletes will not work:', err instanceof Error ? err.message : err)
     }
   })()
-  return _pragmasPromise
+  return _pragmaPromise
 }
 
 // Auto-apply on first import (safe for both dev and production)
@@ -55,15 +55,32 @@ const CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000
 async function cleanupOldRecords(): Promise<void> {
   try {
     const cutoff = new Date(Date.now() - LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000)
-    const logResult = await db.botLog.deleteMany({
-      where: { timestamp: { lt: cutoff } },
-    })
-    const msgResult = await db.botMessage.deleteMany({
-      where: { timestamp: { lt: cutoff } },
-    })
-    if (logResult.count > 0 || msgResult.count > 0) {
-      console.log(`[DB-Cleanup] Deleted ${logResult.count} logs, ${msgResult.count} messages older than ${LOG_RETENTION_DAYS} days`)
-      await db.$queryRawUnsafe('PRAGMA wal_checkpoint(TRUNCATE)')
+    const BATCH_SIZE = 1000
+    let totalLogs = 0
+    let totalMsgs = 0
+
+    // Batch delete BotLog records to avoid long write locks on large tables
+    let deleted: number
+    do {
+      const result = await db.$executeRaw`DELETE FROM BotLog WHERE rowid IN (SELECT rowid FROM BotLog WHERE timestamp < ${cutoff} LIMIT ${BATCH_SIZE})`
+      deleted = result
+      totalLogs += deleted
+      if (deleted > 0) await new Promise(r => setTimeout(r, 50))
+    } while (deleted >= BATCH_SIZE)
+
+    // Batch delete BotMessage records
+    do {
+      const result = await db.$executeRaw`DELETE FROM BotMessage WHERE rowid IN (SELECT rowid FROM BotMessage WHERE timestamp < ${cutoff} LIMIT ${BATCH_SIZE})`
+      deleted = result
+      totalMsgs += deleted
+      if (deleted > 0) await new Promise(r => setTimeout(r, 50))
+    } while (deleted >= BATCH_SIZE)
+
+    if (totalLogs > 0 || totalMsgs > 0) {
+      console.log(`[DB-Cleanup] Deleted ${totalLogs} logs, ${totalMsgs} messages older than ${LOG_RETENTION_DAYS} days`)
+      try {
+        await db.$executeRawUnsafe('PRAGMA wal_checkpoint(PASSIVE)')
+      } catch { /* Non-fatal: checkpoint may fail with active readers */ }
     }
   } catch {
     // Non-fatal: cleanup will retry on next interval
@@ -73,4 +90,5 @@ async function cleanupOldRecords(): Promise<void> {
 const _cleanupTimer = setInterval(cleanupOldRecords, CLEANUP_INTERVAL_MS)
 if (_cleanupTimer.unref) _cleanupTimer.unref()
 // Run first cleanup after 5 minutes (give server time to start)
-setTimeout(cleanupOldRecords, 5 * 60 * 1000)
+const _initialCleanupTimer = setTimeout(cleanupOldRecords, 5 * 60 * 1000)
+if (_initialCleanupTimer.unref) _initialCleanupTimer.unref()

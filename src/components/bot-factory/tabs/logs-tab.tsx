@@ -35,7 +35,11 @@ const levelBorderColors: Record<string, string> = {
 
 type SimLevel = 'debug' | 'info' | 'warn' | 'error'
 
-const sourceFiles = ['handler.ts', 'middleware.ts', 'api.ts', 'cache.ts', 'scheduler.ts', 'bot.ts']
+const sourceFilesByExt: Record<string, string[]> = {
+  ts: ['handler.ts', 'middleware.ts', 'api.ts', 'cache.ts', 'scheduler.ts', 'bot.ts'],
+  py: ['handler.py', 'middleware.py', 'api.py', 'cache.py', 'scheduler.py', 'bot.py'],
+  js: ['handler.js', 'middleware.js', 'api.js', 'cache.js', 'scheduler.js', 'bot.js'],
+}
 
 function pickRandomLevel(): SimLevel {
   const r = Math.random()
@@ -210,6 +214,8 @@ export function LogsTab({ isVisible = true }: LogsTabProps) {
     const level = pickRandomLevel()
     const messages = Array.from({ length: 9 }, (_, i) => t(`logsTab.simMsg.${i}` as any))
     const message = pickRandom(messages)
+    const ext = bot.language === 'python' ? 'py' : bot.language === 'javascript' ? 'js' : 'ts'
+    const sourceFiles = sourceFilesByExt[ext] || sourceFilesByExt.ts
     const source = pickRandom(sourceFiles)
 
     addLogEntryRef.current(bot.id, {

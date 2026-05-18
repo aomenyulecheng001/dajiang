@@ -183,7 +183,7 @@ export async function POST(request: Request) {
     // spawns a new one, which is a privileged operation that should not be available
     // to all authenticated users.
     const { db } = await import('@/lib/db')
-    const firstAccount = await db.account.findFirst({ orderBy: { createdAt: 'asc' } })
+    const firstAccount = await db.account.findFirst({ orderBy: { createdAt: 'asc' }, select: { id: true } })
     if (!firstAccount || firstAccount.id !== session.userId) {
       return NextResponse.json(
         { error: 'Forbidden: only admin can start the runner service' },

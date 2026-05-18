@@ -89,8 +89,10 @@ export function PasswordChangeForm({ onSuccess, submitLabel }: PasswordChangeFor
         toast.success(t('common.passwordChanged'))
         resetForm()
         onSuccess?.()
-        logout()
+        await logout()
       } else {
+        // NOTE: Error matching depends on server English error messages.
+        // If i18n is needed, server should return error codes instead.
         if (data.error?.toLowerCase().includes('current') || data.error?.toLowerCase().includes('incorrect') || data.error?.toLowerCase().includes('invalid')) {
           setError(t('common.currentPasswordWrong'))
         } else {

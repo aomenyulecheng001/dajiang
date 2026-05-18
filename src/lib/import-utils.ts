@@ -204,7 +204,6 @@ export function detectEntryPoint(files: ProjectFile[], packageJson: ProjectFile 
   // Try package.json first
   if (packageJson) {
     const parsed = parsePackageJson(packageJson.content)
-    if (parsed?.startScript) return parsed.startScript
     if (parsed?.main) return parsed.main
   }
 

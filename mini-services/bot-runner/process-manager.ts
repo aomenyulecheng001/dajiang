@@ -1,27 +1,23 @@
-import { readFileSync } from 'fs'
-import { spawn, execFileSync } from 'child_process'
+import { readFileSync, readdirSync, writeFileSync, unlinkSync } from 'fs'
+import { spawn, execFile } from 'child_process'
 import type { BotProcess } from './types'
 // ─── Node.js Path for Bot Processes ────────────────────────────────────────
 // When bot-runner runs under Node.js (via PM2 --interpreter tsx), there's no
 // spawn interception. But we still want to find the best Node.js binary
 // (newest version ≥ 16) for spawning bot child processes.
 let _nodePath: string | null = null
-function getNodePath(): string {
+async function getNodePath(): Promise<string> {
   if (_nodePath) return _nodePath
   try {
-    const { execFileSync } = require('child_process') as typeof import('child_process')
     const candidates: string[] = []
     // 1. BaoTa panel Node.js
     try {
-      const { readdirSync } = require('fs') as typeof import('fs')
       const btNodeBase = '/www/server/nodejs'
-      try {
-        const versions = readdirSync(btNodeBase).sort().reverse()
-        for (const v of versions) {
-          candidates.push(`${btNodeBase}/${v}/bin/node`)
-        }
-      } catch { /* no BT node */ }
-    } catch { /* fs not available */ }
+      const versions = readdirSync(btNodeBase).sort().reverse()
+      for (const v of versions) {
+        candidates.push(`${btNodeBase}/${v}/bin/node`)
+      }
+    } catch { /* no BT node */ }
     // 2. nodesource install (typically v18+)
     candidates.push('/usr/local/bin/node')
     // 3. System node (may be old)
@@ -32,7 +28,11 @@ function getNodePath(): string {
     let bestMajor = 0
     for (const candidate of candidates) {
       try {
-        const ver = execFileSync(candidate, ['--version'], { encoding: 'utf-8', timeout: 2000 }).trim()
+        const ver = await new Promise<string>((resolve, reject) => {
+          execFile(candidate, ['--version'], { timeout: 2000 }, (err, stdout) =>
+            err ? reject(err) : resolve((stdout || '').trim())
+          )
+        })
         if (ver.startsWith('v')) {
           const major = parseInt(ver.slice(1).split('.')[0], 10)
           if (major >= 16 && major > bestMajor) {
@@ -51,14 +51,22 @@ function getNodePath(): string {
   return 'node'
 }
 
-import { getBotDir, loadBotConfigAsync } from './utils'
+import { getBotDir, loadBotConfigAsync, CONFIG_DIR } from './utils'
 import { appendLog } from './log-manager'
 import { io } from './socket'
 
 // ─── Safe Environment Whitelist ───────────────────────────────────────────
 
-/** Only pass these environment variable keys to bot child processes */
-const SAFE_ENV_KEYS = ['BOT_TOKEN', 'BOT_NAME', 'NODE_ENV', 'PATH', 'HOME', 'LANG', 'LC_ALL']
+/** Environment variables explicitly passed to bot child processes.
+ *  Host env vars are NEVER automatically forwarded — only explicitly listed keys
+ *  from process.env are injected (PATH, HOME, LANG, LC_ALL). */
+const SAFE_ENV_KEYS = new Set(['BOT_TOKEN', 'BOT_NAME', 'NODE_ENV', 'PATH', 'HOME', 'LANG', 'LC_ALL'])
+
+const DANGEROUS_ENV_KEYS = new Set([
+  'NODE_OPTIONS', 'NODE_PATH', 'ELECTRON_RUN_AS_NODE', 'LD_PRELOAD',
+  'LD_LIBRARY_PATH', 'DYLD_INSERT_LIBRARIES', 'DYLD_LIBRARY_PATH',
+  'PYTHONPATH', 'PYTHONHOME', 'CLASSPATH', 'SHLVL', 'BASH_FUNC_*',
+])
 
 // ─── Process Memory ───────────────────────────────────────────────────────
 
@@ -70,7 +78,7 @@ const SAFE_ENV_KEYS = ['BOT_TOKEN', 'BOT_NAME', 'NODE_ENV', 'PATH', 'HOME', 'LAN
  * Fallback: `tasklist /FI "PID eq {pid}"` (Windows)
  * Returns 0 if all methods fail.
  */
-export function getChildProcessMemory(pid: number): number {
+export async function getChildProcessMemory(pid: number): Promise<number> {
   // Try /proc first (Linux — most accurate)
   try {
     const status = readFileSync(`/proc/${pid}/status`, 'utf-8')
@@ -82,10 +90,10 @@ export function getChildProcessMemory(pid: number): number {
 
   // Try ps (macOS/Linux)
   try {
-    const ps = execFileSync('ps', ['-o', 'rss=', '-p', String(pid)], {
-      encoding: 'utf-8',
-      timeout: 2000,
-      stdio: ['pipe', 'pipe', 'ignore'],
+    const ps = await new Promise<string>((resolve, reject) => {
+      execFile('ps', ['-o', 'rss=', '-p', String(pid)], { timeout: 2000 }, (err, stdout) =>
+        err ? reject(err) : resolve(stdout || '')
+      )
     })
     const rss = parseInt(ps.trim())
     if (!isNaN(rss)) return rss * 1024
@@ -96,11 +104,13 @@ export function getChildProcessMemory(pid: number): number {
   // Try tasklist (Windows)
   if (process.platform === 'win32') {
     try {
-      const { execFileSync } = require('child_process') as typeof import('child_process')
-      const output = execFileSync('tasklist', ['/FI', `PID eq ${pid}`, '/NH', '/FO', 'CSV'], {
-        encoding: 'utf-8',
-        timeout: 2000,
-        stdio: ['pipe', 'pipe', 'ignore'],
+      const output = await new Promise<string>((resolve, reject) => {
+        execFile('tasklist', ['/FI', `PID eq ${pid}`, '/NH', '/FO', 'CSV'], {
+          timeout: 2000,
+          windowsHide: true,
+        }, (err, stdout) =>
+          err ? reject(err) : resolve((stdout || '').replace(/\0/g, ''))
+        )
       })
       // Output format: "image name","PID","session name","session #","mem usage"
       const match = output.match(/"(\d+)"/)
@@ -208,14 +218,14 @@ function clearStopTimeout(botId: string): void {
   }
 }
 
-export function handleBotExit(
+export async function handleBotExit(
   botId: string,
   code: number | null,
   signal: string | null,
   botProcesses: Map<string, BotProcess>,
-  startBotProcess: (botId: string) => void,
+  startBotProcess: (botId: string) => Promise<void>,
   exitedProcess?: ChildProcess,
-) {
+): Promise<void> {
   const bot = botProcesses.get(botId)
   if (!bot) return
 
@@ -242,14 +252,19 @@ export function handleBotExit(
   const uptime = bot.startedAt ? now.getTime() - new Date(bot.startedAt).getTime() : 0
   const isFastFail = uptime > 0 && uptime < FAST_FAIL_THRESHOLD_MS
 
-  bot.status = 'stopped'
+  if (bot.status !== 'error') {
+    bot.status = 'stopped'
+  }
   bot.stoppedAt = now.toISOString()
   bot.exitCode = code
   bot.process = undefined
   bot.pid = undefined
 
+  // P1-19 FIX: Remove running marker when bot exits (won't auto-restart unless handleBotExit restarts it)
+  try { unlinkSync(`${CONFIG_DIR}/${botId}.running`) } catch { /* ignore */ }
+
   appendLog(botId, `进程已退出 (code: ${code}, signal: ${signal})`, code === 0 ? 'info' : 'error')
-  io.emit('bot:status', { botId, status: 'stopped', exitCode: code })
+  io.emit('bot:status', { botId, status: bot.status, exitCode: code })
 
   // BUG FIX: Check intentional-stop flag in addition to SIGTERM/SIGINT.
   // When a manual stop/restart is initiated, the process may exit with
@@ -294,7 +309,7 @@ export function handleBotExit(
         const bp = botProcesses.get(botId)
         if (bp) {
           bp.logBuffer = []
-          startBotProcess(botId)
+          await startBotProcess(botId)
         }
       } else {
         appendLog(botId, '无法自动重启: 未找到保存的配置', 'error')
@@ -378,11 +393,11 @@ function detectAndEmitMessage(botId: string, line: string, botName: string): voi
  *
  * @param botId - The bot identifier to start
  */
-export function startBotProcess(
+export async function startBotProcess(
   botId: string,
   _botProcesses?: Map<string, BotProcess>,
-  _handleBotExitFn?: (botId: string, code: number | null, signal: string | null, exitedProcess?: ChildProcess) => void,
-): void {
+  _handleBotExitFn?: (botId: string, code: number | null, signal: string | null, exitedProcess?: ChildProcess) => Promise<void>,
+): Promise<void> {
   // Use module-level or passed-in references (module-level is the common case)
   const processes = _botProcesses ?? (globalThis as unknown as { __botProcesses?: Map<string, BotProcess> }).__botProcesses
   const handleExit = _handleBotExitFn ?? (globalThis as unknown as { __handleBotExitFn?: typeof _handleBotExitFn }).__handleBotExitFn
@@ -392,16 +407,18 @@ export function startBotProcess(
   if (!bot) return
 
   // P1-FIX: Guard against double-start — prevent orphaned processes
-  if (bot.status === 'running' && bot.process) {
-    console.warn(`[Start] Bot ${botId} is already running, skipping start`)
+  if (bot.status === 'running' || bot.status === 'stopping' || bot.status === 'starting') {
+    console.warn(`[Start] Bot ${botId} is ${bot.status}, skipping start`)
     return
   }
 
-  const botDir = getBotDir(botId)
-  if (!botDir) {
+  let botDir: string
+  try {
+    botDir = getBotDir(botId)
+  } catch (e) {
     bot.status = 'error'
-    bot.error = 'Invalid bot directory path'
-    appendLog(botId, 'Error: Invalid bot directory', 'error')
+    bot.error = e instanceof Error ? e.message : 'Invalid bot directory path'
+    appendLog(botId, `Error: ${bot.error}`, 'error')
     io.emit('bot:status', { botId, status: 'error', error: bot.error })
     return
   }
@@ -417,31 +434,24 @@ export function startBotProcess(
   }
 
   // Only pass safe environment variables (no host secrets like ENCRYPTION_KEY)
-  const safeEnv: Record<string, string> = {}
-  for (const key of SAFE_ENV_KEYS) {
-    if (key === 'BOT_TOKEN') {
-      safeEnv[key] = botToken
-    } else if (key === 'BOT_NAME') {
-      safeEnv[key] = bot.name
-    } else if (key === 'NODE_ENV') {
-      safeEnv[key] = 'production'
-    } else if (process.env[key] !== undefined) {
-      safeEnv[key] = process.env[key] as string
-    }
+  const safeEnv: Record<string, string> = {
+    BOT_TOKEN: botToken,
+    BOT_NAME: bot.name,
+    NODE_ENV: 'production',
   }
+  // Only pass PATH and HOME from host if they exist (needed for child process
+  // to find executables like node/python). These are safe to expose.
+  if (process.env.PATH) safeEnv.PATH = process.env.PATH
+  if (process.env.HOME) safeEnv.HOME = process.env.HOME
+  if (process.env.LANG) safeEnv.LANG = process.env.LANG
+  if (process.env.LC_ALL) safeEnv.LC_ALL = process.env.LC_ALL
 
   // P0-5 FIX: Block dangerous env var keys that could break process isolation
-  const DANGEROUS_ENV_KEYS = new Set([
-    'NODE_OPTIONS', 'NODE_PATH', 'ELECTRON_RUN_AS_NODE', 'LD_PRELOAD',
-    'LD_LIBRARY_PATH', 'DYLD_INSERT_LIBRARIES', 'DYLD_LIBRARY_PATH',
-    'PYTHONPATH', 'PYTHONHOME', 'CLASSPATH', 'SHLVL', 'BASH_FUNC_*',
-    'PATH',  // Already in SAFE_ENV_KEYS, never override from user config
-    'HOME',  // Already in SAFE_ENV_KEYS, never override from user config
-  ])
+  // DANGEROUS_ENV_KEYS is defined at module scope (after SAFE_ENV_KEYS).
 
   // Also inject the bot's own env vars from config (user-provided)
   for (const [k, v] of Object.entries(bot.envVars)) {
-    if (SAFE_ENV_KEYS.includes(k)) continue // Already set above (from host env)
+    if (SAFE_ENV_KEYS.has(k)) continue // Already set above (from host env)
     // BUG FIX: Use prefix check for BASH_FUNC_* since Set.has() doesn't support globs
     if (DANGEROUS_ENV_KEYS.has(k) || k.startsWith('BASH_FUNC_')) {
       console.warn(`[Security] Blocked dangerous env var: ${k}`)
@@ -456,7 +466,7 @@ export function startBotProcess(
   // Use entryPoint if available, otherwise fall back to default file names
   const ep = bot.entryPoint
   // P2-21 FIX: Validate entry point doesn't contain path traversal or flag injection
-  const safeEp = (ep && !ep.includes('..') && !ep.startsWith('-'))
+  const safeEp = (ep && !ep.includes('..') && !ep.startsWith('-') && !ep.startsWith('/') && !(process.platform === 'win32' && /^[a-zA-Z]:/.test(ep)))
     ? ep
     : undefined
 
@@ -473,7 +483,7 @@ export function startBotProcess(
   } else {
     // JavaScript: use Node.js directly. No Bun spawn interception since
     // bot-runner runs under Node.js (via PM2 --interpreter tsx).
-    const nodePath = getNodePath()
+    const nodePath = await getNodePath()
     const scriptFile = safeEp && safeEp.endsWith('.js') ? safeEp : 'index.js'
     command = nodePath
     args = ['--max-old-space-size=256', scriptFile]
@@ -496,6 +506,9 @@ export function startBotProcess(
   bot.exitCode = undefined // Clear stale exit code from previous run
   bot.stoppedAt = undefined // Clear stale stoppedAt from previous run
   bot._stdinErrorHandler = false // Reset for new process — new stdin needs new error handler
+
+  // P1-19 FIX: Create running marker for auto-restart after shutdown
+  try { writeFileSync(`${CONFIG_DIR}/${botId}.running`, new Date().toISOString()) } catch { /* ignore */ }
 
   child.stdout?.on('data', (data: Buffer) => {
     const lines = data.toString().split('\n')
@@ -526,7 +539,7 @@ export function startBotProcess(
   })
 
   child.on('close', (code, signal) => {
-    handleExit(botId, code, signal, child)
+    handleExit(botId, code, signal, child).catch(e => console.error(`[Process] handleExit error for ${botId}:`, e))
   })
 
   io.emit('bot:status', { botId, status: 'running', pid: child.pid })
@@ -555,6 +568,7 @@ export function stopBotProcess(botId: string, botProcesses: Map<string, BotProce
         bot.pid = undefined
         bot.stoppedAt = new Date().toISOString()
         clearIntentionalStop(botId)
+        try { unlinkSync(`${CONFIG_DIR}/${botId}.running`) } catch { /* ignore */ }
         io.emit('bot:status', { botId, status: 'stopped', exitCode: null })
       }
     }
@@ -565,6 +579,9 @@ export function stopBotProcess(botId: string, botProcesses: Map<string, BotProce
   // This is critical for the restart flow where stopBotProcess is called
   // before a manual startBotProcess.
   markIntentionalStop(botId)
+
+  // P1-19 FIX: Remove running marker so bot won't auto-start after shutdown
+  try { unlinkSync(`${CONFIG_DIR}/${botId}.running`) } catch { /* ignore */ }
 
   // BUG FIX: Cancel any pending auto-restart timer from a previous crash.
   cancelRestartTimer(botId)

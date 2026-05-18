@@ -3,212 +3,7 @@ import { spawn } from 'child_process'
 import { writeFile, mkdir, access, readFile, chmod } from 'fs/promises'
 import { join, dirname, resolve } from 'path'
 import type { BotProcess, BotConfig, InstallResult, DeployStage } from './types'
-import { templates } from './templates'
-
-// ─── Native Module Helpers ────────────────────────────────────────────────
-// These helpers detect and validate native C++ modules (better-sqlite3, etc.)
-// for cross-platform deployment compatibility.
-
-/**
- * Test if the native module (e.g., better-sqlite3) can actually be loaded
- * by Node.js. This catches version mismatches and platform incompatibilities
- * that simple file existence checks miss.
- */
-async function testNativeModuleLoad(nodeModulesPath: string): Promise<boolean> {
-  try {
-    const { execFile } = require('child_process') as typeof import('child_process')
-    await new Promise<void>((resolve, reject) => {
-      const child = execFile(
-        process.execPath || 'node',
-        ['-e', `try { require('better-sqlite3'); process.exit(0) } catch(e) { process.exit(1) }`],
-        { cwd: nodeModulesPath, timeout: 10000 },
-      )
-      child.on('exit', (code) => code === 0 ? resolve() : reject(new Error('load failed')))
-      child.on('error', reject)
-    })
-    return true
-  } catch {
-    return false
-  }
-}
-
-/**
- * Get OS-appropriate build tools install command.
- * Returns a human-readable command string for error messages.
- */
-function getBuildToolsInstallCommand(): string {
-  try {
-    const osRelease = require('fs').readFileSync('/etc/os-release', 'utf8') as string
-    if (/ID=(?:ubuntu|debian)/.test(osRelease))
-      return 'Ubuntu/Debian: sudo apt update && sudo apt install -y build-essential python3'
-    if (/ID=(?:centos|rhel|rocky|alinux)/.test(osRelease))
-      return 'CentOS/RHEL/Alibaba: sudo yum groupinstall "Development Tools" -y && sudo yum install python3-devel -y'
-  } catch { /* not Linux or cannot read */ }
-  return '请安装 C++ 编译工具链和 Python3 开发头文件 (gcc/g++/make/python3-dev)'
-}
-
-// ─── Telegraf redactToken Patch ─────────────────────────────────────────────
-// Telegraf's internal redactToken() tries to assign to error.message,
-// which can be readonly on some Error subclasses, causing:
-//   TypeError: Attempted to assign to readonly property.
-// This function patches the Telegraf client.js to wrap the assignment in try-catch.
-// The original code looks like:
-//   function redactToken(error) { error.message = error.message.replace(/.../, '...'); throw error; }
-// We replace it with:
-//   function redactToken(error) { try { error.message = error.message.replace(/.../, '...'); } catch(_) {} throw error; }
-async function patchTelegrafRedactToken(botDir: string): Promise<void> {
-  const clientPaths = [
-    join(botDir, 'node_modules/telegraf/lib/core/network/client.js'),
-    join(botDir, 'node_modules/telegraf/src/core/network/client.js'),
-  ]
-  for (const clientPath of clientPaths) {
-    try {
-      let content = await readFile(clientPath, 'utf-8')
-      const marker = 'error.message = error.message.replace'
-      if (!content.includes(marker)) continue
-
-      // Line-by-line approach: find the line with the assignment and wrap it in try-catch
-      const lines = content.split('\n')
-      let patched = false
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i]
-        if (line.includes(marker) && !line.includes('catch(_)')) {
-          // Extract the assignment part, wrap in try { ... } catch(_) {}
-          const trimmed = line.trim()
-          if (trimmed.startsWith('error.message = error.message.replace')) {
-            // Full line is the assignment — replace entirely
-            lines[i] = line.replace(
-              /error\.message\s*=\s*error\.message\.replace\(([^;]+)\);?/,
-              'try { error.message = error.message.replace($1); } catch(_) {}'
-            )
-            patched = true
-          }
-        }
-      }
-      if (patched) {
-        content = lines.join('\n')
-        await writeFile(clientPath, content, 'utf-8')
-        console.log(`[Patch] Fixed Telegraf redactToken in ${clientPath}`)
-      }
-    } catch { /* file not found or patch failed */ }
-  }
-}
-
-// ─── Rebuild Native Modules ──────────────────────────────────────────────────
-// After pnpm/bun install, native C++ modules (like better-sqlite3) may not have
-// their .node binary compiled. This function detects missing .node files and
-// rebuilds them using `pnpm rebuild` or `npm rebuild`, which runs node-gyp
-// under the real Node.js runtime.
-//
-// NATIVE FIX: Enhanced with actual load test - checks if the .node binary can
-// actually be required by Node.js, not just if the file exists on disk.
-// This catches cases where:
-// - .node file was compiled for a different Node.js version
-// - .node file was compiled for a different platform (e.g., macOS binary on Linux)
-// - .node file is corrupted or incomplete
-async function rebuildNativeModules(botId: string, botDir: string): Promise<void> {
-  // Check if any native module needs rebuilding by looking for missing .node files
-  try {
-    const { readdir, stat } = require('fs/promises') as typeof import('fs/promises')
-    const nmPath = join(botDir, 'node_modules')
-    let hasNativeModule = false
-
-    // Check for better-sqlite3 specifically (most common native dependency)
-    const candidatePaths = [
-      join(nmPath, 'better-sqlite3'),
-      join(nmPath, '.pnpm', 'better-sqlite3*'),  // pnpm flat structure
-    ]
-
-    for (const pattern of candidatePaths) {
-      try {
-        const s = await stat(pattern)
-        if (s.isDirectory()) { hasNativeModule = true; break }
-      } catch { /* not found */ }
-    }
-
-    if (!hasNativeModule) return
-
-    // NATIVE FIX: Try to actually load the native module to verify it works.
-    // This is more reliable than just checking if a .node file exists.
-    const canLoadNative = await testNativeModuleLoad(nmPath)
-    if (canLoadNative) return // Module loads fine, no rebuild needed
-
-    appendDeployLog(botId, '🔧 检测到原生模块需要重新编译...')
-
-    // Determine OS-appropriate build tools install command for error messages
-    const buildToolsHint = getBuildToolsInstallCommand()
-    const pm = getPackageManager()
-    const rebuildCmd = pm.cmd === 'pnpm' ? 'pnpm' : pm.cmd === 'bun' ? 'bun' : (process.platform === 'win32' ? 'npm.cmd' : 'npm')
-    const rebuildArgs = ['rebuild']
-
-    await new Promise<void>((resolve, reject) => {
-      const child = spawn(rebuildCmd, rebuildArgs, {
-        cwd: botDir,
-        timeout: 120000,
-        stdio: ['pipe', 'pipe', 'pipe'],
-        shell: process.platform === 'win32',
-      })
-      let stdout = ''
-      let stderr = ''
-      child.stdout?.on('data', (data: Buffer) => { stdout += data.toString() })
-      child.stderr?.on('data', (data: Buffer) => {
-        const chunk = data.toString()
-        stderr += chunk
-        for (const line of chunk.split('\n')) {
-          if (line.trim()) appendDeployLog(botId, line.trim())
-        }
-      })
-      child.on('error', (err) => {
-        appendDeployLog(botId, `⚠️ 原生模块重编译失败: ${err.message}`)
-        appendDeployLog(botId, `   提示: ${buildToolsHint}`)
-        resolve() // Non-critical, don't block deploy
-      })
-      child.on('close', (code) => {
-        if (code === 0) {
-          appendDeployLog(botId, '✅ 原生模块重编译完成')
-          // Verify the rebuild worked by testing load again
-          testNativeModuleLoad(nmPath).then(ok => {
-            if (!ok) {
-              appendDeployLog(botId, '⚠️ 重编译后模块仍无法加载，可能需要安装编译工具链')
-              appendDeployLog(botId, `   ${buildToolsHint}`)
-            }
-          }).catch(() => {})
-        } else {
-          appendDeployLog(botId, `⚠️ 原生模块重编译退出码: ${code}`)
-          appendDeployLog(botId, `   提示: ${buildToolsHint}`)
-        }
-        resolve() // Non-critical, don't block deploy
-      })
-    })
-  } catch { /* non-critical */ }
-}
-
-// ─── Package Manager Detection ─────────────────────────────────────────────
-// Prefer pnpm (installs native modules like better-sqlite3 for real Node.js),
-// then bun, then npm as fallback.
-function getPackageManager(): { cmd: string; installArgs: string[]; addArgs: string[] } {
-  try {
-    const { execFileSync } = require('child_process') as typeof import('child_process')
-    const result = execFileSync('pnpm', ['--version'], { encoding: 'utf-8', timeout: 3000 }).trim()
-    if (result) {
-      return { cmd: 'pnpm', installArgs: ['install', '--prod'], addArgs: ['add'] }
-    }
-  } catch { /* pnpm not found */ }
-
-  const pathEnv = process.env.PATH || ''
-  // Cross-platform PATH separator check
-  const pathSep = process.platform === 'win32' ? ';' : ':'
-  const hasBun = pathEnv.split(pathSep).some(p => p.includes('bun')) ||
-    process.env.BUN_INSTALL !== undefined
-
-  if (hasBun) {
-    return { cmd: 'bun', installArgs: ['install', '--production'], addArgs: ['add'] }
-  }
-
-  // FIX: On Windows, npm is npm.cmd — spawn() requires the full extension
-  const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm'
-  return { cmd: npmCmd, installArgs: ['install', '--omit=dev'], addArgs: ['install'] }
-}
+import { patchTelegrafRedactToken, rebuildNativeModules, getPackageManager } from './native-modules'
 import {
   sanitizeBotId,
   getBotDir,
@@ -294,7 +89,9 @@ export async function generateBotFiles(botId: string, config: BotConfig): Promis
       }
       const resolvedPath = resolve(botDir, pf.path)
       // Cross-platform path containment check
-      if (!resolvedPath.startsWith(resolvedBotDir + '/') && !resolvedPath.startsWith(resolvedBotDir + '\\') && resolvedPath !== resolvedBotDir) {
+      const isContained = resolvedPath.startsWith(resolvedBotDir + '/') || resolvedPath.startsWith(resolvedBotDir + '\\') || resolvedPath === resolvedBotDir
+        || (process.platform === 'win32' && resolvedPath.toLowerCase().startsWith(resolvedBotDir.toLowerCase() + '\\'))
+      if (!isContained) {
         appendDeployLog(botId, `⚠️ 跳过越界文件路径: ${pf.path}`)
         continue
       }
@@ -359,8 +156,7 @@ export async function generateBotFiles(botId: string, config: BotConfig): Promis
           const mod = modMatch[1]
           // Skip relative paths and builtin modules
           if (!mod.startsWith('.') && !builtinModules.has(mod)) {
-            // Strip subpath (e.g. 'telegraf/session' → 'telegraf')
-            const pkgName = mod.split('/')[0]
+            const pkgName = mod.startsWith('@') ? mod.split('/').slice(0, 2).join('/') : mod.split('/')[0]
             if (pkgName && !deps.includes(pkgName)) {
               deps.push(`${pkgName}`)
             }
@@ -414,46 +210,9 @@ export async function generateBotFiles(botId: string, config: BotConfig): Promis
     return { files: writtenFiles, dependencies: deps }
   }
 
-  // Fallback to template-based code generation
-  const template = templates.get(config.templateId) || templates.get('custom')!
-  const result = template.generateCode(config)
+  // No projectFiles and no customCode — cannot deploy
+    throw new Error('No code provided. Upload project files or write custom code.')
 
-  const writtenFiles: string[] = []
-
-  for (const file of result.files) {
-    const filePath = join(botDir, file.path)
-    const dir = dirname(filePath)
-    // P2-BR-9 FIX: Use async mkdir and writeFile
-    await mkdir(dir, { recursive: true })
-    await writeFile(filePath, file.content, 'utf-8')
-    writtenFiles.push(file.path)
-  }
-
-  // Write package.json for Node.js projects (CommonJS — templates use require())
-  if (config.language !== 'python') {
-    // P2-31 FIX: Use shared writeBotPackageJson helper instead of inline logic
-    // P2-BR-9 FIX: writeBotPackageJson is now async
-    await writeBotPackageJson(botDir, botId, result.dependencies, 'index.js')
-    writtenFiles.push('package.json')
-  }
-
-  // Write .env file (only if there are env vars)
-  const envEntries = Object.entries(config.envVars || {})
-  if (envEntries.length > 0) {
-    const envContent = envEntries
-      .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
-      .join('\n')
-    // P2-BR-9 FIX: Use async writeFile
-    await writeFile(join(botDir, '.env'), envContent, 'utf-8')
-    // SECURITY: Restrict .env file permissions to owner-only (prevent token leakage)
-    await chmod(join(botDir, '.env'), 0o600).catch(() => {})
-    writtenFiles.push('.env')
-  }
-
-  // P2-BR-9 FIX: Use async addDotenvSupportAsync
-  await addDotenvSupportAsync(botDir, config.language, config.entryPoint)
-
-  return { files: writtenFiles, dependencies: result.dependencies }
 }
 
 // ─── Dependency Installation ──────────────────────────────────────────────
@@ -519,10 +278,14 @@ export async function installDependencies(botId: string, language: string, optio
 
             let incrementalSuccess = false
             try {
+              const safePkgs = installPkgs.filter(p => /^[a-zA-Z0-9@\/_.-]+$/.test(p))
+              if (safePkgs.length !== installPkgs.length) {
+                appendDeployLog(botId, `⚠️ Skipped packages with invalid characters`)
+              }
               // P0-2 FIX: Use spawn with args array (no shell) to prevent command injection
-              const pm = getPackageManager()
+              const pm = await getPackageManager()
               await new Promise<void>((resolvePromise, reject) => {
-                const child = spawn(pm.cmd, [...pm.addArgs, ...installPkgs], {
+                const child = spawn(pm.cmd, [...pm.addArgs, ...safePkgs], {
                   cwd: botDir,
                   timeout: 120000,
                   stdio: ['pipe', 'pipe', 'pipe'],
@@ -586,7 +349,7 @@ export async function installDependencies(botId: string, language: string, optio
     command = process.platform === 'win32' ? 'pip' : 'pip3'
     args = ['install', '-r', 'requirements.txt']
   } else {
-    const pm = getPackageManager()
+    const pm = await getPackageManager()
     command = pm.cmd
     args = pm.installArgs
   }
@@ -639,9 +402,7 @@ export async function installDependencies(botId: string, language: string, optio
         // Write deps hash after successful full install
         // P2-BR-9 FIX: Use async fs operations
         const hashBotDir = getBotDir(botId)
-        if (!hashBotDir) {
-          appendDeployLog(botId, '⚠️ 无法确定 bot 目录，跳过依赖 hash 写入')
-        } else if (language === 'python') {
+        if (language === 'python') {
           const reqPath = join(hashBotDir, 'requirements.txt')
           try {
             await access(reqPath)
@@ -670,13 +431,10 @@ export async function deployBot(
   config: BotConfig,
   botProcesses: Map<string, BotProcess>,
   deployStatus: Map<string, { stage: DeployStage; progress: number; error?: string; logs: string[] }>,
-  startBotProcess: (botId: string) => void,
+  startBotProcess: (botId: string) => Promise<void>,
   isCancelled?: () => boolean,
 ): Promise<void> {
   const botDir = getBotDir(botId)
-  if (!botDir) {
-    throw new Error(`Invalid botId: could not determine bot directory`)
-  }
 
   // Validate BOT_TOKEN
   const botToken = config.envVars?.BOT_TOKEN || config.botToken || ''
@@ -721,16 +479,20 @@ export async function deployBot(
     // that ignore SIGTERM from holding resources the new deployment needs.
     const forceKill = setTimeout(() => {
       try { procRef.kill('SIGKILL') } catch { /* ignore */ }
-    }, 5000)
-    // Wait for the process to actually exit (up to 8s: 5s for SIGKILL + 3s grace)
-    await new Promise<void>((resolve) => {
-      const timeout = setTimeout(resolve, 8000)
-      procRef.once('close', () => {
-        clearTimeout(forceKill)
-        clearTimeout(timeout)
-        resolve()
+    }, 10000)
+    forceKill.unref()
+    if (procRef.exitCode !== null) {
+      clearTimeout(forceKill)
+    } else {
+      await new Promise<void>((resolve) => {
+        const timeout = setTimeout(resolve, 15000)
+        procRef.once('close', () => {
+          clearTimeout(forceKill)
+          clearTimeout(timeout)
+          resolve()
+        })
       })
-    })
+    }
   } else {
     // No running process, but still cancel any pending auto-restart timer
     cancelRestartTimer(botId)
@@ -841,21 +603,20 @@ export async function deployBot(
       appendDeployLog(botId, '🔧 正在编译 TypeScript...')
       // P0-2 FIX: Use spawn (no shell) for TypeScript check
       // OPT-5 FIX: Stream TypeScript build output in real-time
-      await new Promise<void>((resolve, reject) => {
-        const pm = getPackageManager()
-        // For pnpm, use 'pnpm exec'; for bun, use 'bunx'; for npm, use 'npx'
-        let tscCmd: string
-        let tscArgs: string[]
-        if (pm.cmd === 'pnpm') {
-          tscCmd = 'pnpm'
-          tscArgs = ['exec', 'tsc', '--noEmit']
-        } else if (pm.cmd === 'bun') {
-          tscCmd = 'bunx'
-          tscArgs = ['tsc', '--noEmit']
-        } else {
-          tscCmd = 'npx'
-          tscArgs = ['tsc', '--noEmit']
-        }
+      const pm = await getPackageManager()
+      let tscCmd: string
+      let tscArgs: string[]
+      if (pm.cmd === 'pnpm') {
+        tscCmd = 'pnpm'
+        tscArgs = ['exec', 'tsc', '--noEmit']
+      } else if (pm.cmd === 'bun') {
+        tscCmd = 'bunx'
+        tscArgs = ['tsc', '--noEmit']
+      } else {
+        tscCmd = 'npx'
+        tscArgs = ['tsc', '--noEmit']
+      }
+      await new Promise<void>((resolvePromise, reject) => {
         const child = spawn(tscCmd, tscArgs, {
           cwd: botDir,
           timeout: 60000,
@@ -905,7 +666,7 @@ export async function deployBot(
     // Stage 4: Start
     updateStatus('start', 80)
     appendDeployLog(botId, '🚀 正在启动机器人...')
-    startBotProcess(botId)
+    await startBotProcess(botId)
     // BUG FIX: Clear intentional stop flag after successful process start.
     // Without this, the first crash after deploy would be treated as an intentional
     // stop and skip auto-restart (because markIntentionalStop was called earlier).

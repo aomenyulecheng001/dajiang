@@ -25,6 +25,7 @@ export interface BotProcess {
   maxRestarts: number    // max auto-restart attempts per hour
   maxMemoryMb: number    // max memory before auto-restart (default 256MB)
   _stdinErrorHandler?: boolean  // P2-BR-12 FIX: Track if stdin error handler is attached
+  _wasRunning?: boolean  // P1-19 FIX: Track if bot was running before shutdown for auto-restart
 }
 
 export interface BotTemplate {

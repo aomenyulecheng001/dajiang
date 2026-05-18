@@ -32,9 +32,16 @@ const securityHeaders = [
     key: 'Content-Security-Policy',
     value: [
       "default-src 'self'",
-      "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+      // NOTE: 'unsafe-eval' removed — it allowed eval() which is the #1 XSS vector.
+      // 'unsafe-inline' retained for script-src as a temporary measure because
+      // Next.js runtime chunks and some Radix UI components inject inline scripts.
+      // TODO: Implement per-request nonce in middleware.ts to replace 'unsafe-inline'.
+      "script-src 'self' 'unsafe-inline'",
+      // 'unsafe-inline' required for style-src: Tailwind CSS, Radix UI, and
+      // framer-motion all inject inline styles. Nonce-based CSP for styles
+      // requires framework-level support that is not yet available.
       "style-src 'self' 'unsafe-inline'",
-      "img-src 'self' data: blob: http: https:",
+      "img-src 'self' data: blob: https:",
       "font-src 'self' data:",
       "connect-src " + connectSrc,
       "frame-ancestors 'none'",
@@ -48,7 +55,7 @@ const nextConfig: NextConfig = {
   output: "standalone",
   /* config options here */
   typescript: {
-    ignoreBuildErrors: isProd,
+    ignoreBuildErrors: false,
   },
   reactStrictMode: true,
   async headers() {

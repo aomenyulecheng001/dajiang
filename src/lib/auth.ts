@@ -10,6 +10,11 @@ export { validateSessionAsync, deleteSession }
 // P2-API-11 FIX: Cache ensureDefaultAccount result to avoid unnecessary DB query on every login
 let _accountCheckTime = 0
 const ACCOUNT_CHECK_INTERVAL_MS = 60 * 1000
+// BUG FIX (BUG-3): Promise cache to prevent concurrent account creation.
+// Two simultaneous login requests could both pass the _accountCheckTime check
+// and both attempt to create the default account, wasting bcrypt.hash CPU time.
+// This promise ensures concurrent callers share the same initialization.
+let _accountInitPromise: Promise<void> | null = null
 
 /**
  * Ensure at least one admin account exists.
@@ -18,56 +23,73 @@ const ACCOUNT_CHECK_INTERVAL_MS = 60 * 1000
  * Previously hardcoded password 'dajiang888' is only used if
  * the ADMIN_INITIAL_PASSWORD env var is explicitly set.
  */
+// DESIGN DECISION: This application uses a single-admin model. There is no
+// public registration endpoint. Multi-user support would require adding
+// /api/auth/register with invite-code or admin-approval flow.
 export async function ensureDefaultAccount(): Promise<void> {
   // P2-API-11 FIX: Skip DB query after first successful call
   if (Date.now() - _accountCheckTime < ACCOUNT_CHECK_INTERVAL_MS) return
-  const count = await db.account.count()
-  if (count === 0) {
-    // Check if an initial password was provided via env var
-    const envPassword = process.env.ADMIN_INITIAL_PASSWORD
-    let password: string
 
-    // H7 FIX: Make default username configurable via ADMIN_INITIAL_USERNAME env var.
-    // Previously hardcoded 'dajiang888' was predictable and made brute-force attacks easier.
-    const envUsername = process.env.ADMIN_INITIAL_USERNAME
-    const defaultUsername = (envUsername && envUsername.length >= 3) ? envUsername : 'dajiang888'
-    
-    if (envPassword && envPassword.length >= 6) {
-      password = envPassword
-      console.warn(`[Auth] ⚠️  Using ADMIN_INITIAL_PASSWORD from environment variable.`
-        + ` Change this password after first login!`)
-    } else {
-      // Generate a random 16-character password using Web Crypto API
-      password = Array.from(crypto.getRandomValues(new Uint8Array(12)))
-        .map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 16)
-      const credFile = resolveFromProjectRoot('.admin-credentials')
-      try {
-        await writeFile(credFile,
-          `Username: ${defaultUsername}\nPassword: ${password}\n\n⚠️ CHANGE THIS PASSWORD AFTER FIRST LOGIN!\n`,
-          'utf-8')
-        console.warn(`[Auth] Initial admin credentials written to .admin-credentials file. Delete after first login.`)
-      } catch {
-        console.warn(`[Auth] ⚠️ Could not write .admin-credentials file. Check server logs for credentials.`)
-      }
-    }
+  // BUG FIX (BUG-3): Use promise cache to prevent concurrent initialization.
+  // If another call is already running, await the same promise instead of
+  // starting a second DB query + bcrypt.hash operation.
+  if (_accountInitPromise) return _accountInitPromise
 
-    const hashedPassword = await bcrypt.hash(password, 12)
+  _accountInitPromise = (async () => {
     try {
-      await db.account.create({
-        data: {
-          username: defaultUsername,
-          password: hashedPassword,
-        },
-      })
-    } catch (error: any) {
-      // Handle race: another request may have created the account concurrently (P2002 = unique constraint)
-      if (error?.code !== 'P2002') throw error
+      const count = await db.account.count()
+      if (count === 0) {
+        // Check if an initial password was provided via env var
+        const envPassword = process.env.ADMIN_INITIAL_PASSWORD
+        let password: string
+
+        // H7 FIX: Make default username configurable via ADMIN_INITIAL_USERNAME env var.
+        // Previously hardcoded 'dajiang888' was predictable and made brute-force attacks easier.
+        const envUsername = process.env.ADMIN_INITIAL_USERNAME
+        const defaultUsername = (envUsername && envUsername.length >= 3) ? envUsername : 'dajiang888'
+        
+        if (envPassword && envPassword.length >= 6) {
+          password = envPassword
+          console.warn(`[Auth] ⚠️  Using ADMIN_INITIAL_PASSWORD from environment variable.`
+            + ` Change this password after first login!`)
+        } else {
+          // Generate a random 16-character password using Web Crypto API
+          password = Array.from(crypto.getRandomValues(new Uint8Array(12)))
+            .map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 16)
+          const credFile = resolveFromProjectRoot('.admin-credentials')
+          try {
+            await writeFile(credFile,
+              `Username: ${defaultUsername}\nPassword: ${password}\n\n⚠️ CHANGE THIS PASSWORD AFTER FIRST LOGIN!\n`,
+              'utf-8')
+            console.warn(`[Auth] Initial admin credentials written to .admin-credentials file. Delete after first login.`)
+          } catch {
+            console.warn(`[Auth] ⚠️ Could not write .admin-credentials file. Check server logs for credentials.`)
+          }
+        }
+
+        const hashedPassword = await bcrypt.hash(password, 12)
+        try {
+          await db.account.create({
+            data: {
+              username: defaultUsername,
+              password: hashedPassword,
+            },
+          })
+        } catch (error: any) {
+          // Handle race: another request may have created the account concurrently (P2002 = unique constraint)
+          if (error?.code !== 'P2002') throw error
+        }
+      }
+      // H1 FIX: Only set _accountCheckTime AFTER the successful DB check/create,
+      // not before the DB write. Previously set early which meant a
+      // failed DB write would permanently prevent account creation retries.
+      _accountCheckTime = Date.now()
+    } finally {
+      _accountInitPromise = null
     }
-  }
-  // H1 FIX: Only set _accountEnsured AFTER the successful DB check/create,
-  // not before the DB write. Previously set early (line 24) which meant a
-  // failed DB write would permanently prevent account creation retries.
-  _accountCheckTime = Date.now()
+  })()
+
+  return _accountInitPromise
 }
 
 /**
@@ -82,6 +104,7 @@ export async function authenticateUser(
 
   const account = await db.account.findUnique({
     where: { username },
+    select: { id: true, password: true, username: true, tokenVersion: true },
   })
 
   // SECURITY FIX: Always call bcrypt.compare even for non-existent users
@@ -118,7 +141,7 @@ export async function resetPassword(
   currentPassword: string,
   newPassword: string,
   currentToken?: string
-): Promise<{ success: boolean; message: string }> {
+): Promise<{ success: boolean; message: string; newToken?: string }> {
   // Verify current password — lookup by userId (immutable) not username
   const account = await db.account.findUnique({ where: { id: userId } })
   if (!account) {
@@ -155,24 +178,33 @@ export async function resetPassword(
   // change and tokenVersion increment succeed together. Previously, these were
   // separate operations and incrementTokenVersion could fail silently, leaving
   // old session tokens from other devices valid after a password change.
-  await db.account.update({
+  const updatedAccount = await db.account.update({
     where: { id: userId },
     data: {
       password: hashedPassword,
       tokenVersion: { increment: 1 },
     },
+    select: { tokenVersion: true, username: true },
   })
 
   // Invalidate the in-memory cache so the next token validation picks up
   // the new tokenVersion from the DB, rejecting all old session tokens.
   invalidateTokenVersionCache(userId)
 
-  // Revoke the current session token so it cannot be reused after password change
+  // BUG FIX (BUG-8): Revoke old token and issue a new one with the updated tokenVersion,
+  // same pattern as updateUsername(). Previously, the old token was deleted but no new
+  // token was issued, causing the user's session to immediately expire and forcing
+  // re-login. This was inconsistent with the username change flow and poor UX.
+  let newToken: string | undefined
   if (currentToken) {
     await deleteSession(currentToken)
+    // Get the updated tokenVersion from the atomic update result
+    if (updatedAccount) {
+      newToken = createSession(userId, updatedAccount.username, updatedAccount.tokenVersion)
+    }
   }
 
-  return { success: true, message: 'Password changed successfully' }
+  return { success: true, message: 'Password changed successfully', newToken }
 }
 
 /**
