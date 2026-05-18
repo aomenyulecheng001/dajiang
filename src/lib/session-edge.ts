@@ -26,7 +26,7 @@ function getHmacSecret(): string {
       const fs = require('fs') as typeof import('fs')
       const path = require('path') as typeof import('path')
       const secretFile = path.join(
-        (typeof process !== 'undefined' && process.env && process.env.PROJECT_ROOT) || process.cwd() || '/',
+        (typeof process !== 'undefined' && process.env && process.env.PROJECT_ROOT) || '/',
         '.hmac-secret'
       )
       if (fs.existsSync(secretFile)) {

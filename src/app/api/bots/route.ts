@@ -154,6 +154,8 @@ export async function POST(request: Request) {
     const processedEnvVars = await encryptEnvVarsOnSaveAsync((bot.envVars as { key: string; value: string; isEncrypted?: boolean }[]) || [])
 
     const clientId = bot.id
+    const existingWebhookSecret = (bot.config as Record<string, unknown>)?.webhookSecret as string | undefined
+    const webhookSecret = existingWebhookSecret || generateWebhookSecret()
     const createData = {
       // SECURITY FIX (SEC-77): Also reject path traversal patterns in client-provided bot ID
       ...(clientId && typeof clientId === 'string' && clientId.length > 0 && clientId.length <= 100 && /^[a-zA-Z0-9._-]+$/.test(clientId) && !clientId.includes('..') && !clientId.startsWith('.')
@@ -175,9 +177,6 @@ export async function POST(request: Request) {
       // DEPRECATED: webhookSecret in config JSON is kept for backward compatibility only.
       // The canonical storage is the dedicated Bot.webhookSecret column.
       // New code should read/write only the column, not the config JSON.
-      // P1-1 FIX: Generate webhookSecret once and reuse in both config and column
-      const existingWebhookSecret = (bot.config as Record<string, unknown>)?.webhookSecret as string | undefined
-      const webhookSecret = existingWebhookSecret || generateWebhookSecret()
       config: JSON.stringify({
         ...(bot.config as Record<string, unknown> || {}),
         ...(existingWebhookSecret ? {} : { webhookSecret }),
