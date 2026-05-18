@@ -108,8 +108,7 @@ export function authFetch(url: string, init: RequestInit = {}): Promise<Response
          import('sonner').then(({ toast }) => {
            import('@/lib/i18n').then(({ useI18nStore, getTranslation }) => {
              const locale = useI18nStore.getState().locale
-             const t = (k: string) => getTranslation(locale, k)
-             toast.error(t('common.sessionExpired'), { description: t('common.pleaseLogInAgain') })
+             toast.error(getTranslation(locale, 'common.sessionExpired'), { description: getTranslation(locale, 'common.pleaseLogInAgain') })
            }).catch(() => {
              toast.error('Session expired', { description: 'Please log in again.' })
            })
