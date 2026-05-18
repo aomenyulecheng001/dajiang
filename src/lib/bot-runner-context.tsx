@@ -138,8 +138,8 @@ const BotLogsContext = createContext<Map<string, SocketBotLogEntry[]>>(new Map()
 const BOT_RUNNER_URL = (typeof window !== 'undefined' && (window as unknown as Record<string, unknown>).__RUNNER_URL__)
   ? String((window as unknown as Record<string, unknown>).__RUNNER_URL__)
   : (typeof window !== 'undefined' 
-    ? `${window.location.protocol}//${window.location.hostname}:3001` 
-    : `http://localhost:3001`)
+    ? window.location.origin
+    : `http://localhost:3100`)
 
 // Maximum time (ms) to wait for a 'stopped' event after receiving 'stopping'.
 // If exceeded, we assume the bot has stopped (the server's 10s stop timeout
