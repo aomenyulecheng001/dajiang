@@ -30,11 +30,11 @@ export async function applySqlitePragmas(): Promise<void> {
   _pragmaPromise = (async () => {
     try {
       await db.$queryRawUnsafe('PRAGMA journal_mode=WAL')
-      await db.$executeRawUnsafe('PRAGMA busy_timeout=5000')
-      await db.$executeRawUnsafe('PRAGMA journal_size_limit=67108864')
-      await db.$executeRawUnsafe('PRAGMA synchronous=NORMAL')
-      await db.$executeRawUnsafe('PRAGMA cache_size=-64000')
-      await db.$executeRawUnsafe('PRAGMA foreign_keys=ON')
+      await db.$queryRawUnsafe('PRAGMA busy_timeout=5000')
+      await db.$queryRawUnsafe('PRAGMA journal_size_limit=67108864')
+      await db.$queryRawUnsafe('PRAGMA synchronous=NORMAL')
+      await db.$queryRawUnsafe('PRAGMA cache_size=-64000')
+      await db.$queryRawUnsafe('PRAGMA foreign_keys=ON')
     } catch (err) {
       _pragmaPromise = null
       console.error('[DB] PRAGMA application failed — SQLite will use defaults. foreign_keys may be OFF, meaning CASCADE deletes will not work:', err instanceof Error ? err.message : err)
