@@ -74,8 +74,6 @@ export const zh = {
     saving: '保存中...',
     dep: '个依赖',
     deps: '个依赖',
-    sessionExpired: '会话已过期',
-    pleaseLoginAgain: '请重新登录。',
     tooManyRequests: '请求过于频繁，请稍后重试。',
   },
   auth: {

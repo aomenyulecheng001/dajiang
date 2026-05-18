@@ -74,8 +74,6 @@ export const en = {
     saving: 'Saving...',
     dep: 'dep',
     deps: 'deps',
-    sessionExpired: 'Session expired',
-    pleaseLoginAgain: 'Please log in again.',
     tooManyRequests: 'Too many requests. Please try again later.',
   },
   auth: {
