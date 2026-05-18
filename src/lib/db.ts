@@ -29,7 +29,7 @@ export async function applySqlitePragmas(): Promise<void> {
   if (_pragmaPromise) return _pragmaPromise
   _pragmaPromise = (async () => {
     try {
-      await db.$executeRawUnsafe('PRAGMA journal_mode=WAL')
+      await db.$queryRawUnsafe('PRAGMA journal_mode=WAL')
       await db.$executeRawUnsafe('PRAGMA busy_timeout=5000')
       await db.$executeRawUnsafe('PRAGMA journal_size_limit=67108864')
       await db.$executeRawUnsafe('PRAGMA synchronous=NORMAL')
@@ -79,7 +79,7 @@ async function cleanupOldRecords(): Promise<void> {
     if (totalLogs > 0 || totalMsgs > 0) {
       console.log(`[DB-Cleanup] Deleted ${totalLogs} logs, ${totalMsgs} messages older than ${LOG_RETENTION_DAYS} days`)
       try {
-        await db.$executeRawUnsafe('PRAGMA wal_checkpoint(PASSIVE)')
+        await db.$queryRawUnsafe('PRAGMA wal_checkpoint(PASSIVE)')
       } catch { /* Non-fatal: checkpoint may fail with active readers */ }
     }
   } catch {
