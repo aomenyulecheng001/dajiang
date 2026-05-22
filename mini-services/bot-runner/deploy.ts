@@ -26,12 +26,9 @@ import { cancelRestartTimer, markIntentionalStop, clearIntentionalStop } from '.
 /** P2-31 FIX: Parse a dependency string into name and version */
 function parseDepString(dep: string): { name: string; version: string } {
   if (dep.startsWith('@')) {
-    const slashIdx = dep.indexOf('/', 1)
-    if (slashIdx !== -1) {
-      const name = dep.substring(0, slashIdx)
-      const rest = dep.substring(slashIdx + 1)
-      const atIdx = rest.lastIndexOf('@')
-      return { name, version: atIdx !== -1 ? rest.substring(atIdx + 1) : 'latest' }
+    const lastAtIdx = dep.lastIndexOf('@')
+    if (lastAtIdx > 0) {
+      return { name: dep.substring(0, lastAtIdx), version: dep.substring(lastAtIdx + 1) }
     }
     return { name: dep, version: 'latest' }
   }
@@ -78,6 +75,33 @@ export async function generateBotFiles(botId: string, config: BotConfig): Promis
 
     const writtenFiles: string[] = []
     const hasPackageJson = config.projectFiles.some((f) => f.path === 'package.json')
+
+    // BUG FIX: Validate entry point exists in project files.
+    // If the specified entry point doesn't exist in the project files,
+    // the bot will fail to start. We detect this early and log a warning.
+    if (config.entryPoint) {
+      const entryExists = config.projectFiles.some((f) => f.path === config.entryPoint)
+      if (!entryExists) {
+        appendDeployLog(botId, `⚠️ 入口文件 "${config.entryPoint}" 不在项目文件中，将尝试自动检测...`)
+        // Try to find a common entry point
+        const commonEntries = ['index.js', 'index.ts', 'main.js', 'main.ts', 'bot.js', 'bot.ts', 'app.js', 'app.ts', 'index.py', 'main.py', 'bot.py']
+        const found = commonEntries.find((name) => config.projectFiles!.some((f) => f.path === name || f.path.endsWith('/' + name)))
+        if (found) {
+          config.entryPoint = found
+          appendDeployLog(botId, `✅ 自动检测到入口文件: ${found}`)
+        } else {
+          // Use the first code file as fallback
+          const firstCode = config.projectFiles.find((f) => {
+            const ext = f.path.split('.').pop()?.toLowerCase()
+            return ['js', 'mjs', 'cjs', 'ts', 'tsx', 'py'].includes(ext || '')
+          })
+          if (firstCode) {
+            config.entryPoint = firstCode.path
+            appendDeployLog(botId, `✅ 使用第一个代码文件作为入口: ${firstCode.path}`)
+          }
+        }
+      }
+    }
 
     // Write all project files, preserving directory structure
     const resolvedBotDir = resolve(botDir)
@@ -146,19 +170,33 @@ export async function generateBotFiles(botId: string, config: BotConfig): Promis
 
     // Parse dependencies from config or code (for Node.js)
     let deps: string[] = config.dependencies || []
-    if (config.language !== 'python' && deps.length === 0) {
-      // Auto-detect require() calls in the code
+    if (config.language !== 'python') {
       const requireMatches = config.customCode.match(/require\s*\(\s*['"]([^'"]+)['"]\s*\)/g) || []
       const builtinModules = new Set(['fs', 'path', 'http', 'https', 'os', 'crypto', 'url', 'util', 'stream', 'events', 'child_process', 'net', 'tls', 'dns', 'buffer', 'querystring', 'assert', 'zlib'])
+      // FIX: Correct scoped package name extraction.
+      // For "@scope/pkg@1.0.0", split('@') gives ['', 'scope/pkg', '1.0.0'].
+      // The old logic d.split('@')[0] returned '' for scoped packages, causing:
+      // (1) existingPkgNames contained empty strings, (2) duplicate detection failed.
+      const extractPkgName = (dep: string): string => {
+        if (dep.startsWith('@')) {
+          // @scope/pkg@version -> @scope/pkg
+          const parts = dep.split('/')
+          return parts.slice(0, 2).join('/').split('@').slice(1).join('@').split('@')[0]
+            ? '@' + parts[0].split('@')[1] + '/' + (parts[1]?.split('@')[0] || parts[1])
+            : dep
+        }
+        return dep.split('@')[0]
+      }
+      const existingPkgNames = new Set(deps.map(extractPkgName))
       for (const match of requireMatches) {
         const modMatch = match.match(/require\s*\(\s*['"]([^'"]+)['"]\s*\)/)
         if (modMatch) {
           const mod = modMatch[1]
-          // Skip relative paths and builtin modules
           if (!mod.startsWith('.') && !builtinModules.has(mod)) {
             const pkgName = mod.startsWith('@') ? mod.split('/').slice(0, 2).join('/') : mod.split('/')[0]
-            if (pkgName && !deps.includes(pkgName)) {
+            if (pkgName && !existingPkgNames.has(pkgName)) {
               deps.push(`${pkgName}`)
+              existingPkgNames.add(pkgName)
             }
           }
         }
@@ -299,11 +337,13 @@ export async function installDependencies(botId: string, language: string, optio
                   appendDeployLog(botId, `⚠️ ${pm.cmd} spawn error: ${err.message}`)
                   reject(new Error('incremental failed'))
                 })
-                child.on('close', (code) => {
+                child.on('close', (code, signal) => {
                   if (stdout) stdout.split('\n').forEach(line => { if (line.trim()) appendDeployLog(botId, line) })
                   if (stderr) stderr.split('\n').forEach(line => { if (line.trim()) appendDeployLog(botId, line) })
-                  if (code !== 0 && code !== null) {
-                    appendDeployLog(botId, `⚠️ 增量安装失败 (code: ${code})，回退到完整安装...`)
+                  // FIX: code=null means process was killed by signal (e.g., OOM SIGKILL).
+                  // Old check `code !== 0 && code !== null` treated signal-killed as success.
+                  if (code !== 0 || signal !== null) {
+                    appendDeployLog(botId, `⚠️ 增量安装失败 (code: ${code}, signal: ${signal})，回退到完整安装...`)
                     reject(new Error('incremental failed'))
                   } else {
                     resolvePromise()
@@ -391,13 +431,15 @@ export async function installDependencies(botId: string, language: string, optio
     child.on('error', (err) => {
       reject(new Error(`依赖安装失败: ${err.message}`))
     })
-    child.on('close', async (code) => {
+    child.on('close', async (code, signal) => {
       // Flush any remaining stdout that didn't end with a newline
       if (stdoutBuffer.trim()) {
         appendDeployLog(botId, stdoutBuffer.trim())
       }
-      if (code !== 0 && code !== null) {
-        reject(new Error(`依赖安装失败: ${stderr || `exit code ${code}`}`))
+      // FIX: code=null means process was killed by signal (e.g., OOM SIGKILL).
+      // Old check `code !== 0 && code !== null` treated signal-killed as success.
+      if (code !== 0 || signal !== null) {
+        reject(new Error(`依赖安装失败: ${stderr || (signal ? `killed by ${signal}` : `exit code ${code}`)}`))
       } else {
         // Write deps hash after successful full install
         // P2-BR-9 FIX: Use async fs operations
@@ -475,15 +517,12 @@ export async function deployBot(
     try {
       procRef.kill('SIGTERM')
     } catch { /* ignore if already dead */ }
-    // BUG FIX: Add SIGKILL fallback (like stopBotProcess) to prevent orphaned processes
-    // that ignore SIGTERM from holding resources the new deployment needs.
-    const forceKill = setTimeout(() => {
-      try { procRef.kill('SIGKILL') } catch { /* ignore */ }
-    }, 10000)
-    forceKill.unref()
-    if (procRef.exitCode !== null) {
-      clearTimeout(forceKill)
-    } else {
+    // Skip kill+wait if the process is already dead
+    if (procRef.exitCode === null && !procRef.killed) {
+      const forceKill = setTimeout(() => {
+        try { procRef.kill('SIGKILL') } catch { /* ignore */ }
+      }, 10000)
+      forceKill.unref()
       await new Promise<void>((resolve) => {
         const timeout = setTimeout(resolve, 15000)
         procRef.once('close', () => {
@@ -643,11 +682,11 @@ export async function deployBot(
           appendDeployLog(botId, `❌ TypeScript 编译检查失败: ${err.message}`)
           reject(new Error(`TypeScript type check failed: ${err.message}`))
         })
-        child.on('close', (code) => {
-          // Flush remaining
+        child.on('close', (code, signal) => {
           if (tsBuffer.trim()) appendDeployLog(botId, tsBuffer.trim())
           // BUG FIX: Fail deploy if TypeScript type check has errors
-          if (code !== 0 && code !== null) {
+          // FIX: code=null means process was killed by signal — also a failure
+          if (code !== 0 || signal !== null) {
             appendDeployLog(botId, '❌ TypeScript 类型检查失败')
             reject(new Error('TypeScript type check failed'))
           } else {
@@ -702,6 +741,8 @@ export async function deployBot(
         : '❌ 部署失败: 机器人未能正常启动'
       updateStatus('error', 80)
       appendDeployLog(botId, errorMessage)
+      // FIX: Emit bot:status so frontend can clear deployProgress
+      io.emit('bot:status', { botId, status: 'error', error: errorMessage })
     }
   } catch (err: any) {
     // Check if the error is due to cancellation
@@ -716,6 +757,10 @@ export async function deployBot(
       bot.status = 'error'
       bot.error = err.message
     }
+    // FIX: Emit bot:status so the frontend can clear deployProgress.
+    // Without this, deployProgress gets stuck at stage='error' forever
+    // because the frontend only clears it on bot:status events.
+    io.emit('bot:status', { botId, status: 'error', error: err.message })
     // Cancel any auto-restart timer that might have been set by handleBotExit
     cancelRestartTimer(botId)
     markIntentionalStop(botId)

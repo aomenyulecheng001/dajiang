@@ -19,16 +19,14 @@ import { TabErrorBoundary } from './tab-error-boundary'
 
 export function BotDetail() {
   // PERF OPT: Single stable selector reads selectedBotId from store state
-  // instead of closure. Previous approach used two separate subscriptions:
-  //   const selectedBotId = useBotStore((s) => s.selectedBotId)
-  //   const bot = useBotStore((s) => s.bots.find((b) => b.id === selectedBotId))
-  // This caused: (1) two subscriptions, (2) selector function recreation on
-  // every render due to closure over selectedBotId, (3) potential mismatch
-  // between selectedBotId and bot during re-renders.
-  const bot = useBotStore((s) => {
-    const selectedId = s.selectedBotId
-    return selectedId ? s.bots.find((b) => b.id === selectedId) : null
-  })
+  // FIX: Use two separate subscriptions with stable selectors to prevent
+  // over-renders. Previously, s.bots.find() returned a new object reference
+  // every time ANY bot in the array changed, causing BotDetail and all
+  // children to re-render unnecessarily. Now we subscribe to selectedBotId
+  // and bots array separately, and only find the bot when selectedBotId changes.
+  const selectedBotId = useBotStore((s) => s.selectedBotId)
+  const bots = useBotStore((s) => s.bots)
+  const bot = selectedBotId ? bots.find((b) => b.id === selectedBotId) ?? null : null
   const [activeTab, setActiveTab] = useState('overview')
   const t = useT()
   const locale = useLocale()

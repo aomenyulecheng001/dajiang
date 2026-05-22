@@ -296,6 +296,11 @@ export function EnvVarsTab() {
       return
     }
     const upperKey = editKey.trim().toUpperCase()
+    // FIX: Validate key format matches backend regex ^[A-Za-z_][A-Za-z0-9_]*$
+    if (!/^[A-Z_][A-Z0-9_]*$/.test(upperKey)) {
+      toast.error(t('envTab.invalidKeyFormat', { key: upperKey }))
+      return
+    }
     // Check for duplicate key (excluding current)
     const existing = bot.envVars.find((v) => v.key === upperKey && v.id !== envVarId)
     if (existing) {
@@ -313,11 +318,16 @@ export function EnvVarsTab() {
       toast.error(t('envTab.nameRequired'))
       return
     }
-    if (value === '' && isSensitiveKey(key.trim().toUpperCase())) {
+    const upperKey = key.trim().toUpperCase()
+    // FIX: Validate key format matches backend regex ^[A-Za-z_][A-Za-z0-9_]*$
+    if (!/^[A-Z_][A-Z0-9_]*$/.test(upperKey)) {
+      toast.error(t('envTab.invalidKeyFormat', { key: upperKey }))
+      return
+    }
+    if (value === '' && isSensitiveKey(upperKey)) {
       toast.error(t('envTab.valueRequired'))
       return
     }
-    const upperKey = key.trim().toUpperCase()
     // Check for duplicate key — update existing instead of adding a new one
     const existing = bot.envVars.find((v) => v.key === upperKey)
     if (existing) {
@@ -383,7 +393,14 @@ export function EnvVarsTab() {
       toast.error(t('envTab.valueRequired'))
       return
     }
-    const validEntries = parsed.filter(({ value }) => value.trim())
+    const validEntries = parsed.filter(({ key: k, value }) => {
+      if (!value.trim()) return false
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) {
+        toast.error(t('envTab.invalidKey', { key: k }), { duration: 3000 })
+        return false
+      }
+      return true
+    })
     if (validEntries.length === 0) {
       toast.error(t('envTab.valueRequired'))
       return

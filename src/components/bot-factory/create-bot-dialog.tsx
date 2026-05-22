@@ -55,6 +55,11 @@ import {
   type ImportFile,
   shouldSkipFile,
   MAX_ZIP_SIZE,
+  MAX_FILE_COUNT,
+  MAX_SINGLE_FILE_SIZE,
+  MAX_TOTAL_EXTRACTED_SIZE,
+  isBinaryExtension,
+  normalizeZipPath,
   parseEnvFile,
   detectDependencies,
   detectBotName,
@@ -553,44 +558,76 @@ export function CreateBotDialog() {
       const zip = await JSZipModule.default.loadAsync(buffer)
 
       const extractedFiles: ProjectFile[] = []
-      const promises: Promise<void>[] = []
+      let totalExtractedSize = 0
+      const skippedReasons: string[] = []
 
+      // Collect entries first to check count before extracting
+      const entries: { path: string; zipEntry: import('jszip').JSZipObject }[] = []
       zip.forEach((relativePath, zipEntry) => {
         if (zipEntry.dir) return
-        if (shouldSkipFile(relativePath)) return
+        // BUG FIX: Normalize path (handle Windows backslashes, leading slashes, ./ prefix)
+        const normalizedPath = normalizeZipPath(relativePath)
+        if (!normalizedPath) return
+        if (shouldSkipFile(normalizedPath)) return
 
         // Skip hidden files (except .env)
-        const fileName = relativePath.split('/').pop() || ''
+        const fileName = normalizedPath.split('/').pop() || ''
         if (fileName.startsWith('.') && !fileName.includes('env')) return
 
-        // Skip binary files
+        // BUG FIX: Use comprehensive binary extension list instead of hardcoded short list
         const ext = fileName.split('.').pop()?.toLowerCase() || ''
-        const binaryExts = ['png', 'jpg', 'jpeg', 'gif', 'svg', 'ico', 'bmp', 'woff', 'woff2', 'ttf', 'eot', 'gz', 'tar', 'zip']
-        if (binaryExts.includes(ext)) return
+        if (isBinaryExtension(ext)) {
+          skippedReasons.push(`${fileName} (binary)`)
+          return
+        }
 
-        const promise = zipEntry.async('string').then((content) => {
-          extractedFiles.push({
-            path: relativePath,
-            content,
-            size: 0,
-          })
-        })
-        promises.push(promise)
+        entries.push({ path: normalizedPath, zipEntry })
       })
 
-      await Promise.all(promises)
-
-      if (extractedFiles.length === 0) {
-        toast.error(t('importBot.zipExtractError', { error: String('No extractable files found') }))
+      // BUG FIX: Check file count limit BEFORE extracting (prevent memory exhaustion)
+      if (entries.length > MAX_FILE_COUNT) {
+        toast.error(t('importBot.zipExtractError', { error: `Too many files (${entries.length}). Maximum ${MAX_FILE_COUNT} files allowed.` }))
         setIsExtracting(false)
         return
       }
 
-      // Use actual uncompressed content length for size
-      for (const f of extractedFiles) {
-        if (f.size === 0) {
-          f.size = new TextEncoder().encode(f.content).length
+      // Extract files with size limits
+      for (const { path, zipEntry } of entries) {
+        const content = await zipEntry.async('string')
+        const contentSize = new TextEncoder().encode(content).length
+
+        // BUG FIX: Check single file size limit (prevent browser memory exhaustion)
+        if (contentSize > MAX_SINGLE_FILE_SIZE) {
+          skippedReasons.push(`${path} (${formatFileSize(contentSize)}, exceeds ${formatFileSize(MAX_SINGLE_FILE_SIZE)})`)
+          continue
         }
+
+        // BUG FIX: Check total extracted size limit
+        if (totalExtractedSize + contentSize > MAX_TOTAL_EXTRACTED_SIZE) {
+          skippedReasons.push(`${path} (total size limit exceeded)`)
+          continue
+        }
+
+        totalExtractedSize += contentSize
+        extractedFiles.push({
+          path,
+          content,
+          size: contentSize,
+        })
+      }
+
+      if (extractedFiles.length === 0) {
+        const detail = skippedReasons.length > 0
+          ? `Skipped: ${skippedReasons.slice(0, 5).join(', ')}${skippedReasons.length > 5 ? ` and ${skippedReasons.length - 5} more` : ''}`
+          : 'No extractable files found'
+        toast.error(t('importBot.zipExtractError', { error: detail }))
+        setIsExtracting(false)
+        return
+      }
+
+      // Log skipped files for user awareness
+      if (skippedReasons.length > 0) {
+        console.info(`[ZIP Import] Skipped ${skippedReasons.length} files:`, skippedReasons.slice(0, 10))
       }
 
       setProjectFiles(extractedFiles)
@@ -603,17 +640,20 @@ export function CreateBotDialog() {
       const lang = detectLanguageFromFiles(extractedFiles)
       setZipDetectedLang(lang)
 
-      // Auto-detect name from package.json
-      if (!importName) {
+      // BUG FIX: Use functional state updates to avoid stale closure values.
+      // Previously, importName/importDesc were captured in the useCallback closure,
+      // causing the auto-detect check to use stale values when the user had
+      // already typed something between ZIP upload and processing completion.
+      setImportName(prev => {
+        if (prev) return prev // User already typed a name — don't overwrite
         const botName = detectBotNameFromPackage(pkgFile)
-        if (botName) setImportName(botName)
-      }
-
-      // Auto-detect description from package.json
-      if (!importDesc) {
+        return botName || prev
+      })
+      setImportDesc(prev => {
+        if (prev) return prev // User already typed a description — don't overwrite
         const desc = detectDescriptionFromPackage(pkgFile)
-        if (desc) setImportDesc(desc)
-      }
+        return desc || prev
+      })
 
       // Clear single-file imports when ZIP is loaded
       setFiles([])
@@ -625,12 +665,14 @@ export function CreateBotDialog() {
     } finally {
       setIsExtracting(false)
     }
-  }, [importName, importDesc, t])
+  }, [t])
 
   // ── File handling ───────────────────────────────────────────────────────
   const processFiles = useCallback((fileList: FileList | File[]) => {
     const allowedCode = ['.js', '.mjs', '.cjs', '.ts', '.tsx', '.mts', '.py']
     const allowedEnv = ['.env', '.env.local', '.env.production', '.env.development', '.env.staging']
+    // FIX: Single file size limit — same as ZIP's MAX_SINGLE_FILE_SIZE (1MB)
+    const MAX_SINGLE_IMPORT_SIZE = 1 * 1024 * 1024
 
     Array.from(fileList).forEach((file) => {
       const ext = '.' + file.name.split('.').pop()?.toLowerCase()
@@ -645,7 +687,17 @@ export function CreateBotDialog() {
       const isEnv = allowedEnv.includes(ext) || (file.name.startsWith('.') && file.name.includes('env'))
 
       if (isCode || isEnv) {
+        // FIX: Check file size before reading to prevent browser OOM
+        if (file.size > MAX_SINGLE_IMPORT_SIZE) {
+          toast.error(t('importBot.zipExtractError', { error: `File "${file.name}" is too large (${formatFileSize(file.size)}). Maximum ${formatFileSize(MAX_SINGLE_IMPORT_SIZE)}.` }))
+          return
+        }
+
         const reader = new FileReader()
+        // FIX: Handle FileReader errors — previously silent on read failure
+        reader.onerror = () => {
+          toast.error(t('importBot.zipExtractError', { error: `Failed to read file "${file.name}"` }))
+        }
         reader.onload = () => {
           const content = reader.result as string
           const type = isCode ? 'code' as const : 'env' as const
@@ -653,14 +705,15 @@ export function CreateBotDialog() {
             const filtered = prev.filter((f) => f.type !== type)
             return [...filtered, { name: file.name, size: file.size, type, content }]
           })
-          if (isCode && !importName) {
-            setImportName(detectBotName(content, file.name))
+          // FIX: Use functional update to avoid stale closure over importName
+          if (isCode) {
+            setImportName(prev => prev || detectBotName(content, file.name))
           }
         }
         reader.readAsText(file)
       }
     })
-  }, [importName, processZipFile])
+  }, [processZipFile, t])
 
   const handleDragOver = useCallback((e: React.DragEvent) => { e.preventDefault(); setIsDragging(true) }, [])
   const handleDragLeave = useCallback((e: React.DragEvent) => { e.preventDefault(); setIsDragging(false) }, [])
@@ -790,7 +843,7 @@ export function CreateBotDialog() {
       // Build codeBlocks from project files
       const codeFiles = projectFiles.filter((f) => {
         const ext = f.path.split('.').pop()?.toLowerCase()
-        return ['js', 'mjs', 'cjs', 'ts', 'tsx', 'py'].includes(ext || '')
+        return ['js', 'mjs', 'cjs', 'ts', 'tsx', 'mts', 'py'].includes(ext || '')
       })
 
       // If entryPoint is specified, put it first and mark as active

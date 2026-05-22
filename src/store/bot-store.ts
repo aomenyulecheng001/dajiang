@@ -160,7 +160,13 @@ function normalizeBot(raw: Partial<Bot> & { id: string; name: string }): Bot {
     code: raw.code ?? '',
     codeBlocks: Array.isArray(raw.codeBlocks) ? raw.codeBlocks : [],
     dependencies: Array.isArray(raw.dependencies) ? raw.dependencies : [],
-    envVars: Array.isArray(raw.envVars) ? raw.envVars : [],
+    envVars: Array.isArray(raw.envVars) ? raw.envVars.map((v: EnvVar) => ({
+      id: v.id || genId(),
+      key: v.key || '',
+      value: v.value ?? '',
+      isEncrypted: v.isEncrypted ?? false,
+      description: v.description || undefined,
+    })) : [],
     config: {
       pollingMode: 'polling',
       rateLimitPerMinute: 30,
@@ -237,6 +243,36 @@ function isDeepEqual(a: unknown, b: unknown, depth: number = 0): boolean {
   return true
 }
 
+function stripEnvVarIds(envVars: unknown): unknown {
+  if (!Array.isArray(envVars)) return envVars
+  return envVars.map((v: Record<string, unknown>) => {
+    const { id: _id, ...rest } = v
+    return rest
+  })
+}
+
+// PERF: Large arrays (>50 elements) are compared via JSON.stringify for O(n + m)
+// string comparison, which is faster than recursive isDeepEqual for large payloads
+// like projectFiles (up to 500 files, 20MB total) and codeBlocks.
+const LARGE_ARRAY_KEYS = new Set(['projectFiles', 'codeBlocks', 'code'])
+const LARGE_ARRAY_THRESHOLD = 50
+
+function fastArrayEqual(a: unknown, b: unknown): boolean {
+  if (!Array.isArray(a) || !Array.isArray(b)) return false
+  if (a.length !== b.length) return false
+  if (a.length === 0) return true
+  // For small arrays, isDeepEqual is faster (no serialization overhead)
+  if (a.length <= LARGE_ARRAY_THRESHOLD) return isDeepEqual(a, b)
+  // For large arrays, JSON.stringify comparison is faster (single pass serialization
+  // vs recursive property-by-property comparison with type checks)
+  try {
+    return JSON.stringify(a) === JSON.stringify(b)
+  } catch {
+    // Fallback to deep comparison if serialization fails (e.g., circular refs)
+    return isDeepEqual(a, b)
+  }
+}
+
 function computePatchDiff(bot: Bot, prev: Record<string, unknown> | undefined): Record<string, unknown> | null {
   const patchData: Record<string, unknown> = {}
   const currentEntries = Object.entries(bot)
@@ -244,8 +280,12 @@ function computePatchDiff(bot: Bot, prev: Record<string, unknown> | undefined): 
     if (PATCH_EXCLUDE_FIELDS.has(key)) continue
     if (SNAPSHOT_EXCLUDE_FIELDS.has(key)) { patchData[key] = value; continue }
     const prevVal = prev ? prev[key] : undefined
-    if (REF_EQUAL_FIELDS.has(key)) { if (value === prevVal) continue }
-    else if (isDeepEqual(prevVal, value)) continue
+    if (key === 'envVars') {
+      if (isDeepEqual(stripEnvVarIds(prevVal), stripEnvVarIds(value))) continue
+    } else if (REF_EQUAL_FIELDS.has(key)) { if (value === prevVal) continue }
+    else if (LARGE_ARRAY_KEYS.has(key)) {
+      if (fastArrayEqual(prevVal, value)) continue
+    } else if (isDeepEqual(prevVal, value)) continue
     patchData[key] = value
   }
   for (const key of Object.keys(patchData)) {
@@ -256,11 +296,11 @@ function computePatchDiff(bot: Bot, prev: Record<string, unknown> | undefined): 
 
 const PATCH_DEBOUNCE_MS = 500
 
-async function executePatch(botId: string, _retryCount = 0): Promise<boolean> {
+async function executePatch(botId: string, _retryCount = 0): Promise<boolean | null> {
   const bot = useBotStore.getState().bots.find(b => b.id === botId)
   if (!bot) { persistTimers.delete(botId); return false }
   const patchData = computePatchDiff(bot, botSnapshots.get(botId))
-  if (!patchData) { persistTimers.delete(botId); return false }
+  if (!patchData) { persistTimers.delete(botId); return null }
   if (patchData.envVars) {
     patchData.envVars = (patchData.envVars as EnvVar[]).map(({ id: _id, ...rest }) => rest)
   }
@@ -279,6 +319,14 @@ async function executePatch(botId: string, _retryCount = 0): Promise<boolean> {
       const errorBody = await res.text().catch(() => '')
       console.error(`[BotStore] PATCH /api/bots/${botId} failed: ${res.status}`, errorBody)
       if (res.status === 404) {
+        // If the bot hasn't been persisted yet (client UUID), retry later
+        // rather than marking changes as synced. persistNewBot will swap the
+        // ID and re-schedule the patch when it completes.
+        if (!dbBotIds.has(botId)) {
+          persistTimers.delete(botId)
+          schedulePatch(botId, undefined, false)
+          return false
+        }
         const currentBot = useBotStore.getState().bots.find(b => b.id === botId)
         if (currentBot) {
           botSnapshots.set(botId, createFilteredSnapshot(currentBot))
@@ -316,30 +364,36 @@ async function executePatch(botId: string, _retryCount = 0): Promise<boolean> {
     }
     console.error(`[BotStore] PATCH /api/bots/${botId} error:`, error)
     showErrorToastWithCooldown(botId)
-    const currentBot = useBotStore.getState().bots.find(b => b.id === botId)
-    if (currentBot) {
-      botSnapshots.set(botId, createFilteredSnapshot(currentBot))
-    }
+    // Keep the diff dirty — don't update snapshot, so future edits compound
+    // and get another chance to persist.
     persistTimers.delete(botId)
     return false
   }
 }
 
-function schedulePatch(botId: string, _getBot?: () => Bot | undefined) {
+function schedulePatch(botId: string, _getBot?: () => Bot | undefined, immediate = false) {
+  if (immediate) {
+    const existingTimer = persistTimers.get(botId)
+    if (existingTimer) {
+      clearTimeout(existingTimer)
+      persistTimers.delete(botId)
+    }
+    executePatch(botId)
+    return
+  }
   if (persistTimers.has(botId)) return
   persistTimers.set(botId, setTimeout(() => {
     executePatch(botId)
   }, PATCH_DEBOUNCE_MS))
 }
 
-async function flushPendingPatch(botId: string, _getBot?: () => Bot | undefined): Promise<boolean> {
+async function flushPendingPatch(botId: string, _getBot?: () => Bot | undefined): Promise<boolean | null> {
   const timer = persistTimers.get(botId)
-  if (timer) {
-    clearTimeout(timer)
-    persistTimers.delete(botId)
-  }
+  if (!timer) return null
+  clearTimeout(timer)
+  persistTimers.delete(botId)
   const result = await executePatch(botId)
-  if (!result) {
+  if (result === false) {
     showErrorToastWithCooldown(botId)
   }
   return result
@@ -554,39 +608,41 @@ export const useBotStore = create<BotStore>((set, get) => ({
           }
         }
 
-        if (allBots.length > 0 || page > 1) {
-          if (hasMore) {
-            console.warn(`[BotStore] Partial hydration: got ${allBots.length} bots, more pages available`)
-          }
-          const currentBots = get().bots
-          const mergedBots = allBots.map((dbBot) => {
-            const liveBot = currentBots.find(b => b.id === dbBot.id)
-            if (liveBot && liveBot.lastRunnerStatus && liveBot.lastRunnerStatus !== 'stopped') {
-              return {
-                ...dbBot,
-                status: liveBot.status,
-                health: liveBot.health,
-                lastRunnerStatus: liveBot.lastRunnerStatus,
-                lastDeployedAt: liveBot.lastDeployedAt || dbBot.lastDeployedAt,
-              }
-            }
-            return dbBot
-          })
-          set({ bots: mergedBots })
-          dbBotIds.clear()
-          allBots.forEach((b: { id: string }) => dbBotIds.add(b.id))
-          for (const [timerBotId, timer] of persistTimers.entries()) {
-            clearTimeout(timer)
-            persistTimers.delete(timerBotId)
-          }
-          botSnapshots.clear()
-          for (const bot of allBots) {
-            botSnapshots.set(bot.id, createFilteredSnapshot(bot))
-          }
-          hasHydrated = true
-          set({ _hasHydrated: true })
-          break
+        // BUG FIX: Set _hasHydrated even when allBots.length === 0 (fresh install).
+        // Previously, the `if (allBots.length > 0 || page > 1)` guard prevented
+        // _hasHydrated from ever being set to true on empty databases, causing
+        // infinite re-hydration attempts on every interaction that triggers hydration.
+        if (hasMore) {
+          console.warn(`[BotStore] Partial hydration: got ${allBots.length} bots, more pages available`)
         }
+        const currentBots = get().bots
+        const mergedBots = allBots.map((dbBot) => {
+          const liveBot = currentBots.find(b => b.id === dbBot.id)
+          if (liveBot && liveBot.lastRunnerStatus && liveBot.lastRunnerStatus !== 'stopped') {
+            return {
+              ...dbBot,
+              status: liveBot.status,
+              health: liveBot.health,
+              lastRunnerStatus: liveBot.lastRunnerStatus,
+              lastDeployedAt: liveBot.lastDeployedAt || dbBot.lastDeployedAt,
+            }
+          }
+          return dbBot
+        })
+        set({ bots: mergedBots })
+        dbBotIds.clear()
+        allBots.forEach((b: { id: string }) => dbBotIds.add(b.id))
+        for (const [timerBotId, timer] of persistTimers.entries()) {
+          clearTimeout(timer)
+          persistTimers.delete(timerBotId)
+        }
+        botSnapshots.clear()
+        for (const bot of allBots) {
+          botSnapshots.set(bot.id, createFilteredSnapshot(bot))
+        }
+        hasHydrated = true
+        set({ _hasHydrated: true })
+        break
       } catch (e) {
         console.warn(`Failed to hydrate from DB (attempt ${attempt + 1}/${MAX_RETRIES}):`, e)
       }
@@ -794,6 +850,8 @@ export const useBotStore = create<BotStore>((set, get) => ({
     botSnapshots.delete(id)
     logDedupKeys.delete(id)
     lastLogFetchTime.delete(id)
+    // FIX: Also clean up errorToastCooldown for deleted bot (memory leak)
+    errorToastCooldown.delete(id)
     const pendingTimer = persistTimers.get(id)
     if (pendingTimer) {
       clearTimeout(pendingTimer)
@@ -823,7 +881,8 @@ export const useBotStore = create<BotStore>((set, get) => ({
           // the bot still exists after the rollback.
           return {
             bots: newBots,
-            ...(current.selectedBotId === id ? { selectedBotId: id } : {}),
+            // Only restore selectedBotId if the user hasn't navigated elsewhere
+            ...(current.selectedBotId === id && state.selectedBotId !== id ? { selectedBotId: id } : {}),
           }
         })
       }
@@ -1084,11 +1143,23 @@ export const useBotStore = create<BotStore>((set, get) => ({
     set((state) => ({
       bots: state.bots.map((b) => {
         if (b.id !== botId) return b
+        // FIX: When editing a codeBlock, also sync the change to the corresponding
+        // projectFile (matched by description = file path). This prevents data loss
+        // where projectFiles has stale content while codeBlocks has the latest edit.
+        const updatedCodeBlocks = b.codeBlocks.map((cb) =>
+          cb.id === blockId ? { ...cb, code, lastModified: new Date().toISOString() } : cb
+        )
+        const editedBlock = updatedCodeBlocks.find((cb) => cb.id === blockId)
+        const updatedProjectFiles = b.projectFiles?.map((f) => {
+          if (editedBlock && editedBlock.description === f.path) {
+            return { ...f, content: code, size: new TextEncoder().encode(code).length }
+          }
+          return f
+        })
         return {
           ...b,
-          codeBlocks: b.codeBlocks.map((cb) =>
-            cb.id === blockId ? { ...cb, code, lastModified: new Date().toISOString() } : cb
-          ),
+          codeBlocks: updatedCodeBlocks,
+          projectFiles: updatedProjectFiles || b.projectFiles,
           codeDirty: true,
           updatedAt: new Date().toISOString(),
         }
@@ -1318,7 +1389,13 @@ export const useBotStore = create<BotStore>((set, get) => ({
         }
       }),
     }))
-    schedulePatch(botId, () => get().bots.find(b => b.id === botId))
+    // FIX: Only use immediate=true for terminal state transitions (stopped/error),
+    // which need to be persisted promptly. For transient states (starting, running),
+    // use debounced patching to avoid concurrent PATCH requests that can cause
+    // envVar merge conflicts (the executePatch envVar merge replaces the entire
+    // array, so concurrent PATCHes can lose in-flight edits).
+    const isTerminalTransition = runnerStatus === 'stopped' || runnerStatus === 'error'
+    schedulePatch(botId, () => get().bots.find(b => b.id === botId), isTerminalTransition)
   },
 
   // ─── Stats Fetch ───────────────────────────────────────────────────────
@@ -1396,13 +1473,24 @@ export const useBotStore = create<BotStore>((set, get) => ({
       bots: state.bots.map((b) => {
         if (b.id !== botId) return b
         if (!b.projectFiles) return b
+        // FIX: When editing a projectFile, also sync the change to the corresponding
+        // codeBlock (matched by description = file path). This prevents data loss
+        // where codeBlocks has stale content while projectFiles has the latest edit.
+        const updatedProjectFiles = b.projectFiles.map((f) =>
+          f.path === filePath
+            ? { ...f, content: newContent, size: new TextEncoder().encode(newContent).length }
+            : f
+        )
+        const updatedCodeBlocks = b.codeBlocks.map((cb) => {
+          if (cb.description === filePath) {
+            return { ...cb, code: newContent, lastModified: new Date().toISOString() }
+          }
+          return cb
+        })
         return {
           ...b,
-          projectFiles: b.projectFiles.map((f) =>
-            f.path === filePath
-              ? { ...f, content: newContent, size: new TextEncoder().encode(newContent).length }
-              : f
-          ),
+          projectFiles: updatedProjectFiles,
+          codeBlocks: updatedCodeBlocks,
           codeDirty: true,
           updatedAt: new Date().toISOString(),
         }
@@ -1421,4 +1509,31 @@ if (typeof window !== 'undefined') {
       useBotStore.getState().hydrateFromDB()
     }
   }).catch(() => {})
+
+  window.addEventListener('beforeunload', () => {
+    for (const [botId, timer] of persistTimers.entries()) {
+      clearTimeout(timer)
+      persistTimers.delete(botId)
+      if (!dbBotIds.has(botId)) continue
+      const bot = useBotStore.getState().bots.find(b => b.id === botId)
+      if (!bot) continue
+      const patchData = computePatchDiff(bot, botSnapshots.get(botId))
+      if (!patchData) continue
+      if (patchData.envVars) {
+        patchData.envVars = (patchData.envVars as EnvVar[]).map(({ id: _id, ...rest }) => rest)
+      }
+      for (const key of Object.keys(patchData)) {
+        if (patchData[key] === undefined) delete patchData[key]
+      }
+      try {
+        fetch(`/api/bots/${botId}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(patchData),
+          credentials: 'include',
+          keepalive: true,
+        }).catch(() => {})
+      } catch {}
+    }
+  })
 }

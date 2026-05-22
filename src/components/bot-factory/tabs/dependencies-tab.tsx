@@ -107,19 +107,25 @@ export function DependenciesTab() {
       toast.error(t('depsTab.nameRequired'))
       return
     }
+    // FIX: Validate dependency name matches backend rules — reject names starting with . / \
+    const trimmedName = name.trim()
+    if (/^[./\\]/.test(trimmedName)) {
+      toast.error(t('depsTab.invalidDepName', { name: trimmedName }))
+      return
+    }
     // Check for duplicate dependency name
-    const existing = bot.dependencies.find((d) => d.name.toLowerCase() === name.trim().toLowerCase())
+    const existing = bot.dependencies.find((d) => d.name.toLowerCase() === trimmedName.toLowerCase())
     if (existing) {
-      toast.error(t('depsTab.duplicateDep', { name: name.trim() }))
+      toast.error(t('depsTab.duplicateDep', { name: trimmedName }))
       return
     }
     addDependency(bot.id, {
-      name: name.trim(),
+      name: trimmedName,
       version: version.trim() || 'latest',
       isRequired,
       description: description.trim() || undefined,
     })
-    toast.success(t('depsTab.added', { name: name.trim() }))
+    toast.success(t('depsTab.added', { name: trimmedName }))
     setName('')
     setVersion('')
     setIsRequired(true)

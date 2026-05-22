@@ -135,8 +135,12 @@ class RateLimiter {
     const elapsed = now - record.windowStart
 
     // Window has expired → shift current to previous, start new window
+    // FIX: When the window has fully expired, prevCount should be 0, not record.count.
+    // The old window is completely in the past, so its requests should not affect
+    // the new window's sliding count. Setting prevCount = record.count caused
+    // users to be immediately rate-limited at the start of a new window.
     if (elapsed >= config.window) {
-      record.prevCount = record.count
+      record.prevCount = 0
       record.count = 1
       record.windowStart = now
       return {

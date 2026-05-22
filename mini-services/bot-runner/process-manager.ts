@@ -1,4 +1,5 @@
-import { readFileSync, readdirSync, writeFileSync, unlinkSync } from 'fs'
+import { readdirSync, writeFileSync, unlinkSync } from 'fs'
+import { readFile } from 'fs/promises'
 import { spawn, execFile } from 'child_process'
 import type { BotProcess } from './types'
 // ─── Node.js Path for Bot Processes ────────────────────────────────────────
@@ -72,7 +73,8 @@ const DANGEROUS_ENV_KEYS = new Set([
 
 /**
  * P3-18/20 FIX: Get child process memory with cross-platform fallbacks.
- * P2-3 FIX: Uses readFileSync instead of execSync to avoid blocking shell.
+ * P2-3 FIX: Uses readFile instead of execSync to avoid blocking shell.
+ * P1 FIX: Changed from readFileSync to async readFile to avoid blocking the event loop.
  * Primary: /proc/{pid}/status VmRSS (Linux)
  * Fallback: `ps -o rss= -p {pid}` (macOS/Linux)
  * Fallback: `tasklist /FI "PID eq {pid}"` (Windows)
@@ -81,7 +83,7 @@ const DANGEROUS_ENV_KEYS = new Set([
 export async function getChildProcessMemory(pid: number): Promise<number> {
   // Try /proc first (Linux — most accurate)
   try {
-    const status = readFileSync(`/proc/${pid}/status`, 'utf-8')
+    const status = await readFile(`/proc/${pid}/status`, 'utf-8')
     const match = status.match(/VmRSS:\s*(\d+)\s*kB/)
     if (match) return parseInt(match[1]) * 1024 // Convert KB to bytes
   } catch {
@@ -302,17 +304,20 @@ export async function handleBotExit(
     // P2-BR-4 FIX: Track the restart timer so it can be cancelled during shutdown
     const restartTimer = setTimeout(async () => {
       restartTimers.delete(botId) // Clean up tracking
-      const config = await loadBotConfigAsync(botId)
-      if (config) {
-        appendLog(botId, '正在重启进程...', 'info')
-        // Ensure bot process record exists with correct env
-        const bp = botProcesses.get(botId)
-        if (bp) {
-          bp.logBuffer = []
-          await startBotProcess(botId)
+      try {
+        const config = await loadBotConfigAsync(botId)
+        if (config) {
+          appendLog(botId, '正在重启进程...', 'info')
+          const bp = botProcesses.get(botId)
+          if (bp) {
+            bp.logBuffer = []
+            await startBotProcess(botId)
+          }
+        } else {
+          appendLog(botId, '无法自动重启: 未找到保存的配置', 'error')
         }
-      } else {
-        appendLog(botId, '无法自动重启: 未找到保存的配置', 'error')
+      } catch (e) {
+        appendLog(botId, `自动重启失败: ${e instanceof Error ? e.message : 'unknown'}`, 'error')
       }
     }, delay)
     restartTimers.set(botId, restartTimer)
@@ -325,7 +330,10 @@ export async function handleBotExit(
     appendLog(botId, `快速失败: 进程运行不足 ${FAST_FAIL_THRESHOLD_MS / 1000} 秒即退出，已停止自动重启。请检查 Bot Token 和配置是否正确。`, 'error')
     io.emit('bot:status', { botId, status: 'error', error: bot.error })
   } else {
-    appendLog(botId, `已达最大重启次数 (${bot.maxRestarts})，机器人已停止`, 'error')
+    bot.status = 'error'
+    bot.error = `已达最大重启次数 (${bot.maxRestarts})，机器人已停止`
+    appendLog(botId, bot.error, 'error')
+    io.emit('bot:status', { botId, status: 'error', error: bot.error })
   }
 }
 
@@ -398,11 +406,10 @@ export async function startBotProcess(
   _botProcesses?: Map<string, BotProcess>,
   _handleBotExitFn?: (botId: string, code: number | null, signal: string | null, exitedProcess?: ChildProcess) => Promise<void>,
 ): Promise<void> {
-  // Use module-level or passed-in references (module-level is the common case)
   const processes = _botProcesses ?? (globalThis as unknown as { __botProcesses?: Map<string, BotProcess> }).__botProcesses
   const handleExit = _handleBotExitFn ?? (globalThis as unknown as { __handleBotExitFn?: typeof _handleBotExitFn }).__handleBotExitFn
 
-  if (!processes) return
+  if (!processes || !handleExit) return
   const bot = processes.get(botId)
   if (!bot) return
 

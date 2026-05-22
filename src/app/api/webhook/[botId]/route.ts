@@ -259,8 +259,10 @@ export async function POST(
       }
       if (storedSecret) {
         const crypto = await import('crypto')
-        const bodyStr = JSON.stringify(parsed)
-        const signature = crypto.createHmac('sha256', storedSecret).update(bodyStr).digest('hex')
+        // FIX: Use original body string for signature, not JSON.stringify(parsed).
+        // JSON.stringify may produce different whitespace/key order than the original body,
+        // causing signature mismatch with the receiving end.
+        const signature = crypto.createHmac('sha256', storedSecret).update(body).digest('hex')
         headers['X-Webhook-Signature'] = `sha256=${signature}`
       }
       const response = await fetch(runnerUrl, {

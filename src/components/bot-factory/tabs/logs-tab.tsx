@@ -186,7 +186,7 @@ export function LogsTab({ isVisible = true }: LogsTabProps) {
   // only started on mount, so if the bot wasn't running yet, new logs from
   // a subsequently started bot would never appear via polling).
 
-  const isBotRunning = bot?.status === 'active' && bot?.lastRunnerStatus !== 'stopped'
+  const isBotRunning = bot?.status === 'active' || bot?.status === 'deploying' || bot?.lastRunnerStatus === 'running' || bot?.lastRunnerStatus === 'starting'
   const isBotRunningRef = useRef(isBotRunning)
   useEffect(() => { isBotRunningRef.current = isBotRunning }, [isBotRunning])
 
@@ -194,6 +194,8 @@ export function LogsTab({ isVisible = true }: LogsTabProps) {
     if (!bot?.id || !isVisible) return
 
     if (!isBotRunning) return
+
+    fetchBotLogs(bot.id)
 
     const timer = setInterval(() => {
       if (!isBotRunningRef.current) {

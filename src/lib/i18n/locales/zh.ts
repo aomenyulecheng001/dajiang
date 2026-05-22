@@ -554,6 +554,7 @@ export const zh = {
     encryptValue: '加密此值',
     nameRequired: '请输入变量名',
     valueRequired: '请输入变量值',
+    invalidKey: '变量名 "{key}" 格式无效（必须以字母或下划线开头，仅包含字母、数字和下划线），已跳过',
     added: '已添加 "{key}" 变量',
     removed: '已移除 "{key}" 变量',
     updated: '已更新 "{key}" 变量',

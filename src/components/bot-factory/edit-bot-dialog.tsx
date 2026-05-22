@@ -34,9 +34,16 @@ function EditBotForm({ bot, onClose }: { bot: Bot; onClose: () => void }) {
   const [errors, setErrors] = useState<{ name?: string }>({})
 
   function validate() {
-    const newErrors: { name?: string } = {}
+    const newErrors: { name?: string; description?: string } = {}
     if (!name.trim()) {
       newErrors.name = t('editBot.nameRequired')
+    } else if (name.trim().length > 100) {
+      // FIX: Align with backend validation (MAX_NAME_LENGTH = 100)
+      newErrors.name = t('editBot.nameTooLong', { max: 100 })
+    }
+    if (description.length > 500) {
+      // FIX: Align with backend validation (MAX_DESCRIPTION_LENGTH = 500)
+      newErrors.description = t('editBot.descTooLong', { max: 500 })
     }
     setErrors(newErrors)
     return Object.keys(newErrors).length === 0
@@ -55,7 +62,6 @@ function EditBotForm({ bot, onClose }: { bot: Bot; onClose: () => void }) {
       updateBotEmoji(bot.id, emoji, customIcon)
     }
 
-    toast.success(t('editBot.updated', { name }), { description: t('editBot.updatedDesc') })
     onClose()
   }
 

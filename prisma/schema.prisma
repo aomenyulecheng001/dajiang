@@ -52,6 +52,8 @@ model Bot {
   @@index([createdAt])
   @@index([name])
   @@index([ownerId])
+  // FIX: Added composite index for the main list query (WHERE ownerId=? ORDER BY updatedAt DESC)
+  @@index([ownerId, updatedAt(sort: Desc)])
   @@unique([ownerId, name])
 }
 
@@ -65,9 +67,8 @@ model BotLog {
   message   String
   source    String   @default("")
 
-  @@index([botId, timestamp])
-  // REMOVED: @@index([botId, id]) — redundant with PK index on `id` and
-  // the more useful @@index([botId, timestamp]) for time-ordered queries.
+  // FIX: Removed redundant @@index([botId, timestamp]) — it's a prefix of
+  // the @@index([botId, timestamp, level]) below, which can serve the same queries.
   @@index([botId, level])
   @@index([timestamp])
   @@index([botId, timestamp, level])

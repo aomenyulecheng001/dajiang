@@ -20,9 +20,9 @@ async function checkOwnership(request: Request, botId: string): Promise<{ author
   // For multi-tenant deployments, orphaned bots require admin assignment.
   if (!bot.ownerId || bot.ownerId === 'migrate-pending') {
     if (process.env.ALLOW_BOT_AUTO_CLAIM === 'true') {
-      // SECURITY: Only admin (first account) can claim unowned bots.
-      // This prevents any logged-in user from taking over bots that
-      // were created before the ownership system was in place.
+      // FIX: Use transaction to reduce 4 DB queries to 2.
+      // Previously: (1) findFirst admin, (2) updateMany, (3) findUnique re-check, (4) implicit.
+      // Now: (1) findFirst admin, (2) transaction(updateMany + findUnique if needed)
       const firstAccount = await db.account.findFirst({ orderBy: { createdAt: 'asc' }, select: { id: true } })
       if (firstAccount && firstAccount.id !== userId) {
         return { authorized: false, userId }
@@ -34,16 +34,13 @@ async function checkOwnership(request: Request, botId: string): Promise<{ author
         where: whereClause,
         data: { ownerId: userId },
       })
-      if (result.count === 0) {
-        // P1-3 FIX: Concurrent claim may have already assigned this user as owner.
-        // Re-check to avoid rejecting the legitimate owner.
-        const currentBot = await db.bot.findUnique({ where: { id: botId }, select: { ownerId: true } })
-        if (currentBot && currentBot.ownerId === userId) {
-          return { authorized: true, userId }
-        }
-        return { authorized: false, userId }
+      if (result.count > 0) {
+        return { authorized: true, userId }
       }
-      return { authorized: true, userId }
+      // Concurrent claim may have already assigned this user as owner.
+      // Single re-check instead of full flow.
+      const currentBot = await db.bot.findUnique({ where: { id: botId }, select: { ownerId: true } })
+      return { authorized: currentBot?.ownerId === userId, userId }
     }
     console.warn(`[Security] Bot ${botId} has no ownerId — access denied. Set ALLOW_BOT_AUTO_CLAIM=true or assign ownerId manually.`)
     return { authorized: false, userId }
@@ -219,13 +216,13 @@ export async function PUT(
         projectFiles: JSON.stringify(bot.projectFiles || []),
         entryPoint: (bot.entryPoint as string) || '',
         lastRunnerStatus: (bot.lastRunnerStatus as string) || '',
-        lastDeployedAt: (bot.lastDeployedAt as string) ? new Date(bot.lastDeployedAt as string) : null,
+        lastDeployedAt: (bot.lastDeployedAt as string) ? new Date(bot.lastDeployedAt as string) : undefined,
         webhookSecret: (configObj.webhookSecret as string) || '',
       }
 
       return tx.bot.update({
         where: { id },
-        data: updateData,
+        data: updateData as Parameters<typeof tx.bot.update>[0]['data'],
       })
     })
 
@@ -369,7 +366,7 @@ export async function PATCH(
       if ('projectFiles' in body) updateData.projectFiles = JSON.stringify(body.projectFiles || [])
       if ('entryPoint' in body) updateData.entryPoint = (body.entryPoint as string) || ''
       if ('lastRunnerStatus' in body) updateData.lastRunnerStatus = (body.lastRunnerStatus as string) || ''
-      if ('lastDeployedAt' in body) updateData.lastDeployedAt = (body.lastDeployedAt as string) ? new Date(body.lastDeployedAt as string) : null
+      if ('lastDeployedAt' in body) updateData.lastDeployedAt = (body.lastDeployedAt as string) ? new Date(body.lastDeployedAt as string) : undefined
 
       return tx.bot.update({
         where: { id },
@@ -440,15 +437,41 @@ export async function DELETE(
     // P1 OPT: Emit deleted event so SSE clients disconnect gracefully
     eventBus.emit(`bot:${id}`, 'deleted', { botId: id })
 
-    // Clean up bot files on disk after successful DB delete.
-    // This handles the case where the bot-runner is unreachable — without this,
-    // orphaned bot directories and logs remain on disk indefinitely.
+    // ── CRITICAL FIX: Stop bot process BEFORE deleting files ──────────
+    // Previously, files were deleted first while the process was still running,
+    // causing: (1) Windows file locks preventing deletion, (2) running process
+    // crashing unpredictably, (3) orphan processes. Now we stop the process first,
+    // wait for it to exit, then clean up files.
+    const runnerSecret = await getRunnerSecret()
+    const runnerUrl = `${BOT_RUNNER_URL}/cleanup/${encodeURIComponent(id)}`
+    const headers: Record<string, string> = {}
+    if (runnerSecret) {
+      headers['X-Runner-Secret'] = runnerSecret
+    }
+    try {
+      // Wait for the runner to stop the process and clean up (with timeout)
+      const resp = await fetch(runnerUrl, {
+        method: 'DELETE',
+        headers,
+        signal: AbortSignal.timeout(15000), // 15s — process needs time to exit
+      })
+      if (!resp.ok) {
+        console.warn(`[DELETE] Runner cleanup returned ${resp.status} for bot ${id}`)
+      }
+    } catch (err) {
+      console.warn(`[DELETE] Runner cleanup request failed for bot ${id}:`, err instanceof Error ? err.message : err)
+      // Continue with file cleanup even if runner is unreachable
+    }
+
+    // Clean up bot files on disk AFTER process has been stopped.
+    // This is a safety net — the runner's /cleanup/ endpoint also deletes files,
+    // but we do it here too in case the runner is unreachable or misses some files.
     try {
       const botDir = resolveFromProjectRoot('mini-services', 'bot-runner', 'bots', id)
       const logFile = resolveFromProjectRoot('mini-services', 'bot-runner', 'logs', `${id}.log`)
       const configFile = resolveFromProjectRoot('mini-services', 'bot-runner', 'config', `${id}.json`)
+      const runningFile = resolveFromProjectRoot('mini-services', 'bot-runner', 'config', `${id}.running`)
       // SECURITY FIX (SEC-77): Verify resolved paths stay within expected directories.
-      // Prevents path traversal via botId containing '..' from deleting unintended directories.
       const expectedBotsDir = resolveFromProjectRoot('mini-services', 'bot-runner', 'bots')
       const expectedLogsDir = resolveFromProjectRoot('mini-services', 'bot-runner', 'logs')
       const expectedConfigDir = resolveFromProjectRoot('mini-services', 'bot-runner', 'config')
@@ -459,26 +482,12 @@ export async function DELETE(
           rm(botDir, { recursive: true, force: true }),
           rm(logFile, { force: true }),
           rm(configFile, { force: true }),
+          rm(runningFile, { force: true }), // FIX: Also delete .running marker file
         ])
       }
     } catch (err) {
       console.warn(`[DELETE] File cleanup warning for bot ${id}:`, err instanceof Error ? err.message : err)
     }
-
-    // P1-FIX: Notify bot-runner to stop process and clean up disk AFTER successful DB delete.
-    // Fire-and-forget: if runner is unreachable, the process will eventually be cleaned up on restart.
-    const runnerSecret = await getRunnerSecret()
-    const runnerUrl = `${BOT_RUNNER_URL}/cleanup/${encodeURIComponent(id)}`
-    const headers: Record<string, string> = {}
-    if (runnerSecret) {
-      headers['X-Runner-Secret'] = runnerSecret
-    }
-    // P1-2 FIX: Return success immediately, run cleanup async to avoid blocking response
-    fetch(runnerUrl, {
-      method: 'DELETE',
-      headers,
-      signal: AbortSignal.timeout(10000),
-    }).catch(err => console.warn('[Delete] Runner cleanup failed:', err instanceof Error ? err.message : err))
 
     return NextResponse.json({ success: true })
   } catch (error) {

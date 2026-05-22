@@ -53,6 +53,31 @@ export function buildDeployConfig(
 ): DeployConfig {
   const depsList = (bot.dependencies || []).map((d: Dependency) => d.version ? `${d.name}@${d.version}` : d.name)
 
+  // BUG FIX: When projectFiles exist, codeBlocks edits must be synced back to projectFiles.
+  // Previously, codeBlocks were generated from projectFiles at import time but never synced.
+  // When the user edited code in the code tab, only codeBlocks was updated — projectFiles
+  // (which is what actually gets deployed) remained unchanged, causing edits to be silently lost.
+  // Now we merge codeBlocks changes back into projectFiles before building the deploy config.
+  let projectFilesForDeploy = bot.projectFiles
+  if (bot.projectFiles?.length && bot.codeBlocks?.length) {
+    const codeBlockMap = new Map<string, string>()
+    for (const cb of bot.codeBlocks) {
+      if (cb.description && cb.code) {
+        // codeBlocks from ZIP import have description = file path
+        codeBlockMap.set(cb.description, cb.code)
+      }
+    }
+    if (codeBlockMap.size > 0) {
+      projectFilesForDeploy = bot.projectFiles.map(f => {
+        const updatedCode = codeBlockMap.get(f.path)
+        if (updatedCode !== undefined) {
+          return { ...f, content: updatedCode, size: new TextEncoder().encode(updatedCode).length }
+        }
+        return f
+      })
+    }
+  }
+
   return {
     botId,
     config: {
@@ -61,10 +86,10 @@ export function buildDeployConfig(
       language: (bot.language || 'javascript') as 'javascript' | 'typescript' | 'python',
       templateId: bot.template || 'custom',
       envVars: realEnvVarsMap,
-      customCode: bot.projectFiles?.length ? undefined : (bot.codeBlocks?.filter(b => b.isActive !== false).map(b => b.code).join('\n\n') || bot.code || undefined),
+      customCode: projectFilesForDeploy?.length ? undefined : (bot.codeBlocks?.filter(b => b.isActive !== false).map(b => b.code).join('\n\n') || bot.code || undefined),
       dependencies: depsList.length > 0 ? depsList : undefined,
-      projectFiles: bot.projectFiles?.length
-        ? bot.projectFiles.map((f: ProjectFile) => ({ path: f.path, content: f.content }))
+      projectFiles: projectFilesForDeploy?.length
+        ? projectFilesForDeploy.map((f: ProjectFile) => ({ path: f.path, content: f.content }))
         : undefined,
       entryPoint: bot.entryPoint || undefined,
     },

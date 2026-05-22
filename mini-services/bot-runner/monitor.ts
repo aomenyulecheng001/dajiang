@@ -1,4 +1,4 @@
-import { readFileSync } from 'fs'
+import { readFile } from 'fs/promises'
 import type { BotProcess } from './types'
 import { getChildProcessMemory, intentionalStopSet, cancelRestartTimer, memoryKilledSet } from './process-manager'
 import { appendLog } from './log-manager'
@@ -34,9 +34,9 @@ interface CpuSnapshot {
  *   field 15: stime  - kernel-mode CPU ticks
  *   field 22: starttime - process start time (ticks since boot)
  */
-function readProcCpu(pid: number): CpuSnapshot | null {
+async function readProcCpu(pid: number): Promise<CpuSnapshot | null> {
   try {
-    const stat = readFileSync(`/proc/${pid}/stat`, 'utf-8')
+    const stat = await readFile(`/proc/${pid}/stat`, 'utf-8')
     // The comm field (field 2) may contain spaces and parentheses, so we split from the end
     const lastParen = stat.lastIndexOf(')')
     if (lastParen === -1) return null
@@ -53,8 +53,7 @@ function readProcCpu(pid: number): CpuSnapshot | null {
     // Get total CPU time from /proc/stat (sum of all CPU times across cores)
     let totalCpuTicks = 0
     try {
-      // P2-3 FIX: Read /proc/stat directly instead of `cat | head` via execSync
-      const cpuStat = readFileSync('/proc/stat', 'utf-8')
+      const cpuStat = await readFile('/proc/stat', 'utf-8')
       const firstLine = cpuStat.split('\n')[0] // cpu line is always first
       const cpuParts = firstLine.split(/\s+/).slice(1).map(Number)
       totalCpuTicks = cpuParts.reduce((sum, v) => sum + (isNaN(v) ? 0 : v), 0)
@@ -188,11 +187,17 @@ export function startMonitoring(botProcesses: Map<string, BotProcess>): void {
       }
     }
 
-    // P2-BR-6 FIX: Clean up cpuSnapshots entries for bots no longer in botProcesses
+    // P2-BR-6 FIX: Clean up cpuSnapshots entries for bots no longer in botProcesses.
+    // Collect stale IDs first to avoid modifying the Map during iteration, which
+    // is undefined behavior on some JS engines and can skip entries.
+    const staleIds: string[] = []
     for (const botId of cpuSnapshots.keys()) {
       if (!botProcesses.has(botId)) {
-        cpuSnapshots.delete(botId)
+        staleIds.push(botId)
       }
+    }
+    for (const botId of staleIds) {
+      cpuSnapshots.delete(botId)
     }
 
     io.emit('resources:update', resourceData)

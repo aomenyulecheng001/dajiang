@@ -20,7 +20,7 @@ import { PORT, CONFIG_DIR, loadBotConfigAsync, BOTS_DIR, sanitizeBotId, getBotDi
 import { MAX_LOG_LINES, setLogState, cleanupOldLogs, startLogCleanup, stopLogCleanup, LOGS_DIR } from './log-manager'
 
 import { httpServer, io } from './socket'
-import { handleBotExit, startBotProcess, stopBotProcess, clearAllRestartTimers, intentionalStopSet } from './process-manager'
+import { handleBotExit, startBotProcess, stopBotProcess, clearAllRestartTimers, intentionalStopSet, memoryKilledSet, cancelRestartTimer } from './process-manager'
 import { registerHandlers } from './handlers'
 import { startMonitoring, stopMonitoring } from './monitor'
 
@@ -46,6 +46,11 @@ const RUNNER_SECRET = loadRunnerSecret()
 
 if (!RUNNER_SECRET && process.env.NODE_ENV === 'production') {
   console.error('[FATAL] RUNNER_SECRET is empty in production. Refusing to start without authentication.')
+  // Kill all child processes before exiting to prevent orphaned bot processes.
+  // The child_process.kill() sends SIGTERM to each tracked process.
+  for (const [, bot] of botProcesses) {
+    try { bot.process?.kill('SIGTERM') } catch { /* ignore */ }
+  }
   process.exit(1)
 }
 if (!RUNNER_SECRET) {
@@ -95,31 +100,31 @@ async function verifyWebhookSecret(req: IncomingMessage, botId: string, body?: s
   const signature = req.headers['x-webhook-signature'] as string | undefined
   const forwardedSecret = req.headers['x-webhook-secret'] as string | undefined
 
-  if (!signature && !forwardedSecret) {
-    const config = await loadBotConfigAsync(botId)
-    if (!config) {
-      console.warn(`[Webhook] Unknown bot ${botId}, rejecting webhook`)
-      return false
-    }
-    const storedSecret = config.envVars?.WEBHOOK_SECRET || config.webhookSecret
-    if (storedSecret) {
-      console.warn(`[Webhook] No auth header for bot ${botId} with configured secret — rejecting`)
-      return false
-    }
-    return true
-  }
+  // FIX: Load config once at the start, not twice (once in no-auth branch, once in auth branch)
   const config = await loadBotConfigAsync(botId)
   if (!config) {
     console.warn(`[Webhook] Unknown bot ${botId}, rejecting webhook`)
     return false
   }
   const storedSecret = config.envVars?.WEBHOOK_SECRET || config.webhookSecret
+
+  if (!signature && !forwardedSecret) {
+    if (storedSecret) {
+      console.warn(`[Webhook] No auth header for bot ${botId} with configured secret — rejecting`)
+      return false
+    }
+    return true
+  }
   if (!storedSecret) {
     return true
   }
   if (signature && body) {
-    const expectedSig = createHmac('sha256', storedSecret).update(body).digest('hex')
-    const expectedHash = createHash('sha256').update(`sha256=${expectedSig}`, 'utf-8').digest()
+    // FIX: Remove double-hashing. The sender generates `sha256=<HMAC-hex>`,
+    // so we compute the expected HMAC and compare directly (with timing-safe
+    // hash comparison to avoid length leakage). The old code did an extra
+    // SHA-256 on top of the HMAC output, which never matched the sender's format.
+    const expectedSig = `sha256=${createHmac('sha256', storedSecret).update(body).digest('hex')}`
+    const expectedHash = createHash('sha256').update(expectedSig, 'utf-8').digest()
     const providedHash = createHash('sha256').update(signature, 'utf-8').digest()
     if (!timingSafeEqual(expectedHash, providedHash)) {
       console.warn(`[Webhook] Invalid webhook signature for bot ${botId}`)
@@ -263,12 +268,16 @@ httpServer.on('request', async (req: IncomingMessage, res: ServerResponse) => {
     console.log(`[Cleanup-Audit] bot=${botId} action=cleanup ip=${clientIp} time=${new Date().toISOString()} running=${botProcesses.has(botId)}`)
 
     // Stop process if running
+    // FIX: Cancel restart timer and mark intentional stop BEFORE stopping,
+    // matching the Socket.IO bot:delete handler's logic.
+    cancelRestartTimer(botId)
     boundStopBotProcess(botId)
 
     // Clean up disk
     const botDir = getBotDir(botId)
     const configPath = `${CONFIG_DIR}/${botId}.json`
     const logPath = `${LOGS_DIR}/${botId}.log`
+    const runningPath = `${CONFIG_DIR}/${botId}.running`
 
     // P2-BR-1 FIX: Use async fs operations instead of sync to avoid blocking event loop
     ;(async () => {
@@ -285,16 +294,33 @@ httpServer.on('request', async (req: IncomingMessage, res: ServerResponse) => {
           })
         }
 
+        // Re-deployment guard: if the bot was re-deployed with the same ID
+        // while this cleanup was in flight, abort to avoid destroying the new
+        // bot's files and process entry.
+        const currentBot = botProcesses.get(botId)
+        if (currentBot && (currentBot.status === 'running' || currentBot.status === 'starting')) {
+          console.log(`[Cleanup] Bot ${botId} was re-deployed, aborting cleanup`)
+          if (!responded) {
+            responded = true
+            clearTimeout(cleanupTimeout)
+            res.writeHead(200, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ ok: true, skipped: 're-deployed' }))
+          }
+          return
+        }
+
         await access(botDir).then(() => rm(botDir, { recursive: true, force: true })).catch(() => {})
         await access(configPath).then(() => rm(configPath, { force: true })).catch(() => {})
         await access(logPath).then(() => rm(logPath, { force: true })).catch(() => {})
+        await access(runningPath).then(() => rm(runningPath, { force: true })).catch(() => {})
       } catch { /* ignore cleanup errors */ }
 
       // Remove from memory
       botProcesses.delete(botId)
       deployStatus.delete(botId)
-      // Clean up tracking sets to prevent memory leak
+      // FIX: Clean up ALL tracking sets, not just intentionalStopSet
       intentionalStopSet.delete(botId)
+      memoryKilledSet.delete(botId)
 
       // Notify frontend to clean up stale runner state
       io.emit('bot:deleted', { botId })
@@ -422,8 +448,23 @@ httpServer.listen(PORT, async () => {
   }
   if (autoStartBots.length > 0) {
     console.log(`[Startup] Auto-starting ${autoStartBots.length} previously running bot(s): ${autoStartBots.join(', ')}`)
-    for (const botId of autoStartBots) {
-      await boundStartBotProcess(botId).catch(err => console.error(`[Startup] Failed to auto-start ${botId}:`, err))
+    // PERF FIX: Start bots in batches to avoid CPU/IO spikes from concurrent
+    // npm install / pip install. Batch size and delay are conservative defaults;
+    // adjust AUTO_START_BATCH_SIZE and AUTO_START_BATCH_DELAY_MS env vars for tuning.
+    const BATCH_SIZE = parseInt(process.env.AUTO_START_BATCH_SIZE || '3', 10) || 3
+    const BATCH_DELAY_MS = parseInt(process.env.AUTO_START_BATCH_DELAY_MS || '2000', 10) || 2000
+    for (let i = 0; i < autoStartBots.length; i += BATCH_SIZE) {
+      const batch = autoStartBots.slice(i, i + BATCH_SIZE)
+      if (i > 0) {
+        console.log(`[Startup] Waiting ${BATCH_DELAY_MS}ms before next batch...`)
+        await new Promise(r => setTimeout(r, BATCH_DELAY_MS))
+      }
+      console.log(`[Startup] Starting batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(autoStartBots.length / BATCH_SIZE)}: ${batch.join(', ')}`)
+      await Promise.all(
+        batch.map(botId =>
+          boundStartBotProcess(botId).catch(err => console.error(`[Startup] Failed to auto-start ${botId}:`, err))
+        )
+      )
     }
   }
 

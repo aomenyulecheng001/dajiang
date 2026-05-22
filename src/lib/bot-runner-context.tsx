@@ -141,6 +141,10 @@ const BOT_RUNNER_URL = (typeof window !== 'undefined' && (window as unknown as R
     ? window.location.origin
     : `http://localhost:3100`)
 
+if (typeof window !== 'undefined' && (window as unknown as Record<string, unknown>).__DEBUG_BOT_RUNNER__) {
+  console.log('[BotRunner] BOT_RUNNER_URL =', BOT_RUNNER_URL, '| window.location.origin =', window.location.origin, '| __RUNNER_URL__ =', (window as unknown as Record<string, unknown>).__RUNNER_URL__)
+}
+
 // Maximum time (ms) to wait for a 'stopped' event after receiving 'stopping'.
 // If exceeded, we assume the bot has stopped (the server's 10s stop timeout
 // should have fired). This prevents the UI from showing a spinning "stopping"
@@ -186,6 +190,8 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
   const stoppingTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
   const logSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const recentLogKeysRef = useRef<Set<string>>(new Set())
+  // FIX: Track deleted bot IDs to ignore late-arriving bot:log events
+  const deletedBotIdsRef = useRef<Set<string>>(new Set())
   const messageBatchRef = useRef<Array<{ botId: string; userId: string; userName: string; text: string; command?: string }>>([])
   const messageBatchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const MESSAGE_BATCH_MAX = 50
@@ -344,6 +350,8 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
         })
 
         socket.on('init', (data: { bots: BotRunnerStatus[] }) => {
+          // FIX: Clear deleted bot IDs on reconnection since the server state is fresh
+          deletedBotIdsRef.current.clear()
           const map = new Map<string, BotRunnerStatus>()
           data.bots.forEach(b => map.set(b.id, b))
           setBotStatuses(map)
@@ -372,22 +380,13 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
           }
 
           const { syncRunnerStatus, bots } = useBotStore.getState()
-          // P1-16 FIX: Debounce PATCH requests to avoid request storm on reconnect
-          setTimeout(() => {
-            // Sync bots that ARE in runner data
-            data.bots.forEach(b => syncRunnerStatus(b.id, b.status))
-            // FIX: Mark store bots that are 'active' but NOT in runner data as 'stopped'.
-            // When the runner sends init, it only includes currently-running bots.
-            // Bots that were previously running but have since stopped/crashed are absent.
-            // Without this, their Zustand store status remains 'active' forever,
-            // causing the header badge and bot card to incorrectly show "运行中".
-            const runnerBotIds = new Set(data.bots.map(b => b.id))
-            bots.forEach(b => {
-              if (b.status === 'active' && !runnerBotIds.has(b.id)) {
-                syncRunnerStatus(b.id, 'stopped')
-              }
-            })
-          }, 100)
+          data.bots.forEach(b => syncRunnerStatus(b.id, b.status))
+          const runnerBotIds = new Set(data.bots.map(b => b.id))
+          bots.forEach(b => {
+            if (b.status === 'active' && !runnerBotIds.has(b.id)) {
+              syncRunnerStatus(b.id, 'stopped')
+            }
+          })
 
           const currentBotIds = new Set(bots.map(b => b.id))
           if (logSyncTimerRef.current) {
@@ -509,6 +508,11 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
           clearTimeout(logPersistTimerRef.current)
           logPersistTimerRef.current = null
         }
+        // FIX: Flush any accumulated log batch before clearing it.
+        // Previously, logs accumulated during the old connection were silently discarded.
+        if (logPersistBatchRef.current.length > 0 && flushLogBatchRef.current) {
+          flushLogBatchRef.current()
+        }
         logPersistBatchRef.current = []
 
         function flushLogBatch() {
@@ -545,6 +549,8 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
         flushLogBatchRef.current = flushLogBatch
 
         socket.on('bot:log', (data: SocketBotLogEntry) => {
+          // FIX: Skip logs for deleted bots to prevent recreating state and 404 errors
+          if (deletedBotIdsRef.current.has(data.botId)) return
           const dedupKey = `${data.botId}:${data.timestamp}:${data.message}`
           if (recentLogKeysRef.current.has(dedupKey)) return
           recentLogKeysRef.current.add(dedupKey)
@@ -712,6 +718,8 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
         })
 
         socket.on('bot:deleted', (data: { botId: string }) => {
+          // FIX: Mark bot as deleted so late-arriving bot:log events are ignored
+          deletedBotIdsRef.current.add(data.botId)
           setBotStatuses(prev => { const n = new Map(prev); n.delete(data.botId); return n })
           if (logSyncTimerRef.current) {
             clearTimeout(logSyncTimerRef.current)
@@ -762,6 +770,10 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
       if (socketRef.current) {
         socketRef.current.disconnect()
         socketRef.current = null
+      }
+      if (retryTimerRef.current) {
+        clearTimeout(retryTimerRef.current)
+        retryTimerRef.current = null
       }
       retryCount = 0
       setConnectionError(null)
@@ -867,6 +879,39 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
       deployClearTimersRef.current.clear()
     }
   }, [isAuthenticated])
+
+  // FIX: Re-sync runner statuses after hydrateFromDB completes.
+  // Race condition: Socket.IO 'init' event may fire before hydrateFromDB
+  // finishes loading bots into the store. When that happens, syncRunnerStatus
+  // is a no-op because the bot doesn't exist in the store yet. After
+  // hydrateFromDB completes, the store has bots with stale DB status, and
+  // no further correction happens. This effect re-applies the runner statuses
+  // from the init event to fix the discrepancy.
+  const hasHydrated = useBotStore((s) => s._hasHydrated)
+
+  useEffect(() => {
+    if (!hasHydrated) return
+
+    const { syncRunnerStatus, bots } = useBotStore.getState()
+    if (bots.length === 0) return
+
+    const currentStatuses = botStatusesRef.current
+    if (currentStatuses.size === 0) return
+
+    currentStatuses.forEach((status, botId) => {
+      const storeBot = bots.find(b => b.id === botId)
+      if (storeBot) {
+        syncRunnerStatus(botId, status.status)
+      }
+    })
+
+    const runnerBotIds = new Set([...currentStatuses.keys()])
+    bots.forEach(b => {
+      if (b.status === 'active' && !runnerBotIds.has(b.id)) {
+        syncRunnerStatus(b.id, 'stopped')
+      }
+    })
+  }, [hasHydrated])
 
   // Public reconnect function
   const reconnect = useCallback(() => {

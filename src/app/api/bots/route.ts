@@ -165,8 +165,11 @@ export async function POST(request: Request) {
       description: sanitizeBotDescription(bot.description),
       emoji: sanitizeEmoji(bot.emoji),
       customIcon: sanitizeCustomIcon(bot.customIcon),
-      status: (bot.status as string) || 'inactive',
-      health: (bot.health as string) || 'unknown',
+      // FIX: Force status/health to initial values on creation.
+      // Previously, clients could submit status: 'active' to create a bot
+      // that appears to be running, which is misleading and a security risk.
+      status: 'inactive',
+      health: 'unknown',
       language: (bot.language as string) || 'typescript',
       template: (bot.template as string) || 'custom',
       version: (bot.version as string) || '1.0.0',

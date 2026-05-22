@@ -554,6 +554,7 @@ export const en = {
     encryptValue: 'Encrypt this value',
     nameRequired: 'Variable name is required',
     valueRequired: 'Variable value is required',
+    invalidKey: 'Variable name "{key}" has invalid format (must start with letter or underscore, contain only letters, numbers, and underscores), skipped',
     added: 'Added "{key}" variable',
     removed: 'Removed "{key}" variable',
     updated: 'Updated "{key}" variable',

@@ -133,7 +133,11 @@ export async function validateSessionEdge(token: string): Promise<{ userId: stri
       const cached = tokenVersionEdgeCache.get(payload.userId)
       let dbVersion: number | undefined
 
-      if (cached && now - cached.cachedAt < EDGE_CACHE_TTL_MS) {
+      // Only trust the cache if the token was created BEFORE the cache entry.
+      // A token created after the cache was populated (e.g., a new session
+      // issued on password/username change) must be validated against the
+      // current DB state, because the cached tokenVersion may be stale.
+      if (cached && now - cached.cachedAt < EDGE_CACHE_TTL_MS && payload.createdAt <= cached.cachedAt) {
         dbVersion = cached.version
       } else {
         try {

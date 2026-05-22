@@ -24,13 +24,57 @@ export interface ImportFile {
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
-export const SKIP_PATTERNS = ['node_modules/', '.git/', 'package-lock.json', 'yarn.lock', '.DS_Store', 'Thumbs.db']
-export const MAX_ZIP_SIZE = 10 * 1024 * 1024 // 10MB
+export const SKIP_PATTERNS = ['node_modules/', '.git/', 'package-lock.json', 'yarn.lock', 'bun.lockb', '.DS_Store', 'Thumbs.db', '__pycache__/', '.venv/', 'venv/', '.tox/', '.mypy_cache/', '.pytest_cache/', 'dist/', 'build/', '.next/', '.nuxt/']
+export const MAX_ZIP_SIZE = 10 * 1024 * 1024 // 10MB (compressed)
+export const MAX_FILE_COUNT = 500 // Maximum number of files after extraction
+export const MAX_SINGLE_FILE_SIZE = 1 * 1024 * 1024 // 1MB per extracted file
+export const MAX_TOTAL_EXTRACTED_SIZE = 20 * 1024 * 1024 // 20MB total extracted content
+
+// Comprehensive binary file extensions — must be skipped when reading as text
+export const BINARY_EXTENSIONS = new Set([
+  // Images
+  'png', 'jpg', 'jpeg', 'gif', 'svg', 'ico', 'bmp', 'webp', 'tiff', 'tif', 'avif',
+  // Fonts
+  'woff', 'woff2', 'ttf', 'eot', 'otf',
+  // Archives
+  'gz', 'tar', 'zip', 'bz2', 'xz', '7z', 'rar', 'tgz',
+  // Media
+  'mp3', 'mp4', 'wav', 'avi', 'mov', 'mkv', 'flac', 'ogg', 'wma', 'wmv', 'webm',
+  // Executables & binaries
+  'exe', 'dll', 'so', 'dylib', 'bin', 'app', 'dmg', 'iso', 'img',
+  // Documents (binary formats)
+  'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'odt', 'ods', 'odp',
+  // Databases
+  'sqlite', 'sqlite3', 'db',
+  // Java
+  'jar', 'class',
+  // Python compiled
+  'pyc', 'pyo', 'pyd',
+  // Lock files (binary)
+  'lockb',
+])
 
 // ─── File Helpers ───────────────────────────────────────────────────────────
 
 export function shouldSkipFile(path: string): boolean {
-  return SKIP_PATTERNS.some((p) => path.includes(p))
+  // Normalize Windows backslashes to forward slashes for consistent matching
+  const normalized = path.replace(/\\/g, '/')
+  return SKIP_PATTERNS.some((p) => normalized.includes(p))
+}
+
+/** Check if a file extension indicates a binary file that should not be read as text */
+export function isBinaryExtension(ext: string): boolean {
+  return BINARY_EXTENSIONS.has(ext.toLowerCase())
+}
+
+/** Normalize ZIP entry path: convert backslashes, strip leading slashes, remove ./ prefix */
+export function normalizeZipPath(path: string): string {
+  // Convert Windows backslashes to forward slashes
+  let normalized = path.replace(/\\/g, '/')
+  // Strip leading slashes or ./ prefix (common in some ZIP tools)
+  while (normalized.startsWith('/')) normalized = normalized.slice(1)
+  while (normalized.startsWith('./')) normalized = normalized.slice(2)
+  return normalized
 }
 
 export function formatFileSize(bytes: number): string {
@@ -120,7 +164,7 @@ export function detectDependencies(code: string): { name: string; version: strin
   let match: RegExpExecArray | null
   while ((match = requireRegex.exec(code)) !== null) {
     const pkg = match[1]
-    const pkgName = pkg.split('/')[0]
+    const pkgName = pkg.startsWith('@') ? pkg.split('/').slice(0, 2).join('/') : pkg.split('/')[0]
     if (seen.has(pkgName) || builtins.includes(pkgName) || pkg.startsWith('.')) continue
     seen.add(pkgName)
     deps.push({ name: pkgName, version: 'latest', isRequired: true, description: `${pkgName} package` })
@@ -130,7 +174,7 @@ export function detectDependencies(code: string): { name: string; version: strin
   const importRegex = /import\s+(?:(?:\{[^}]*\}|\*\s+as\s+\w+|\w+)\s+from\s+)?['"]([^'"]+)['"]/g
   while ((match = importRegex.exec(code)) !== null) {
     const pkg = match[1]
-    const pkgName = pkg.split('/')[0]
+    const pkgName = pkg.startsWith('@') ? pkg.split('/').slice(0, 2).join('/') : pkg.split('/')[0]
     if (seen.has(pkgName) || builtins.includes(pkgName) || pkg.startsWith('.')) continue
     seen.add(pkgName)
     deps.push({ name: pkgName, version: 'latest', isRequired: true, description: `${pkgName} package` })

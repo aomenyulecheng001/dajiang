@@ -58,6 +58,10 @@ const MAX_CODE_BLOCK_CODE_LENGTH = 100_000 // 100KB per block
 const MAX_ENV_VAR_KEY_LENGTH = 100
 const MAX_ENV_VAR_VALUE_LENGTH = 10_000
 const MAX_URL_LENGTH = 2048
+const MAX_PROJECT_FILES_COUNT = 500
+const MAX_PROJECT_FILE_PATH_LENGTH = 500
+const MAX_PROJECT_FILE_CONTENT_LENGTH = 1_000_000 // 1MB per file
+const MAX_PROJECT_FILES_TOTAL_CONTENT_LENGTH = 20_000_000 // 20MB total
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -243,16 +247,12 @@ export function validateBotCreate(body: Record<string, unknown>): ValidationResu
 
   // Optional: projectFiles
   if (body.projectFiles !== undefined && body.projectFiles !== null) {
-    if (!isArray(body.projectFiles)) {
-      errors.push(err('projectFiles', 'Project files must be an array'))
-    }
+    errors.push(...validateProjectFiles(body.projectFiles))
   }
 
   // Optional: entryPoint
   if (body.entryPoint !== undefined && body.entryPoint !== null) {
-    if (!isString(body.entryPoint)) {
-      errors.push(err('entryPoint', 'Entry point must be a string'))
-    }
+    errors.push(...validateEntryPoint(body.entryPoint))
   }
 
   return { valid: errors.length === 0, errors }
@@ -377,15 +377,11 @@ export function validateBotPatch(body: Record<string, unknown>): ValidationResul
   }
 
   if ('projectFiles' in body && body.projectFiles !== undefined && body.projectFiles !== null) {
-    if (!isArray(body.projectFiles)) {
-      errors.push(err('projectFiles', 'Project files must be an array'))
-    }
+    errors.push(...validateProjectFiles(body.projectFiles))
   }
 
   if ('entryPoint' in body && body.entryPoint !== undefined && body.entryPoint !== null) {
-    if (!isString(body.entryPoint)) {
-      errors.push(err('entryPoint', 'Entry point must be a string'))
-    }
+    errors.push(...validateEntryPoint(body.entryPoint))
   }
 
   return { valid: errors.length === 0, errors }
@@ -627,14 +623,14 @@ function validateConfig(value: unknown): ValidationError[] {
 
   // rateLimitPerMinute
   if (value.rateLimitPerMinute !== undefined) {
-    if (typeof value.rateLimitPerMinute !== 'number' || value.rateLimitPerMinute < 1 || value.rateLimitPerMinute > 10000) {
+    if (typeof value.rateLimitPerMinute !== 'number' || isNaN(value.rateLimitPerMinute) || value.rateLimitPerMinute < 1 || value.rateLimitPerMinute > 10000) {
       errors.push(err('config.rateLimitPerMinute', 'rateLimitPerMinute must be a number between 1 and 10000'))
     }
   }
 
   // maxConcurrentRequests
   if (value.maxConcurrentRequests !== undefined) {
-    if (typeof value.maxConcurrentRequests !== 'number' || value.maxConcurrentRequests < 1 || value.maxConcurrentRequests > 1000) {
+    if (typeof value.maxConcurrentRequests !== 'number' || isNaN(value.maxConcurrentRequests) || value.maxConcurrentRequests < 1 || value.maxConcurrentRequests > 1000) {
       errors.push(err('config.maxConcurrentRequests', 'maxConcurrentRequests must be a number between 1 and 1000'))
     }
   }
@@ -653,7 +649,7 @@ function validateConfig(value: unknown): ValidationError[] {
 
   // timeout
   if (value.timeout !== undefined) {
-    if (typeof value.timeout !== 'number' || value.timeout < 1 || value.timeout > 3600) {
+    if (typeof value.timeout !== 'number' || isNaN(value.timeout) || value.timeout < 1 || value.timeout > 3600) {
       errors.push(err('config.timeout', 'timeout must be a number between 1 and 3600 seconds'))
     }
   }
@@ -711,6 +707,95 @@ function validateStats(value: unknown): ValidationError[] {
     } else if (value.hourlyActivity.length !== 24 && value.hourlyActivity.length !== 0) {
       errors.push(err('stats.hourlyActivity', 'hourlyActivity must have exactly 24 entries'))
     }
+  }
+
+  return errors
+}
+
+function validateProjectFiles(value: unknown): ValidationError[] {
+  const errors: ValidationError[] = []
+
+  if (!isArray(value)) {
+    return [err('projectFiles', 'Project files must be an array')]
+  }
+
+  if (value.length > MAX_PROJECT_FILES_COUNT) {
+    errors.push(err('projectFiles', `Maximum ${MAX_PROJECT_FILES_COUNT} project files allowed`))
+  }
+
+  let totalContentLength = 0
+  for (let i = 0; i < Math.min(value.length, MAX_PROJECT_FILES_COUNT); i++) {
+    const file = value[i]
+    if (!isObject(file)) {
+      errors.push(err(`projectFiles[${i}]`, `Project file at index ${i} must be an object`))
+      continue
+    }
+
+    // path — required, must be a non-empty string, no path traversal
+    if (!file.path || !isString(file.path)) {
+      errors.push(err(`projectFiles[${i}].path`, 'File path is required'))
+    } else {
+      if (file.path.length > MAX_PROJECT_FILE_PATH_LENGTH) {
+        errors.push(err(`projectFiles[${i}].path`, `File path must be ${MAX_PROJECT_FILE_PATH_LENGTH} characters or less`))
+      }
+      // Path traversal check
+      if (file.path.includes('..') || file.path.startsWith('/') || /^[a-zA-Z]:/.test(file.path)) {
+        errors.push(err(`projectFiles[${i}].path`, 'File path contains invalid traversal patterns'))
+      }
+      // Empty path check
+      if (file.path.trim().length === 0) {
+        errors.push(err(`projectFiles[${i}].path`, 'File path cannot be empty'))
+      }
+    }
+
+    // content — required, must be a string
+    if (file.content === undefined || file.content === null || !isString(file.content)) {
+      errors.push(err(`projectFiles[${i}].content`, 'File content is required and must be a string'))
+    } else {
+      if (file.content.length > MAX_PROJECT_FILE_CONTENT_LENGTH) {
+        errors.push(err(`projectFiles[${i}].content`, `File content must be ${MAX_PROJECT_FILE_CONTENT_LENGTH} characters or less`))
+      }
+      totalContentLength += file.content.length
+    }
+
+    // size — optional, must be a number if provided
+    if (file.size !== undefined && file.size !== null) {
+      if (typeof file.size !== 'number' || file.size < 0 || !isFinite(file.size)) {
+        errors.push(err(`projectFiles[${i}].size`, 'File size must be a non-negative number'))
+      }
+    }
+  }
+
+  // Total content size check
+  if (totalContentLength > MAX_PROJECT_FILES_TOTAL_CONTENT_LENGTH) {
+    errors.push(err('projectFiles', `Total project files content must be ${MAX_PROJECT_FILES_TOTAL_CONTENT_LENGTH} characters or less`))
+  }
+
+  return errors
+}
+
+function validateEntryPoint(value: unknown): ValidationError[] {
+  const errors: ValidationError[] = []
+
+  if (!isString(value)) {
+    return [err('entryPoint', 'Entry point must be a string')]
+  }
+
+  // Path traversal check
+  if (value.includes('..')) {
+    errors.push(err('entryPoint', 'Entry point must not contain path traversal (..)'))
+  }
+  // Absolute path check
+  if (value.startsWith('/') || /^[a-zA-Z]:/.test(value)) {
+    errors.push(err('entryPoint', 'Entry point must be a relative path'))
+  }
+  // Length check
+  if (value.length > MAX_PROJECT_FILE_PATH_LENGTH) {
+    errors.push(err('entryPoint', `Entry point must be ${MAX_PROJECT_FILE_PATH_LENGTH} characters or less`))
+  }
+  // Empty check
+  if (value.trim().length === 0) {
+    errors.push(err('entryPoint', 'Entry point cannot be empty'))
   }
 
   return errors

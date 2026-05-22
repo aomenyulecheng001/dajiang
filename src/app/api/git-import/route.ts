@@ -9,18 +9,32 @@ import { getCurrentUserId } from '@/lib/api-helpers'
 // ─── Configuration ──────────────────────────────────────────────────────────
 
 const SKIP_PATTERNS = [
-  'node_modules/', '.git/', 'package-lock.json', 'yarn.lock',
-  '.DS_Store', 'Thumbs.db', 'bun.lockb',
+  'node_modules/', '.git/', 'package-lock.json', 'yarn.lock', 'bun.lockb',
+  '.DS_Store', 'Thumbs.db', '__pycache__/', '.venv/', 'venv/', '.tox/',
+  '.mypy_cache/', '.pytest_cache/', 'dist/', 'build/', '.next/', '.nuxt/',
 ]
 
 const BINARY_EXTENSIONS = new Set([
-  'png', 'jpg', 'jpeg', 'gif', 'svg', 'ico', 'bmp', 'webp',
+  // Images
+  'png', 'jpg', 'jpeg', 'gif', 'svg', 'ico', 'bmp', 'webp', 'tiff', 'tif', 'avif',
+  // Fonts
   'woff', 'woff2', 'ttf', 'eot', 'otf',
-  'gz', 'tar', 'zip', 'bz2', 'xz', '7z', 'rar',
-  'mp3', 'mp4', 'wav', 'avi', 'mov', 'mkv',
-  'exe', 'dll', 'so', 'dylib', 'bin',
-  'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx',
-  'sqlite', 'db',
+  // Archives
+  'gz', 'tar', 'zip', 'bz2', 'xz', '7z', 'rar', 'tgz',
+  // Media
+  'mp3', 'mp4', 'wav', 'avi', 'mov', 'mkv', 'flac', 'ogg', 'wma', 'wmv', 'webm',
+  // Executables & binaries
+  'exe', 'dll', 'so', 'dylib', 'bin', 'app', 'dmg', 'iso', 'img',
+  // Documents (binary formats)
+  'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'odt', 'ods', 'odp',
+  // Databases
+  'sqlite', 'sqlite3', 'db',
+  // Java
+  'jar', 'class',
+  // Python compiled
+  'pyc', 'pyo', 'pyd',
+  // Lock files (binary)
+  'lockb',
 ])
 
 const MAX_FILE_SIZE = 1 * 1024 * 1024      // 1MB per file
@@ -508,6 +522,13 @@ export async function POST(request: NextRequest) {
       return NextResponse.json(
         { success: false, error: 'SSH authentication failed. The server may not have the required SSH key configured. Please use HTTPS URL instead.' },
         { status: 403 },
+      )
+    }
+
+    if (message.includes('Total repository size exceeds')) {
+      return NextResponse.json(
+        { success: false, error: 'Repository is too large to import. Consider using a ZIP upload of just the bot source files.' },
+        { status: 413 },
       )
     }
 

@@ -77,15 +77,17 @@ export function ConfigTab() {
       toast.error(t('configTab.invalidNumber'))
       return
     }
-    if (field === 'timeout' && num > 300) {
+    // FIX: Align frontend limits with backend validation (validation.ts)
+    // Backend: timeout max 3600, rateLimitPerMinute max 10000, maxConcurrentRequests max 1000
+    if (field === 'timeout' && num > 3600) {
       toast.error(t('configTab.timeoutMax'))
       return
     }
-    if (field === 'rateLimitPerMinute' && num > 1000) {
+    if (field === 'rateLimitPerMinute' && num > 10000) {
       toast.error(t('configTab.rateLimitMax'))
       return
     }
-    if (field === 'maxConcurrentRequests' && num > 100) {
+    if (field === 'maxConcurrentRequests' && num > 1000) {
       toast.error(t('configTab.maxConcurrentMax'))
       return
     }

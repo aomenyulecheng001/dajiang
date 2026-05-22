@@ -1,4 +1,4 @@
-import { access, rm } from 'fs/promises'
+import { rm } from 'fs/promises'
 import { join } from 'path'
 import { Server } from 'socket.io'
 import type { BotProcess, BotConfig, DeployStage } from './types'
@@ -204,7 +204,10 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
         bot.logBuffer = []
         bot.restartCount = 0 // Reset restart count on manual start
         await startBotProcess(botId)
-      } else if (!bot) {
+      } else if (bot) {
+        // FIX: Provide feedback when bot is not in a startable state (e.g., 'starting', 'running')
+        socket.emit('bot:status', { botId, status: bot.status, error: `Bot is ${bot.status}, cannot start` })
+      } else {
         socket.emit('bot:status', { botId, status: 'error', error: 'Bot not found. Please deploy first.' })
       }
     })
@@ -302,17 +305,11 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
           return
         }
         const botDir = getBotDir(botId)
-        try {
-          await access(botDir).then(() => rm(botDir, { recursive: true, force: true })).catch(() => {})
-        } catch { /* ignore */ }
-        const configPath = join(CONFIG_DIR, `${botId}.json`)
-        try {
-          await access(configPath).then(() => rm(configPath, { force: true })).catch(() => {})
-        } catch { /* ignore */ }
-        const logPath = join(LOGS_DIR, `${botId}.log`)
-        try {
-          await access(logPath).then(() => rm(logPath, { force: true })).catch(() => {})
-        } catch { /* ignore */ }
+        await rm(botDir, { recursive: true, force: true }).catch(() => {})
+        await rm(join(CONFIG_DIR, `${botId}.json`), { force: true }).catch(() => {})
+        await rm(join(LOGS_DIR, `${botId}.log`), { force: true }).catch(() => {})
+        // FIX: Also delete .running marker file to prevent ghost auto-start on service restart
+        await rm(join(CONFIG_DIR, `${botId}.running`), { force: true }).catch(() => {})
         botProcesses.delete(botId)
         deployStatus.delete(botId)
         // Clean up tracking sets to prevent memory leak and stale state
@@ -546,12 +543,12 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
           const botDir = getBotDir(botId)
           const configPath = join(CONFIG_DIR, `${botId}.json`)
           const logPath = join(LOGS_DIR, `${botId}.log`)
+          const runningPath = join(CONFIG_DIR, `${botId}.running`)
 
-          try {
-            await access(botDir).then(() => rm(botDir, { recursive: true, force: true })).catch(() => {})
-            await access(configPath).then(() => rm(configPath, { force: true })).catch(() => {})
-            await access(logPath).then(() => rm(logPath, { force: true })).catch(() => {})
-          } catch { /* ignore cleanup errors */ }
+          await rm(botDir, { recursive: true, force: true }).catch(() => {})
+          await rm(configPath, { force: true }).catch(() => {})
+          await rm(logPath, { force: true }).catch(() => {})
+          await rm(runningPath, { force: true }).catch(() => {})
 
           // Remove from memory
           botProcesses.delete(botId)
@@ -561,6 +558,8 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
           memoryKilledSet.delete(botId)
 
           console.log(`[PM2:Delete] ${botId} fully removed (memory + disk)`)
+          // FIX: Broadcast bot:deleted to all clients (not just the requester)
+          io.emit('bot:deleted', { botId })
           callback?.({ success: true })
         }
 
