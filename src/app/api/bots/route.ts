@@ -13,7 +13,7 @@ function generateWebhookSecret(): string {
 /**
  * P0-1 OPT: Fields to select in list query.
  * Excludes heavy fields that are only needed in detail view:
- *   - projectFiles (up to 5MB per bot)
+ *   - projectFiles (up to 25MB per bot)
  *   - code (redundant with codeBlocks)
  *   - envVars (expensive decryption, only needed in detail view)
  */
@@ -121,13 +121,13 @@ export async function POST(request: Request) {
       if (!text.trim()) {
         return NextResponse.json({ error: 'Request body is empty' }, { status: 400 })
       }
-      // Reject payloads larger than 5MB (projectFiles from Git/ZIP can be large)
-      // BUG FIX: Use Buffer.byteLength() instead of text.length.
+      // Reject payloads larger than 25MB (projectFiles from Git/ZIP can be large)
+      // Use Buffer.byteLength() instead of text.length.
       // text.length counts UTF-16 code units, not actual bytes.
       // For multi-byte content (Chinese descriptions, base64 customIcon),
       // the actual size could be 2-3× the character count.
-      if (Buffer.byteLength(text, 'utf-8') > 5_000_000) {
-        return NextResponse.json({ error: 'Request body too large (max 5MB)' }, { status: 413 })
+      if (Buffer.byteLength(text, 'utf-8') > 25_000_000) {
+        return NextResponse.json({ error: 'Request body too large (max 25MB)' }, { status: 413 })
       }
       bot = JSON.parse(text)
     } catch {

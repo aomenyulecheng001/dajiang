@@ -138,8 +138,8 @@ export async function PUT(
       if (!text.trim()) {
         return NextResponse.json({ error: 'Request body is empty' }, { status: 400 })
       }
-      if (Buffer.byteLength(text, 'utf-8') > 5_000_000) {
-        return NextResponse.json({ error: 'Request body too large (max 5MB)' }, { status: 413 })
+      if (Buffer.byteLength(text, 'utf-8') > 25_000_000) {
+        return NextResponse.json({ error: 'Request body too large (max 25MB)' }, { status: 413 })
       }
       bot = JSON.parse(text)
     } catch {
@@ -271,8 +271,8 @@ export async function PATCH(
       if (!text.trim()) {
         return NextResponse.json({ error: 'Request body is empty' }, { status: 400 })
       }
-      if (Buffer.byteLength(text, 'utf-8') > 5_000_000) {
-        return NextResponse.json({ error: 'Request body too large (max 5MB)' }, { status: 413 })
+      if (Buffer.byteLength(text, 'utf-8') > 25_000_000) {
+        return NextResponse.json({ error: 'Request body too large (max 25MB)' }, { status: 413 })
       }
       body = JSON.parse(text)
     } catch {

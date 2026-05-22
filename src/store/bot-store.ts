@@ -791,9 +791,15 @@ export const useBotStore = create<BotStore>((set, get) => ({
     persistNewBot(newBot).then((serverId) => {
       clearTimeout(creationTimeout)
       if (!serverId) {
-        // BUG FIX: Notify user when bot creation fails so they know the bot
-        // was not persisted. The bot remains in the local store for UX continuity,
-        // but the user should be aware it may be lost on refresh.
+        // Notify user and remove the ghost bot from the local store.
+        // The bot was never created in the DB (e.g., API returned 413),
+        // so keeping it in the store causes a 404 on any subsequent
+        // delete or update attempt.
+        set((state) => ({
+          bots: state.bots.filter(b => b.id !== clientUUID),
+          ...(state.selectedBotId === clientUUID ? { selectedBotId: null } : {}),
+        }))
+        botSnapshots.delete(clientUUID)
         const locale = useI18nStore.getState().locale
         const t = (key: string, params?: Record<string, string | number>) => getTranslation(locale, key as any, params)
         toast.error(t('common.saveFailed'), { description: t('common.saveFailedDesc') })
