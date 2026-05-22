@@ -837,39 +837,11 @@ export function CreateBotDialog() {
     // BUG FIX: Removed artificial 500ms delay — no functional benefit
 
     if (isZipMode) {
-      // ZIP import
+      // ZIP import — projectFiles contains all files including code.
+      // Don't generate codeBlocks to avoid duplicating file content in the API payload.
+      // The bot-runner deploys from projectFiles, and the code tab renders
+      // ProjectFilesSection for viewing/editing.
       const lang = zipDetectedLang || detectLanguageFromFiles(projectFiles)
-
-      // Build codeBlocks from project files
-      const codeFiles = projectFiles.filter((f) => {
-        const ext = f.path.split('.').pop()?.toLowerCase()
-        return ['js', 'mjs', 'cjs', 'ts', 'tsx', 'mts', 'py'].includes(ext || '')
-      })
-
-      // If entryPoint is specified, put it first and mark as active
-      const sortedFiles = entryPoint
-        ? [
-            ...codeFiles.filter((f) => f.path === entryPoint),
-            ...codeFiles.filter((f) => f.path !== entryPoint),
-          ]
-        : codeFiles
-
-      const codeBlocks = sortedFiles.length > 0
-        ? sortedFiles.map((f, i) => {
-            const ext = f.path.split('.').pop()?.toLowerCase()
-            const blockLang = ext === 'py' ? 'python' : ext === 'ts' || ext === 'tsx' ? 'typescript' : 'javascript'
-            return {
-              id: generateUUID(),
-              name: f.path.split('/').pop() || f.path,
-              type: 'handler' as const,
-              code: f.content,
-              language: blockLang as BotLanguage | 'json',
-              isActive: i === 0,
-              lastModified: new Date().toISOString(),
-              description: f.path,
-            }
-          })
-        : []
 
       try {
         addBot({
@@ -879,7 +851,7 @@ export function CreateBotDialog() {
           template: 'custom',
           emoji: importEmoji,
           customIcon: importCustomIcon,
-          codeBlocks,
+          codeBlocks: [],
           dependencies: zipDeps.length > 0 ? zipDeps : undefined,
           envVars: zipEnvVars.length > 0 ? zipEnvVars : undefined,
           projectFiles,

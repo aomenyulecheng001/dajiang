@@ -849,6 +849,26 @@ export const useBotStore = create<BotStore>((set, get) => ({
   deleteBot: async (id) => {
     const current = get()
     const botName = current.bots.find((b) => b.id === id)?.name ?? 'Bot'
+
+    // If the bot was never persisted to the DB (e.g., creation failed with 413),
+    // just remove it from local store — no API call needed.
+    if (!dbBotIds.has(id)) {
+      set({
+        bots: current.bots.filter((b) => b.id !== id),
+        ...(current.selectedBotId === id && { selectedBotId: null }),
+      })
+      botSnapshots.delete(id)
+      logDedupKeys.delete(id)
+      lastLogFetchTime.delete(id)
+      errorToastCooldown.delete(id)
+      const pendingTimer = persistTimers.get(id)
+      if (pendingTimer) {
+        clearTimeout(pendingTimer)
+        persistTimers.delete(id)
+      }
+      return
+    }
+
     set({
       bots: current.bots.filter((b) => b.id !== id),
       ...(current.selectedBotId === id && { selectedBotId: null }),
