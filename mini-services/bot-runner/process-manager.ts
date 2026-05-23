@@ -486,7 +486,7 @@ export async function startBotProcess(
     // FIX: Windows may need .cmd extension for spawn
     command = process.platform === 'win32' ? 'tsx.cmd' : 'tsx'
     const scriptFile = safeEp && safeEp.endsWith('.ts') ? safeEp : 'index.ts'
-    args = [scriptFile]
+    args = ['--max-old-space-size=256', scriptFile]
   } else {
     // JavaScript: use Node.js directly. No Bun spawn interception since
     // bot-runner runs under Node.js (via PM2 --interpreter tsx).

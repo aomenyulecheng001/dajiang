@@ -263,6 +263,27 @@ export async function generateBotFiles(botId: string, config: BotConfig): Promis
       writtenFiles.push('.env')
     }
 
+    // Generate tsconfig.json for TypeScript bots so tsc --noEmit
+    // doesn't run unbounded on low-memory VPS.
+    if (config.language === 'typescript') {
+      const tsconfig = {
+        compilerOptions: {
+          target: 'ES2022',
+          module: 'commonjs',
+          moduleResolution: 'node',
+          noEmit: true,
+          skipLibCheck: true,
+          strict: false,
+          esModuleInterop: true,
+          resolveJsonModule: true,
+        },
+        include: ['*.ts', '**/*.ts'],
+        exclude: ['node_modules'],
+      }
+      await writeFile(join(botDir, 'tsconfig.json'), JSON.stringify(tsconfig, null, 2), 'utf-8')
+      writtenFiles.push('tsconfig.json')
+    }
+
     // P2-BR-9 FIX: Use async addDotenvSupportAsync
     await addDotenvSupportAsync(botDir, config.language, config.entryPoint)
 
