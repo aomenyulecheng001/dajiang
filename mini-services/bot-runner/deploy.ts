@@ -150,6 +150,27 @@ export async function generateBotFiles(botId: string, config: BotConfig): Promis
       writtenFiles.push('.env')
     }
 
+    // Generate a minimal tsconfig.json for TypeScript bots so tsc --noEmit
+    // doesn't hang on large node_modules or run out of memory on low-RAM VPS.
+    if (config.language === 'typescript') {
+      const tsconfig = {
+        compilerOptions: {
+          target: 'ES2022',
+          module: 'commonjs',
+          moduleResolution: 'node',
+          noEmit: true,
+          skipLibCheck: true,
+          strict: false,
+          esModuleInterop: true,
+          resolveJsonModule: true,
+        },
+        include: ['*.ts', '**/*.ts'],
+        exclude: ['node_modules'],
+      }
+      await writeFile(join(botDir, 'tsconfig.json'), JSON.stringify(tsconfig, null, 2), 'utf-8')
+      writtenFiles.push('tsconfig.json')
+    }
+
     // P2-BR-9 FIX: Use async addDotenvSupportAsync
     await addDotenvSupportAsync(botDir, config.language, config.entryPoint)
 
@@ -658,8 +679,10 @@ export async function deployBot(
       await new Promise<void>((resolvePromise, reject) => {
         const child = spawn(tscCmd, tscArgs, {
           cwd: botDir,
-          timeout: 60000,
+          timeout: 30000,
           stdio: ['pipe', 'pipe', 'pipe'],
+          // Kill entire process group on timeout so tsc (grandchild) isn't orphaned
+          killSignal: 'SIGKILL',
         })
         let tsBuffer = ''
         child.stdout?.on('data', (data: Buffer) => {
