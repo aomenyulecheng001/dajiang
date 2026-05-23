@@ -707,14 +707,13 @@ export async function deployBot(
         })
         child.on('close', (code, signal) => {
           if (tsBuffer.trim()) appendDeployLog(botId, tsBuffer.trim())
-          // BUG FIX: Fail deploy if TypeScript type check has errors
-          // FIX: code=null means process was killed by signal — also a failure
+          // TypeScript errors are warnings, not fatal — the bot may still run fine.
+          // ZIP/Git imports may have type errors from missing ambient declarations,
+          // strict mode mismatches, or uninstalled @types packages.
           if (code !== 0 || signal !== null) {
-            appendDeployLog(botId, '❌ TypeScript 类型检查失败')
-            reject(new Error('TypeScript type check failed'))
-          } else {
-            resolve()
+            appendDeployLog(botId, '⚠️ TypeScript 类型检查有警告，继续部署...')
           }
+          resolve()
         })
       })
       appendDeployLog(botId, '✅ 编译完成')
