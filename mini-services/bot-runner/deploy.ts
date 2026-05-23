@@ -676,7 +676,7 @@ export async function deployBot(
         tscCmd = 'npx'
         tscArgs = ['tsc', '--noEmit']
       }
-      await new Promise<void>((resolvePromise, reject) => {
+      await new Promise<void>((resolve, reject) => {
         const child = spawn(tscCmd, tscArgs, {
           cwd: botDir,
           timeout: 30000,
