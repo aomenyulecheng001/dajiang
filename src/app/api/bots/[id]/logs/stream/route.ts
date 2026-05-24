@@ -3,6 +3,7 @@ import { NextResponse } from 'next/server'
 import { validateBotId } from '@/lib/validation'
 import { getCurrentUserId, isBotOwner } from '@/lib/api-helpers'
 import { eventBus } from '@/lib/event-bus'
+import { logger } from '@/lib/logger'
 
 /**
  * GET /api/bots/[id]/logs/stream
@@ -88,7 +89,7 @@ export async function GET(
     const resolved = await params
     id = resolved.id
   } catch (error) {
-    console.error('[SSE] Error resolving params:', error)
+    logger.error('log-stream', 'Error resolving params', error instanceof Error ? error.message : String(error))
     return new Response(JSON.stringify({ error: 'Invalid request' }), {
       status: 400,
       headers: { 'Content-Type': 'application/json' },
@@ -147,7 +148,7 @@ export async function GET(
       }
     }
   } catch (error) {
-    console.error(`[SSE] DB error checking ownership for bot ${id}:`, error)
+    logger.error('log-stream', `DB error checking ownership for bot ${id}`, error instanceof Error ? error.message : String(error))
     activeSSEConnections--
     const uc = activeSSEConnectionsByUser.get(userId) || 1
     activeSSEConnectionsByUser.set(userId, Math.max(0, uc - 1))
@@ -191,8 +192,8 @@ export async function GET(
       decrementCounters()
       cleanup()
     })
-  } catch {
-    // signal.addEventListener may not be available in all runtimes
+  } catch (e) {
+    logger.error('log-stream', `Failed to register abort listener for ${id}`, e instanceof Error ? e.message : e)
   }
 
   const stream = new ReadableStream({
@@ -270,7 +271,7 @@ export async function GET(
             })
           }
         } catch (error) {
-          console.error(`[SSE] Error fetching initial logs for ${id}:`, error)
+          logger.error('log-stream', `Error fetching initial logs for ${id}`, error instanceof Error ? error.message : String(error))
         }
 
         // P2-BUG-4 FIX: Start subscription AFTER initial fetch completes.
@@ -336,7 +337,7 @@ export async function GET(
               })
             }
           } catch (error) {
-            console.error(`[SSE] Fallback poll error for ${id}:`, error)
+            logger.error('log-stream', `Fallback poll error for ${id}`, error instanceof Error ? error.message : String(error))
           }
         }, FALLBACK_POLL_INTERVAL)
         pendingTimers.poll = fallbackTimer

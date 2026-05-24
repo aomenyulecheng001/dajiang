@@ -17,6 +17,7 @@ import {
   writeDepsHashAsync,
   computeDepsDiff,
 } from './utils'
+import { logger } from './logger'
 import { MAX_LOG_LINES, appendDeployLog } from './log-manager'
 import { io } from './socket'
 import { cancelRestartTimer, markIntentionalStop, clearIntentionalStop } from './process-manager'
@@ -645,15 +646,15 @@ export async function deployBot(
     switch (installResult.status) {
       case 'skipped':
         appendDeployLog(botId, '⏭️ 依赖未变更，跳过安装')
-        console.log(`[Deploy] ${botId}: ⏭️ 依赖未变更，跳过安装`)
+        logger.info('deploy', `${botId}: 依赖未变更，跳过安装`)
         break
       case 'incremental':
         appendDeployLog(botId, `✅ 增量安装完成: +${installResult.addedCount} 新依赖${installResult.removedCount > 0 ? `, -${installResult.removedCount} 移除` : ''}`)
-        console.log(`[Deploy] ${botId}: ✅ 增量安装完成`)
+        logger.info('deploy', `${botId}: 增量安装完成`)
         break
       case 'full':
         appendDeployLog(botId, '✅ 依赖安装完成')
-        console.log(`[Deploy] ${botId}: ✅ 依赖安装完成 (完整安装)`)
+        logger.info('deploy', `${botId}: 依赖安装完成 (完整安装)`)
         break
     }
 

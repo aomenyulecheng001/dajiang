@@ -38,7 +38,7 @@ export function getTranslation(locale: Locale, key: TranslationKey, params?: Rec
   let result: unknown = translations[locale];
   for (const k of keys) {
     if (result && typeof result === 'object' && k in result) {
-      result = result[k];
+      result = (result as Record<string, unknown>)[k];
     } else {
       // Fallback to English if key not found in current locale
       let fallback: unknown = translations.en;

@@ -149,13 +149,29 @@ EOF
   echo_warn "  密码: ${AUTO_PASSWORD}"
   echo_warn "  ⚠️  请妥善保存以上信息！"
 else
-  echo_success ".env 文件已存在"
-  
+  echo_success ".env 文件已存在，验证并修复关键配置..."
+
+  # BUG FIX: Always ensure DATABASE_URL is an absolute path on re-deploy
+  DB_PATH="${PROJECT_DIR}/db/custom.db"
+  if grep -q "^DATABASE_URL=" .env; then
+    CURRENT_DB=$(grep "^DATABASE_URL=" .env | head -1)
+    if echo "$CURRENT_DB" | grep -q "file:\.\/"; then
+      echo_warn "DATABASE_URL 使用相对路径，修复为绝对路径..."
+      sed -i "s|^DATABASE_URL=.*$|DATABASE_URL=\"file:${DB_PATH}?journal_mode=WAL&synchronous=NORMAL&cache_size=-64000\"|" .env
+      echo_success "DATABASE_URL 已修复为绝对路径"
+    else
+      echo_info "DATABASE_URL 已经是绝对路径，跳过"
+    fi
+  else
+    echo "DATABASE_URL=\"file:${DB_PATH}?journal_mode=WAL&synchronous=NORMAL&cache_size=-64000\"" >> .env
+    echo_success "已添加 DATABASE_URL"
+  fi
+
   # 确保 PROJECT_ROOT 正确
   set -a
   source .env 2>/dev/null || true
   set +a
-  
+
   if [ -z "$PROJECT_ROOT" ] || [ "$PROJECT_ROOT" = '""' ]; then
     sed -i "s|^PROJECT_ROOT=.*$|PROJECT_ROOT=\"${PROJECT_DIR}\"|" .env
     echo_success "已添加 PROJECT_ROOT"
@@ -245,7 +261,10 @@ cp -r public .next/standalone/ 2>/dev/null || true
 cp .env .next/standalone/.env 2>/dev/null || true
 mkdir -p .next/standalone/prisma
 cp prisma/schema.prisma .next/standalone/prisma/ 2>/dev/null || true
-ln -sf "${PROJECT_DIR}/db" .next/standalone/db 2>/dev/null || cp -r db .next/standalone/db 2>/dev/null || true
+# 试创建 db 软链接到 standalone（DATABASE_URL 是绝对路径时不需要此链接）
+if [ ! -d .next/standalone/db ] && [ ! -L .next/standalone/db ]; then
+  ln -sf "${PROJECT_DIR}/db" .next/standalone/db 2>/dev/null || echo_warn "⚠️ 无法创建软链接，但 DATABASE_URL 是绝对路径，应用仍可正常工作"
+fi
 
 echo_success "构建产物验证通过"
 

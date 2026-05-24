@@ -135,7 +135,17 @@ export function EnvVarsTab() {
       const data = await res.json()
       const vars: Record<string, string> = {}
       for (const v of data.envVars || []) {
-        vars[v.id] = v.value
+        // BUG FIX: Use id as primary key, fall back to key when id is missing.
+        // Env var IDs can be lost by older PATCH requests that stripped them.
+        // When id is undefined, mapping by key ensures revealed values can still
+        // be matched via the key-based fallback in getDisplayValue.
+        if (v.id) {
+          vars[v.id] = v.value
+        }
+        // Also index by key for robustness
+        if (v.key) {
+          vars[`__key__${v.key}`] = v.value
+        }
       }
       setRevealedValues(vars)
     } catch {
@@ -227,8 +237,14 @@ export function EnvVarsTab() {
 
     // If revealed, use the server-decrypted value (accurate) rather than the
     // local store value (which may be the placeholder ••••••••••••)
-    if (isRevealed && revealedValues[envVar.id] !== undefined) {
-      return revealedValues[envVar.id]
+    // Try id-based lookup first, fall back to key-based (handles legacy DB data without ids)
+    const revealedById = revealedValues[envVar.id]
+    if (isRevealed && revealedById !== undefined) {
+      return revealedById
+    }
+    const revealedByKey = revealedValues[`__key__${envVar.key}`]
+    if (isRevealed && revealedByKey !== undefined) {
+      return revealedByKey
     }
 
     return envVar.value
@@ -239,8 +255,13 @@ export function EnvVarsTab() {
     const sensitive = isSensitiveKey(envVar.key)
     const shouldMask = envVar.isEncrypted || sensitive
     // For encrypted/sensitive vars, use the revealed value if available
+    // Try id-based lookup first, fall back to key-based
     if (shouldMask && revealedValues[envVar.id] !== undefined) {
       return revealedValues[envVar.id]
+    }
+    const revealedByKey2 = revealedValues[`__key__${envVar.key}`]
+    if (shouldMask && revealedByKey2 !== undefined) {
+      return revealedByKey2
     }
     // If we don't have the revealed value and it's masked, we can't edit properly
     // The user needs to reveal first — but we still return the stored value

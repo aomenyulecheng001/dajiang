@@ -1,12 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
+import { logger } from '@/lib/logger'
 
 let _internalSecretChecked = false
 function ensureInternalApiSecret(): void {
   if (_internalSecretChecked) return
   _internalSecretChecked = true
   if (!process.env.INTERNAL_API_SECRET && process.env.NODE_ENV === 'production') {
-    console.error('FATAL: INTERNAL_API_SECRET must be set (min 32 chars) in production.')
+    logger.error('token-version', 'FATAL: INTERNAL_API_SECRET must be set (min 32 chars) in production.')
     process.exit(1)
   }
 }
@@ -21,7 +22,7 @@ function ensureInternalApiSecret(): void {
  * The shared secret ensures that even if an attacker discovers this endpoint,
  * they cannot query arbitrary users' tokenVersion without knowing the secret.
  */
-export async function GET(request: NextRequest) {
+export async function POST(request: NextRequest) {
   ensureInternalApiSecret()
   // SECURITY FIX: Use shared secret instead of a trivially spoofable custom header.
   // The previous `X-Internal-Request: 1` header could be set by any external attacker.
@@ -31,7 +32,7 @@ export async function GET(request: NextRequest) {
   // SECURITY FIX (SEC-79): Removed secret length from log message to prevent
   // information leakage that could aid brute-force attacks.
   if (!internalSecret || internalSecret.length < 32) {
-    console.error('[token-version] INTERNAL_API_SECRET is not configured or too short (minimum 32 characters required)')
+    logger.error('token-version', 'INTERNAL_API_SECRET is not configured or too short (minimum 32 characters required)')
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
 
@@ -39,7 +40,7 @@ export async function GET(request: NextRequest) {
   // A secret like "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" passes the length check but
   // is trivially guessable, allowing attackers to query tokenVersion for any user.
   if (/^(.)\1{31,}$/.test(internalSecret)) {
-    console.error('[token-version] INTERNAL_API_SECRET is too weak (repeating characters). Use a cryptographically random secret.')
+    logger.error('token-version', 'INTERNAL_API_SECRET is too weak (repeating characters). Use a cryptographically random secret.')
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
 
@@ -58,7 +59,13 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
 
-  const userId = request.nextUrl.searchParams.get('userId')
+  let userId: string | null = null
+  try {
+    const body = await request.json()
+    userId = body.userId ?? null
+  } catch {
+    return NextResponse.json({ error: 'Invalid request body' }, { status: 400 })
+  }
   if (!userId || typeof userId !== 'string') {
     return NextResponse.json({ error: 'Missing userId' }, { status: 400 })
   }

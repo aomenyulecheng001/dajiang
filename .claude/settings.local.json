@@ -3,7 +3,17 @@
     "allow": [
       "Bash(npx tsc *)",
       "Bash(npx eslint *)",
-      "Bash(bunx tsc *)"
+      "Bash(bunx tsc *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(Get-ChildItem -Recurse -File \"C:\\\\Users\\\\ADMIN\\\\Desktop\\\\dajiang\\\\bot-factory\\\\mini-services\\\\bot-runner\")",
+      "Bash(Select-Object FullName)",
+      "Bash(Select-Object -First 40)",
+      "Bash(bun run *)",
+      "PowerShell(bun run *)",
+      "PowerShell(Get-Command *)",
+      "PowerShell(npx tsc --noEmit 2>&1)"
     ]
   }
 }

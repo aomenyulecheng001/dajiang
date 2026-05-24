@@ -20,6 +20,12 @@ dist
 prisma/data/*.db
 prisma/data/*.db-wal
 prisma/data/*.db-shm
+# Production database (DATABASE_URL=file:/path/to/db/custom.db)
+db/
+# data/ directory can contain the dev database
+data/*.db
+data/*.db-wal
+data/*.db-shm
 
 # Bot Runner runtime
 mini-services/bot-runner/bots

@@ -2,6 +2,7 @@
 
 import React from 'react'
 import { useI18nStore, type Locale } from '@/lib/i18n'
+import { logger } from '@/lib/logger'
 
 const tabErrorTexts: Record<Locale, { error: string; retry: string }> = {
   en: { error: 'This section encountered an error', retry: 'Try again' },
@@ -22,7 +23,7 @@ class TabErrorBoundary extends React.Component<
   }
 
   componentDidCatch(error: Error, info: React.ErrorInfo) {
-    console.error('[TabErrorBoundary]', error, info)
+    logger.error('tab-error-boundary', 'Tab error', { message: error instanceof Error ? error.message : String(error), componentStack: info.componentStack })
   }
 
   render() {

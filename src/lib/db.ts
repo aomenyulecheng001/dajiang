@@ -1,4 +1,5 @@
 import { PrismaClient } from '@prisma/client'
+import { logger } from '@/lib/logger'
 
 const globalForPrisma = globalThis as unknown as {
   prisma: PrismaClient | undefined
@@ -34,10 +35,19 @@ export async function applySqlitePragmas(): Promise<void> {
       await db.$queryRawUnsafe('PRAGMA journal_size_limit=67108864')
       await db.$queryRawUnsafe('PRAGMA synchronous=NORMAL')
       await db.$queryRawUnsafe('PRAGMA cache_size=-64000')
+    } catch (err) {
+      logger.error('db', 'Performance PRAGMAs failed — SQLite will use defaults.', err instanceof Error ? err.message : err)
+    }
+    // CRITICAL FIX: foreign_keys=ON is applied separately and fatally.
+    // Previously all PRAGMAs shared one try/catch — if journal_mode failed,
+    // foreign_keys was also skipped, silently disabling CASCADE deletes.
+    // Without foreign_keys, deleting a Bot leaves orphaned BotLog/BotMessage rows.
+    try {
       await db.$queryRawUnsafe('PRAGMA foreign_keys=ON')
     } catch (err) {
       _pragmaPromise = null
-      console.error('[DB] PRAGMA application failed — SQLite will use defaults. foreign_keys may be OFF, meaning CASCADE deletes will not work:', err instanceof Error ? err.message : err)
+      logger.error('db', 'FATAL: Could not enable foreign_keys. CASCADE deletes will not work.', err instanceof Error ? err.message : err)
+      throw new Error('[DB] FATAL: foreign_keys=ON failed — refusing to run without CASCADE support')
     }
   })()
   return _pragmaPromise
@@ -65,7 +75,7 @@ async function cleanupOldRecords(): Promise<void> {
       const result = await db.$executeRaw`DELETE FROM BotLog WHERE rowid IN (SELECT rowid FROM BotLog WHERE timestamp < ${cutoff} LIMIT ${BATCH_SIZE})`
       deleted = result
       totalLogs += deleted
-      if (deleted > 0) await new Promise(r => setTimeout(r, 50))
+      if (deleted > 0) await new Promise(r => setTimeout(r, 10))
     } while (deleted >= BATCH_SIZE)
 
     // Batch delete BotMessage records
@@ -73,17 +83,18 @@ async function cleanupOldRecords(): Promise<void> {
       const result = await db.$executeRaw`DELETE FROM BotMessage WHERE rowid IN (SELECT rowid FROM BotMessage WHERE timestamp < ${cutoff} LIMIT ${BATCH_SIZE})`
       deleted = result
       totalMsgs += deleted
-      if (deleted > 0) await new Promise(r => setTimeout(r, 50))
+      if (deleted > 0) await new Promise(r => setTimeout(r, 10))
     } while (deleted >= BATCH_SIZE)
 
     if (totalLogs > 0 || totalMsgs > 0) {
-      console.log(`[DB-Cleanup] Deleted ${totalLogs} logs, ${totalMsgs} messages older than ${LOG_RETENTION_DAYS} days`)
+      logger.info('db', `Deleted ${totalLogs} logs, ${totalMsgs} messages older than ${LOG_RETENTION_DAYS} days`)
       try {
         await db.$queryRawUnsafe('PRAGMA wal_checkpoint(PASSIVE)')
       } catch { /* Non-fatal: checkpoint may fail with active readers */ }
     }
-  } catch {
-    // Non-fatal: cleanup will retry on next interval
+  } catch (err) {
+    logger.warn('db', 'Log cleanup failed — will retry on next interval.',
+      err instanceof Error ? err.message : String(err))
   }
 }
 

@@ -1,8 +1,99 @@
-import { NextRequest } from 'next/server'
+import { NextRequest, NextResponse } from 'next/server'
 import { validateSessionAsync } from '@/lib/session'
 import { db } from '@/lib/db'
+import { ENCRYPTED_PLACEHOLDER, encryptEnvVarsOnSaveAsync } from '@/lib/crypto'
+import { logger } from '@/lib/logger'
+
+type EnvVarEntry = { key: string; value: string; isEncrypted?: boolean; id?: string; description?: string }
 
 const SESSION_COOKIE_NAME = 'session_token'
+
+/**
+ * DRY FIX: Shared JSON body parser with size limit protection.
+ * Previously duplicated 3x in POST/PUT/PATCH bot handlers with identical
+ * Buffer.byteLength check + JSON.parse + type validation logic.
+ *
+ * Returns the parsed body object, or null with a NextResponse error to return.
+ */
+export async function parseJsonBody(
+  request: Request,
+  maxSize = 25_000_000,
+): Promise<Record<string, unknown> | NextResponse> {
+  let text: string
+  try {
+    text = await request.text()
+  } catch {
+    return NextResponse.json(
+      { error: 'Failed to read request body' },
+      { status: 400 },
+    )
+  }
+  if (!text.trim()) {
+    return NextResponse.json({ error: 'Request body is empty' }, { status: 400 })
+  }
+  // Reject payloads larger than maxSize (default 25MB)
+  if (Buffer.byteLength(text, 'utf-8') > maxSize) {
+    return NextResponse.json(
+      { error: `Request body too large (max ${Math.round(maxSize / 1_000_000)}MB)` },
+      { status: 413 },
+    )
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return NextResponse.json(
+      { error: 'Invalid JSON in request body' },
+      { status: 400 },
+    )
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return NextResponse.json({ error: 'Request body must be a JSON object' }, { status: 400 })
+  }
+  return parsed as Record<string, unknown>
+}
+
+/**
+ * DRY FIX: Shared env var merge-and-encrypt logic, previously duplicated
+ * identically in PUT and PATCH handlers (~30 lines each).
+ *
+ * When the client sends masked placeholders (••••) for encrypted vars,
+ * this preserves the existing encrypted value from the database instead
+ * of encrypting the placeholder and destroying the real secret.
+ *
+ * Also preserves existing `id` and `description` fields when incoming
+ * entries lack them (by matching on `key`).
+ */
+export async function mergeAndEncryptEnvVars(
+  incomingEnvVars: EnvVarEntry[],
+  existingEnvVarsJson: string,
+): Promise<EnvVarEntry[]> {
+  const existingEnvVars = safeJsonParse(existingEnvVarsJson, []) as EnvVarEntry[]
+
+  const merged = incomingEnvVars.map((incoming) => {
+    if (incoming.value === ENCRYPTED_PLACEHOLDER && incoming.isEncrypted) {
+      const existing = existingEnvVars.find((e) => e.key === incoming.key)
+      if (existing && existing.isEncrypted) {
+        return { ...existing, ...incoming, value: existing.value }
+      }
+    }
+    if (!incoming.id) {
+      const existing = existingEnvVars.find((e) => e.key === incoming.key)
+      if (existing?.id) {
+        return { ...incoming, id: existing.id, description: incoming.description ?? existing.description }
+      }
+    }
+    return incoming
+  })
+
+  const needsReEncrypt = merged.filter(
+    (v) => !existingEnvVars.some(
+      (e) => e.key === v.key && e.value === v.value && v.isEncrypted,
+    ),
+  )
+
+  return needsReEncrypt.length > 0 ? await encryptEnvVarsOnSaveAsync(merged) : merged
+}
 
 export function getSecureClientIp(request: NextRequest): string {
   const trustedProxies = (process.env.TRUSTED_PROXIES || '').split(',').map(s => s.trim()).filter(Boolean)
@@ -110,7 +201,11 @@ export function serializeBotListResponse(bot: Record<string, unknown>): Record<s
   }
 }
 
-/** Safely parse a JSON string with a fallback value */
+/** Safely parse a JSON string with a fallback value.
+ *  SECURITY FIX: Redacts sensitive data (tokens, secrets, keys) from the
+ *  error preview before logging. Previously the raw first 100 characters
+ *  of failed JSON were logged, which could include plaintext BOT_TOKEN values
+ *  when envVars or config JSON parsing failed. */
 export function safeJsonParse<T>(str: string | null | undefined, fallback: T, fieldName?: string): T {
   if (!str) return fallback
   try {
@@ -118,7 +213,8 @@ export function safeJsonParse<T>(str: string | null | undefined, fallback: T, fi
   } catch (e) {
     const name = fieldName || 'unknown'
     const preview = str.length > 100 ? str.slice(0, 100) + '...' : str
-    console.warn(`[safeJsonParse] Failed to parse JSON field "${name}" (length: ${str.length}, preview: "${preview}"): ${e instanceof Error ? e.message : e}`)
+    const redacted = preview.replace(/(["']?(?:BOT_TOKEN|TELEGRAM_BOT_TOKEN|token|secret|password|api_key|apikey|auth)["']?\s*[:=]\s*["'])([^"']+)(["'])/gi, '$1***REDACTED***$3')
+    logger.warn('api-helpers', `Failed to parse JSON field "${name}" (length: ${str.length}, preview: "${redacted}")`, e instanceof Error ? e.message : e)
     return fallback
   }
 }

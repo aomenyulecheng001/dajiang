@@ -3,6 +3,7 @@ import { updateUsername } from '@/lib/auth'
 import { validateSessionAsync } from '@/lib/session'
 import { db } from '@/lib/db'
 import { extractToken, isSecureRequest } from '@/lib/api-helpers'
+import { logger } from '@/lib/logger'
 
 export async function POST(request: NextRequest) {
   try {
@@ -80,7 +81,7 @@ export async function POST(request: NextRequest) {
     // any inconsistency and return a clear error instead of "User not found".
     const account = await db.account.findUnique({ where: { id: session.userId } })
     if (!account) {
-      console.warn('[Auth] Update account: session user not found in DB')
+      logger.warn('update-account', 'Update account: session user not found in DB')
       return NextResponse.json(
         { error: 'Session is invalid — please log in again' },
         { status: 401 }
@@ -116,7 +117,7 @@ export async function POST(request: NextRequest) {
 
     return response
   } catch (error) {
-    console.error('[Auth] Update account error:', error)
+    logger.error('update-account', 'Update account error', error instanceof Error ? error.message : String(error))
     return NextResponse.json(
       { error: 'Internal server error' },
       { status: 500 }

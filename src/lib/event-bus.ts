@@ -12,6 +12,8 @@
  *   SSE endpoint              →  eventBus.subscribe(`bot:${id}`, handler)
  */
 
+import { logger } from '@/lib/logger'
+
 type EventHandler = (event: string, data: unknown) => void
 
 interface Subscription {
@@ -48,14 +50,14 @@ class EventBus {
     let handlers = this.handlers.get(channel)
     if (!handlers) {
       if (this.handlers.size >= EventBus.MAX_CHANNELS) {
-        console.warn(`[EventBus] Max channels (${EventBus.MAX_CHANNELS}) reached, rejecting subscription to "${channel}"`)
+        logger.warn('event-bus', `Max channels (${EventBus.MAX_CHANNELS}) reached, rejecting subscription to "${channel}"`)
         return { unsubscribe: () => {}, active: false }
       }
       handlers = new Set()
       this.handlers.set(channel, handlers)
     }
     if (handlers.size >= EventBus.MAX_SUBSCRIBERS_PER_CHANNEL) {
-      console.warn(`[EventBus] Max subscribers (${EventBus.MAX_SUBSCRIBERS_PER_CHANNEL}) reached for channel "${channel}"`)
+      logger.warn('event-bus', `Max subscribers (${EventBus.MAX_SUBSCRIBERS_PER_CHANNEL}) reached for channel "${channel}"`)
       return { unsubscribe: () => {}, active: false }
     }
     handlers.add(handler)

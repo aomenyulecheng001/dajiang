@@ -3,6 +3,7 @@ import { NextResponse } from 'next/server'
 import { validateBotId } from '@/lib/validation'
 import { getCurrentUserId, isBotOwner } from '@/lib/api-helpers'
 import { eventBus } from '@/lib/event-bus'
+import { logger } from '@/lib/logger'
 
 const MAX_MESSAGE_LENGTH = 10000
 const MAX_SOURCE_LENGTH = 200
@@ -131,7 +132,7 @@ export async function POST(
       })),
     }, { status: 201 })
   } catch (error) {
-    console.error(`POST /api/bots/${id}/logs/batch error:`, error)
+    logger.error('log-batch', `POST /api/bots/${id}/logs/batch error`, error instanceof Error ? error.message : String(error))
     return NextResponse.json({ error: 'Failed to create log entries' }, { status: 500 })
   }
 }

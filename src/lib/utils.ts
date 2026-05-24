@@ -1,6 +1,7 @@
 import { clsx, type ClassValue } from "clsx"
 import { twMerge } from "tailwind-merge"
 import type { Locale } from "@/lib/i18n"
+import { logger } from '@/lib/logger'
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
@@ -208,7 +209,7 @@ export function generateUUID(): string {
     return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`
   }
   // Last resort fallback (very rare)
-  console.warn('[SECURITY] Using Math.random() for UUID generation - not cryptographically secure')
+  logger.warn('utils', 'Using Math.random() for UUID generation - not cryptographically secure')
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
     const r = (Math.random() * 16) | 0
     const v = c === 'x' ? r : (r & 0x3) | 0x8

@@ -15,6 +15,7 @@ import { NextResponse } from 'next/server'
 import { safeJsonParse, getCurrentUserId, isBotOwner } from '@/lib/api-helpers'
 import { validateBotId } from '@/lib/validation'
 import { decryptEnvVarsAsync } from '@/lib/crypto'
+import { logger } from '@/lib/logger'
 
 const REVEAL_RATE_LIMIT = { max: 10, windowMs: 60_000 }
 const MAX_REVEAL_RATE_ENTRIES = 5000
@@ -86,7 +87,7 @@ export async function GET(
     const decrypted = await decryptEnvVarsAsync(envVars)
 
     // P2-API-4 FIX: Log env-var reveal access for security audit
-    console.info(`[Reveal] Env vars revealed for bot: ${id}, sensitive count: ${decrypted.filter((v: { key: string }) => /token|secret|password|auth|apikey|api_key|private/i.test(v.key)).length}`)
+    logger.info('env-reveal', `Env vars revealed for bot: ${id}, sensitive count: ${decrypted.filter((v: { key: string }) => /token|secret|password|auth|apikey|api_key|private/i.test(v.key)).length}`)
 
     return NextResponse.json({
       botId: bot.id,
@@ -95,7 +96,7 @@ export async function GET(
       headers: { 'Cache-Control': 'private, no-store, no-cache, must-revalidate' },
     })
   } catch (error) {
-    console.error(`GET /api/bots/${id}/env-vars/reveal error:`, error)
+    logger.error('env-reveal', `GET /api/bots/${id}/env-vars/reveal error`, error instanceof Error ? error.message : String(error))
     return NextResponse.json({ error: 'Failed to reveal env vars' }, { status: 500 })
   }
 }

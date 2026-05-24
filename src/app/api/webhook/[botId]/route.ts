@@ -4,6 +4,7 @@ import { BOT_RUNNER_URL } from '@/lib/bot-runner-url'
 import { safeJsonParse } from '@/lib/api-helpers'
 import { redactSensitiveData, SECURE_ERROR_RESPONSES, timingSafeCompare } from '@/lib/security-utils'
 import { validateBotId } from '@/lib/validation'
+import { logger } from '@/lib/logger'
 
 // SEC FIX: Track consecutive webhook failures per bot for alerting.
 // Logs at ERROR level only when threshold is exceeded to avoid log flooding.
@@ -66,7 +67,7 @@ if (_failureCleanupTimer.unref) _failureCleanupTimer.unref()
 async function recordTelegramMessage(botId: string, update: Record<string, unknown>) {
   try {
     if (!checkWebhookMsgRate(botId)) {
-      console.warn(`[Webhook] Message rate limit exceeded for bot ${botId}`)
+      logger.warn('webhook', `Message rate limit exceeded for bot ${botId}`)
       return
     }
     // Support message, edited_message, and callback_query
@@ -101,7 +102,7 @@ async function recordTelegramMessage(botId: string, update: Record<string, unkno
     })
   } catch (e) {
     // Non-critical: don't fail the webhook if stats recording fails
-    console.warn(`[Webhook] Failed to record message for bot ${botId}:`, e instanceof Error ? e.message : e)
+    logger.warn('webhook', `Failed to record message for bot ${botId}`, e instanceof Error ? e.message : e)
   }
 }
 
@@ -183,7 +184,7 @@ export async function POST(
     const resolved = await params
     botId = resolved.botId
   } catch (error) {
-    console.error('[Webhook] Error resolving params:', error)
+    logger.error('webhook', 'Error resolving params', error instanceof Error ? error.message : String(error))
     return NextResponse.json({ ok: false, description: 'Invalid request' }, { status: 400 })
   }
 
@@ -203,7 +204,7 @@ export async function POST(
       // Bot has a webhookSecret configured — require matching header
       if (!secretFromHeader) {
         // FIX: Use generic error message that doesn't reveal bot existence
-        console.warn(`[Webhook] Rejected request: missing secret_token header`)
+        logger.warn('webhook', 'Rejected request: missing secret_token header')
         return NextResponse.json(
           SECURE_ERROR_RESPONSES.UNAUTHORIZED,
           { status: 401 }
@@ -211,7 +212,7 @@ export async function POST(
       }
       if (!timingSafeCompare(secretFromHeader, storedSecret)) {
         // FIX: Use generic error message that doesn't reveal bot existence
-        console.warn(`[Webhook] Rejected request: invalid secret_token`)
+        logger.warn('webhook', 'Rejected request: invalid secret_token')
         return NextResponse.json(
           SECURE_ERROR_RESPONSES.FORBIDDEN,
           { status: 403 }
@@ -220,7 +221,7 @@ export async function POST(
     }
     if (!storedSecret) {
       // FIX: Use generic error message that doesn't reveal bot existence
-      console.error(`[Webhook] REJECTED: Bot has no webhookSecret configured. All webhook requests must be authenticated.`)
+      logger.error('webhook', 'REJECTED: Bot has no webhookSecret configured. All webhook requests must be authenticated.')
       return NextResponse.json(
         SECURE_ERROR_RESPONSES.UNAUTHORIZED,
         { status: 401 }
@@ -228,6 +229,12 @@ export async function POST(
     }
 
     // Read the raw request body (Telegram sends JSON)
+    // SECURITY: Verify Content-Type before parsing
+    const contentType = request.headers.get('content-type') || ''
+    if (!contentType.includes('application/json')) {
+      return NextResponse.json({ ok: false, description: 'Unsupported Media Type' }, { status: 415 })
+    }
+
     // SECURITY: Limit body size to 100KB to prevent DoS via oversized payloads
     const MAX_WEBHOOK_BODY = 100 * 1024 // 100KB — generous for Telegram updates
     const body = await request.text()
@@ -247,9 +254,11 @@ export async function POST(
     }
 
     // Record message data for stats (fire-and-forget, non-blocking)
-    recordTelegramMessage(botId, parsed as Record<string, unknown>).catch(() => {})
+    recordTelegramMessage(botId, parsed as Record<string, unknown>).catch((e) => {
+      logger.warn('webhook', `Message recording failed for bot ${botId}`, e instanceof Error ? e.message : String(e))
+    })
 
-    console.log(`[Webhook] Forwarding update for bot ${botId}`)
+    logger.info('webhook', `Forwarding update for bot ${botId}`)
 
     // Forward to bot-runner service via HTTP
     try {
@@ -279,9 +288,9 @@ export async function POST(
         entry.lastFailureAt = Date.now()
         webhookFailureCounts.set(botId, entry)
         if (entry.count >= WEBHOOK_FAILURE_ALERT_THRESHOLD && entry.count % WEBHOOK_FAILURE_ALERT_THRESHOLD === 0) {
-          console.error(`[Webhook] ALERT: Bot ${botId} has ${entry.count} consecutive webhook failures (runner returned ${response.status}). Check bot-runner status!`)
+          logger.error('webhook', `ALERT: Bot ${botId} has ${entry.count} consecutive webhook failures (runner returned ${response.status}). Check bot-runner status!`)
         } else {
-        console.warn(`[Webhook] Bot-runner returned ${response.status} for bot ${botId} (${entry.count} consecutive): ${redactSensitiveData(errText)}`)
+        logger.warn('webhook', `Bot-runner returned ${response.status} for bot ${botId} (${entry.count} consecutive): ${redactSensitiveData(errText)}`)
       }
         return NextResponse.json(
           { ok: false, description: 'Bot-runner error, please retry' },
@@ -298,9 +307,9 @@ export async function POST(
       entry.lastFailureAt = Date.now()
       webhookFailureCounts.set(botId, entry)
       if (entry.count >= WEBHOOK_FAILURE_ALERT_THRESHOLD && entry.count % WEBHOOK_FAILURE_ALERT_THRESHOLD === 0) {
-        console.error(`[Webhook] ALERT: Bot ${botId} has ${entry.count} consecutive webhook failures (runner unreachable). Check bot-runner process!`)
+        logger.error('webhook', `ALERT: Bot ${botId} has ${entry.count} consecutive webhook failures (runner unreachable). Check bot-runner process!`)
       } else {
-        console.warn(`[Webhook] Failed to reach bot-runner for bot ${botId} (${entry.count} consecutive):`, fetchError instanceof Error ? fetchError.message : fetchError)
+        logger.warn('webhook', `Failed to reach bot-runner for bot ${botId} (${entry.count} consecutive)`, fetchError instanceof Error ? fetchError.message : fetchError)
       }
       return NextResponse.json(
         { ok: false, description: 'Bot-runner unreachable, please retry' },
@@ -313,9 +322,9 @@ export async function POST(
     entry.lastFailureAt = Date.now()
     webhookFailureCounts.set(botId, entry)
     if (entry.count >= WEBHOOK_FAILURE_ALERT_THRESHOLD && entry.count % WEBHOOK_FAILURE_ALERT_THRESHOLD === 0) {
-      console.error(`[Webhook] ALERT: Bot ${botId} has ${entry.count} consecutive processing errors.`)
+      logger.error('webhook', `ALERT: Bot ${botId} has ${entry.count} consecutive processing errors.`)
     } else {
-      console.error(`[Webhook] Error processing update for bot ${botId}:`, error)
+      logger.error('webhook', `Error processing update for bot ${botId}`, error instanceof Error ? error.message : String(error))
     }
     return NextResponse.json(
       { ok: false, description: 'Internal error, please retry' },
@@ -335,7 +344,7 @@ export async function GET(
     const resolved = await params
     botId = resolved.botId
   } catch (error) {
-    console.error('[Webhook GET] Error resolving params:', error)
+    logger.error('webhook', 'Error resolving params in GET', error instanceof Error ? error.message : String(error))
     return NextResponse.json({ ok: false, description: 'Invalid request' }, { status: 400 })
   }
 

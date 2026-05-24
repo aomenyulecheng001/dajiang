@@ -1,3 +1,4 @@
+import { logger } from './logger'
 import { createHash } from 'crypto'
 import { join, resolve, dirname } from 'path'
 import { access, readFile, writeFile, mkdir, chmod } from 'fs/promises'
@@ -158,7 +159,7 @@ export async function addDotenvSupportAsync(botDir: string, language: string, en
   // SECURITY FIX: Validate entryPoint doesn't contain path traversal
   // Block both Unix and Windows absolute paths, plus parent directory references
   if (entryPoint && (entryPoint.includes('..') || entryPoint.startsWith('/') || (process.platform === 'win32' && /^[a-zA-Z]:/.test(entryPoint)))) {
-    console.warn(`[Security] Blocked dangerous path in entryPoint: ${entryPoint}`)
+    logger.warn('utils', `Blocked dangerous path in entryPoint: ${entryPoint}`)
     entryPoint = undefined
   }
 

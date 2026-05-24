@@ -23,32 +23,27 @@ const MAX_TOTAL_SESSIONS = 1000
  * In production, this should be loaded from an environment variable.
  * For single-instance dev/demo, a fixed secret is acceptable.
  */
+import { generateHmacSecret, logMissingHmacSecret, isBuildPhase } from '@/lib/hmac-secret'
+import { logger } from '@/lib/logger'
+
+// ...
+
 function getHmacSecret(): string {
   if (typeof process !== 'undefined' && process.env && process.env.HMAC_SECRET) {
     return process.env.HMAC_SECRET
   }
-  const isBuildPhase = typeof process !== 'undefined' && (process.env.NEXT_PHASE === 'phase-production-build' || process.env.NEXT_PHASE === 'phase-export')
-  if (typeof process !== 'undefined' && process.env && process.env.NODE_ENV === 'production' && !isBuildPhase) {
-    console.error('FATAL: HMAC_SECRET environment variable is required for production.')
-    console.error('Generate one with: openssl rand -hex 32')
+  if (isBuildPhase()) {
+    // During build, a placeholder is fine — no tokens are validated
+    return generateHmacSecret()
+  }
+  if (typeof process !== 'undefined' && process.env && process.env.NODE_ENV === 'production') {
+    logMissingHmacSecret('node')
+    logger.error('session', 'Generate HMAC secret with: openssl rand -hex 32')
     process.exit(1)
   }
-  console.error('╔══════════════════════════════════════════════════════════════╗')
-  console.error('║  [FATAL] HMAC_SECRET environment variable is not set!      ║')
-  console.error('║  Session token signing requires a secure secret.           ║')
-  console.error('║  Set HMAC_SECRET in your environment before starting.      ║')
-  console.error('║  Example: HMAC_SECRET=$(openssl rand -hex 32)              ║')
-  console.error('╚══════════════════════════════════════════════════════════════╝')
-  console.error('')
-  // BUG FIX (BUG-104): When HMAC_SECRET is not set, the Edge Runtime
-  // (session-edge.ts) and Node.js Runtime (session.ts) run in separate
-  // isolates and would each generate their own random secret. Tokens
-  // signed by one runtime cannot be verified by the other, breaking the
-  // entire auth system. To fix this, we derive the fallback secret from
-  // a shared file (.hmac-secret) so both runtimes use the same value.
-  // SECURITY: This is still less secure than setting HMAC_SECRET explicitly
-  // (the file may be readable by other processes), but it prevents the
-  // cross-runtime mismatch that would silently break all auth.
+  logMissingHmacSecret('node')
+  // BUG FIX (BUG-104): When HMAC_SECRET is not set, derive fallback from
+  // .hmac-secret file so both Node.js and Edge runtimes share the same secret.
   try {
     const fs = require('fs') as typeof import('fs')
     const path = require('path') as typeof import('path')
@@ -60,28 +55,23 @@ function getHmacSecret(): string {
       const existing = fs.readFileSync(secretFile, 'utf-8').trim()
       if (existing.length >= 32) return existing
     }
-    // Generate and persist a new random secret
-    const bytes = crypto.getRandomValues(new Uint8Array(32))
-    const secret = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('')
+    const secret = generateHmacSecret()
     try {
       fs.writeFileSync(secretFile, secret + '\n', { mode: 0o600 })
     } catch {
-      // Write may fail (read-only filesystem, permissions, etc.)
-      // The secret is still usable in memory for this process
+      // Write may fail — secret is still usable in memory
     }
     return secret
   } catch {
-    // require('fs') may not be available in Edge Runtime.
-    // Fall through to pure random (Edge Runtime should have HMAC_SECRET set).
+    // require('fs') may not be available in Edge Runtime
   }
-  const bytes = crypto.getRandomValues(new Uint8Array(32))
-  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('')
+  return generateHmacSecret()
 }
 
 const HMAC_SECRET = getHmacSecret()
 
 if (typeof process !== 'undefined' && process.env && !process.env.HMAC_SECRET) {
-  console.error('[AUTH] ⚠️  HMAC_SECRET not set! Using random per-process secret. Tokens will not survive restarts. Set HMAC_SECRET env var for production.')
+  logger.error('session', 'HMAC_SECRET not set! Using random per-process secret. Tokens will not survive restarts. Set HMAC_SECRET env var for production.')
 }
 
 // ─── In-memory rate limiting for createSession (Node.js only) ───────────
@@ -111,7 +101,7 @@ async function persistRevocation(tokenHash: string, expiresAt: number): Promise<
   try {
     await appendFile(REVOCATION_FILE, `${tokenHash}:${expiresAt}\n`)
   } catch (error) {
-    console.error('[Session] CRITICAL: Failed to persist token revocation to disk. Revocation is in-memory only and will be lost on restart.', error instanceof Error ? error.message : 'unknown')
+    logger.error('session', 'CRITICAL: Failed to persist token revocation to disk. Revocation is in-memory only and will be lost on restart.', error instanceof Error ? error.message : 'unknown')
   }
 }
 
@@ -135,7 +125,7 @@ async function loadRevocations(): Promise<void> {
     // SECURITY: If we cannot load the revocation list, do NOT set revocationsLoaded=true.
     // This causes validateSessionAsync to reject all tokens (fail-closed) until
     // the file can be read. This is safer than silently accepting revoked tokens.
-    console.error('[Session] CRITICAL: Failed to load revocation list — all tokens will be rejected until this is resolved:', error instanceof Error ? error.message : 'unknown')
+    logger.error('session', 'CRITICAL: Failed to load revocation list — all tokens will be rejected until this is resolved.', error instanceof Error ? error.message : 'unknown')
     // Do NOT set revocationsLoaded = true here
   }
 }
@@ -182,7 +172,7 @@ const revocationCleanupInterval = setInterval(async () => {
     for (const [sig] of toRemove) {
       revokedTokenSignatures.delete(sig)
     }
-    console.warn('[Session] Pruned revocation list (size exceeded 50000)')
+    logger.warn('session', 'Pruned revocation list (size exceeded 50000)')
   }
   try {
     const validEntries: string[] = []
@@ -193,7 +183,7 @@ const revocationCleanupInterval = setInterval(async () => {
     }
     await writeFile(REVOCATION_FILE, validEntries.join('\n') + (validEntries.length > 0 ? '\n' : ''), 'utf-8')
   } catch (error) {
-    console.error('[Session] Failed to compact revocation file:', error instanceof Error ? error.message : 'unknown')
+    logger.error('session', 'Failed to compact revocation file.', error instanceof Error ? error.message : 'unknown')
   }
 }, 60 * 60 * 1000)
 // Only call .unref() in Node.js runtime (not available in Edge Runtime)
@@ -342,7 +332,7 @@ export async function validateSessionAsync(token: string): Promise<{ userId: str
       return null
     }
     if (!revocationsLoaded) {
-      console.error('[Session] Revocation list not yet loaded — rejecting token for safety (fail-closed)')
+      logger.error('session', 'Revocation list not yet loaded — rejecting token for safety (fail-closed)')
       return null
     }
 
@@ -382,7 +372,7 @@ export async function validateSessionAsync(token: string): Promise<{ userId: str
           return null
         }
       } catch {
-        console.error('[Session] DB unavailable during tokenVersion check — rejecting token for safety')
+        logger.error('session', 'DB unavailable during tokenVersion check — rejecting token for safety')
         return null
       }
     }
@@ -451,7 +441,7 @@ export async function incrementTokenVersion(userId: string): Promise<number> {
     tokenVersionCache.set(userId, { version: result.tokenVersion, cachedAt: Date.now() })
     return result.tokenVersion
   } catch (error) {
-    console.error('[Session] Failed to increment tokenVersion:', error)
+    logger.error('session', 'Failed to increment tokenVersion.', error instanceof Error ? error.message : String(error))
     tokenVersionCache.delete(userId)
     throw error
   }

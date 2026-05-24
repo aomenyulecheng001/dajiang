@@ -2,10 +2,11 @@ import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { rateLimit, getRateLimitConfig, getRateLimitHeaders } from '@/lib/rate-limit'
 import { validateSessionEdge } from '@/lib/session-edge'
+import { logger } from '@/lib/logger'
 
 if (process.env.NODE_ENV === 'production' && !process.env.TRUSTED_PROXIES) {
-  console.error('WARNING: TRUSTED_PROXIES is not configured. All users share a single rate limit bucket.')
-  console.error('Set TRUSTED_PROXIES to your reverse proxy IPs (e.g., "10.0.0.1,10.0.0.2")')
+  logger.error('middleware', 'TRUSTED_PROXIES is not configured. All users share a single rate limit bucket.')
+  logger.error('middleware', 'Set TRUSTED_PROXIES to your reverse proxy IPs (e.g., "10.0.0.1,10.0.0.2")')
 }
 
 const PUBLIC_ROUTES = [
@@ -30,7 +31,10 @@ function extractClientIp(request: NextRequest): string {
     return 'shared-untrusted'
   }
 
-  const directIp = request.headers.get('x-real-ip') || request.headers.get('x-client-ip') || '127.0.0.1'
+  const rawDirectIp = request.headers.get('x-real-ip') || request.headers.get('x-client-ip')
+  const directIp = (rawDirectIp && /^[0-9a-fA-F.:]+$/.test(rawDirectIp) && rawDirectIp.length <= 45)
+    ? rawDirectIp
+    : '127.0.0.1'
 
   if (isTrustedProxy(directIp)) {
     const forwarded = request.headers.get('x-forwarded-for')

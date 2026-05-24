@@ -17,7 +17,7 @@ import { BotListSkeleton } from '@/components/bot-factory/bot-list-skeleton'
 import { LoginForm } from '@/components/auth/login-form'
 import { useBotRunnerConnection } from '@/lib/bot-runner-context'
 
-const { motion, AnimatePresence } = await import('framer-motion')
+import { motion, AnimatePresence } from 'framer-motion'
 import { Bot, Plus, ArrowUpDown, ChevronLeftIcon, ChevronRightIcon } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
@@ -292,124 +292,119 @@ export default function Home() {
                     </motion.div>
                   )
                 )}
-                {paginatedBots.length === 0 && bots.length === 0 ? null : (
-                  <>
-                    {filteredBotsList.length > 0 && (
-                      <div className="mt-8 mb-3 flex items-center justify-between">
-                        {/* Left: Page Info */}
-                        <div className="text-xs text-muted-foreground">
-                          <span className="font-medium">
-                            {t('pagination.page')} {currentPage}
-                          </span>
-                          <span className="mx-1 text-muted-foreground/40">·</span>
-                          <span>
-                            {filteredBotsList.length} {t('pagination.items')}
-                          </span>
-                        </div>
+                {useMemo(() => {
+                  if (paginatedBots.length === 0 && bots.length === 0) return null
+                  if (filteredBotsList.length === 0) return null
 
-                        {/* Right: Pagination + Page Size */}
-                        <div className="flex items-center gap-4">
-                          {/* Page Size Selector */}
-                          {bots.length > PAGINATION.DEFAULT_PAGE_SIZE && (
-                            <div className="flex items-center gap-1.5">
-                              <span className="text-xs text-muted-foreground">{t('page.perPage')}</span>
-                              <Select
-                                value={String(pageSize)}
-                                onValueChange={(v) => {
-                                  useBotStore.getState().setPageSize(Number(v))
-                                  setCurrentPage(1)
-                                }}
-                              >
-                                <SelectTrigger className="h-7 w-[60px] text-xs">
-                                  <SelectValue />
-                                </SelectTrigger>
-                                <SelectContent align="end">
-                                  <SelectItem value="10">10</SelectItem>
-                                  <SelectItem value="20">20</SelectItem>
-                                  <SelectItem value="50">50</SelectItem>
-                                  <SelectItem value="100">100</SelectItem>
-                                </SelectContent>
-                              </Select>
-                            </div>
-                          )}
+                  const totalPages = Math.ceil(filteredBotsList.length / pageSize)
+                  const pages: number[] = []
+                  const maxVisible = 7
 
-                          {/* Pagination */}
-                          <nav aria-label={t('pagination.navigation')} role="navigation" className="flex items-center gap-0.5">
-                            <button
-                              onClick={() => currentPage > 1 && setCurrentPage(currentPage - 1)}
-                              disabled={currentPage <= 1}
-                              className={cn(
-                                'inline-flex h-7 w-7 items-center justify-center rounded text-xs transition-colors',
-                                'hover:bg-muted disabled:opacity-30'
-                              )}
-                              aria-label={t('page.previous')}
-                            >
-                              <ChevronLeftIcon className="size-3.5" />
-                            </button>
-                            
-                            {(() => {
-                              const totalFiltered = filteredBotsList.length
-                              const totalPages = Math.ceil(totalFiltered / pageSize)
-                              const pages: number[] = []
-                              const maxVisible = 7
-                              
-                              if (totalPages <= maxVisible) {
-                                for (let i = 1; i <= totalPages; i++) pages.push(i)
-                              } else {
-                                pages.push(1)
-                                if (currentPage > 4) pages.push(-1)
-                                
-                                const start = Math.max(2, currentPage - 2)
-                                const end = Math.min(totalPages - 1, currentPage + 2)
-                                for (let i = start; i <= end; i++) pages.push(i)
-                                
-                                if (currentPage < totalPages - 3) pages.push(-1)
-                                pages.push(totalPages)
-                              }
-                              
-                              return pages.map((p, idx) => (
-                                p === -1 ? (
-                                  <span key={idx} className="inline-flex h-7 w-7 items-center justify-center text-xs text-muted-foreground/40">
-                                    ···
-                                  </span>
-                                ) : (
-                                  <button
-                                    key={idx}
-                                    onClick={() => setCurrentPage(p)}
-                                    className={cn(
-                                      'inline-flex h-7 min-w-[28px] items-center justify-center rounded text-xs px-1.5 transition-colors',
-                                      p === currentPage 
-                                        ? 'bg-primary text-primary-foreground' 
-                                        : 'text-muted-foreground hover:bg-muted'
-                                    )}
-                                    aria-current={p === currentPage ? 'page' : undefined}
-                                  >
-                                    {p}
-                                  </button>
-                                )
-                              ))
-                            })()}
-                            
-                            <button
-                              onClick={() => {
-                                const totalPages = Math.ceil(filteredBotsList.length / pageSize)
-                                if (currentPage < totalPages) setCurrentPage(currentPage + 1)
-                              }}
-                              disabled={currentPage >= Math.ceil(filteredBotsList.length / pageSize)}
-                              className={cn(
-                                'inline-flex h-7 w-7 items-center justify-center rounded text-xs transition-colors',
-                                'hover:bg-muted disabled:opacity-30'
-                              )}
-                              aria-label={t('page.next')}
-                            >
-                              <ChevronRightIcon className="size-3.5" />
-                            </button>
-                          </nav>
-                        </div>
+                  if (totalPages <= maxVisible) {
+                    for (let i = 1; i <= totalPages; i++) pages.push(i)
+                  } else {
+                    pages.push(1)
+                    if (currentPage > 4) pages.push(-1)
+                    const start = Math.max(2, currentPage - 2)
+                    const end = Math.min(totalPages - 1, currentPage + 2)
+                    for (let i = start; i <= end; i++) pages.push(i)
+                    if (currentPage < totalPages - 3) pages.push(-1)
+                    pages.push(totalPages)
+                  }
+
+                  return (
+                    <div className="mt-8 mb-3 flex items-center justify-between">
+                      {/* Left: Page Info */}
+                      <div className="text-xs text-muted-foreground">
+                        <span className="font-medium">
+                          {t('pagination.page')} {currentPage}
+                        </span>
+                        <span className="mx-1 text-muted-foreground/40">·</span>
+                        <span>
+                          {filteredBotsList.length} / {bots.length} {t('pagination.items')}
+                        </span>
                       </div>
-                    )}
-                  </>
-                )}
+
+                      {/* Right: Pagination + Page Size */}
+                      <div className="flex items-center gap-4">
+                        {/* Page Size Selector */}
+                        {bots.length > PAGINATION.DEFAULT_PAGE_SIZE && (
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-xs text-muted-foreground">{t('page.perPage')}</span>
+                            <Select
+                              value={String(pageSize)}
+                              onValueChange={(v) => {
+                                useBotStore.getState().setPageSize(Number(v))
+                                setCurrentPage(1)
+                              }}
+                            >
+                              <SelectTrigger className="h-7 w-[60px] text-xs">
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent align="end">
+                                <SelectItem value="10">10</SelectItem>
+                                <SelectItem value="20">20</SelectItem>
+                                <SelectItem value="50">50</SelectItem>
+                                <SelectItem value="100">100</SelectItem>
+                              </SelectContent>
+                            </Select>
+                          </div>
+                        )}
+
+                        {/* Pagination */}
+                        <nav aria-label={t('pagination.navigation')} role="navigation" className="flex items-center gap-0.5">
+                          <button
+                            onClick={() => currentPage > 1 && setCurrentPage(currentPage - 1)}
+                            disabled={currentPage <= 1}
+                            className={cn(
+                              'inline-flex h-7 w-7 items-center justify-center rounded text-xs transition-colors',
+                              'hover:bg-muted disabled:opacity-30'
+                            )}
+                            aria-label={t('page.previous')}
+                          >
+                            <ChevronLeftIcon className="size-3.5" />
+                          </button>
+
+                          {pages.map((p, idx) => (
+                            p === -1 ? (
+                              <span key={idx} className="inline-flex h-7 w-7 items-center justify-center text-xs text-muted-foreground/40">
+                                ···
+                              </span>
+                            ) : (
+                              <button
+                                key={idx}
+                                onClick={() => setCurrentPage(p)}
+                                className={cn(
+                                  'inline-flex h-7 min-w-[28px] items-center justify-center rounded text-xs px-1.5 transition-colors',
+                                  p === currentPage
+                                    ? 'bg-primary text-primary-foreground'
+                                    : 'text-muted-foreground hover:bg-muted'
+                                )}
+                                aria-current={p === currentPage ? 'page' : undefined}
+                              >
+                                {p}
+                              </button>
+                            )
+                          ))}
+
+                          <button
+                            onClick={() => {
+                              if (currentPage < totalPages) setCurrentPage(currentPage + 1)
+                            }}
+                            disabled={currentPage >= totalPages}
+                            className={cn(
+                              'inline-flex h-7 w-7 items-center justify-center rounded text-xs transition-colors',
+                              'hover:bg-muted disabled:opacity-30'
+                            )}
+                            aria-label={t('page.next')}
+                          >
+                            <ChevronRightIcon className="size-3.5" />
+                          </button>
+                        </nav>
+                      </div>
+                    </div>
+                  )
+                }, [paginatedBots.length, bots.length, filteredBotsList.length, currentPage, pageSize, t])}
               </div>
             </motion.div>
           )}

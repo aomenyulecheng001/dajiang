@@ -50,6 +50,7 @@ import { cn, generateUUID } from '@/lib/utils'
 import type { BotLanguage, ProjectFile } from '@/types/bot'
 import { useBotStore } from '@/store/bot-store'
 import { useT } from '@/lib/i18n'
+import { logger } from '@/lib/logger'
 import { BotIconPicker } from '@/components/bot-factory/bot-icon-picker'
 import {
   type ImportFile,
@@ -627,7 +628,7 @@ export function CreateBotDialog() {
 
       // Log skipped files for user awareness
       if (skippedReasons.length > 0) {
-        console.info(`[ZIP Import] Skipped ${skippedReasons.length} files:`, skippedReasons.slice(0, 10))
+        logger.info('create-bot-dialog', `ZIP Import: Skipped ${skippedReasons.length} files`, skippedReasons.slice(0, 10))
       }
 
       setProjectFiles(extractedFiles)
@@ -1062,6 +1063,8 @@ export function CreateBotDialog() {
                     <button
                       key={lang.id}
                       type="button"
+                      role="radio"
+                      aria-checked={language === lang.id}
                       className={cn(
                         'flex items-center gap-2.5 px-3 py-2.5 rounded-lg border text-sm font-medium transition-all cursor-pointer',
                         language === lang.id

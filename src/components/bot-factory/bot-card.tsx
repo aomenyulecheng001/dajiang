@@ -548,7 +548,7 @@ const GridModeCard = React.memo(function GridModeCard({
           </div>
 
           {/* Action Buttons */}
-          <div className="opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100 shrink-0">
+          <div className="opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100 focus-within:opacity-100 shrink-0">
             <CardActions
               bot={bot}
               onEdit={onEdit}
@@ -705,7 +705,7 @@ const ListModeCard = React.memo(function ListModeCard({
 
       {/* Actions */}
       <td className="py-3 pr-4 pl-3">
-        <div className="flex items-center justify-center gap-0.5 opacity-0 transition-opacity duration-150 group-hover:opacity-100">
+        <div className="flex items-center justify-center gap-0.5 opacity-0 transition-opacity duration-150 group-hover:opacity-100 focus-within:opacity-100">
           <CardActions
             bot={bot}
             onEdit={onEdit}

@@ -3,6 +3,7 @@ import { appendFile } from 'fs/promises'
 import { join, resolve, dirname } from 'path'
 import { fileURLToPath } from 'url'
 import { mkdirSync } from 'fs'
+import { logger } from './logger'
 import { io } from './socket'
 import type { BotProcess, DeployStage } from './types'
 import { sanitizeBotId } from './utils'
@@ -10,6 +11,7 @@ import { sanitizeBotId } from './utils'
 // ─── Log Constants ────────────────────────────────────────────────────────
 
 export const MAX_LOG_LINES = 500
+export const MAX_LOG_FILE_SIZE = 50 * 1024 * 1024 // 50MB — warn and truncate when exceeded
 export const LOGS_DIR = resolve(dirname(fileURLToPath(import.meta.url)), 'logs')
 // P3-6 FIX: Only use sync mkdirSync at module init time (acceptable for startup)
 mkdirSync(LOGS_DIR, { recursive: true })
@@ -86,12 +88,16 @@ export async function cleanupOldLogs() {
         const fileStat = await stat(filePath)
         if (fileStat.mtimeMs < sevenDaysAgo) {
           await unlink(filePath)
-          console.log(`[Cleanup] Deleted old log: ${file}`)
+          logger.info('log-manager', `Deleted old log: ${file}`)
+          // Reset size tracking for deleted log files
+          const botId = file.replace('.log', '')
+          _logFileSizeEstimate.delete(botId)
+          _sizeWarned.delete(botId)
         }
       } catch { /* ignore individual file errors */ }
     }
   } catch (err: any) {
-    console.error(`[Cleanup] Failed to cleanup old logs: ${err.message}`)
+    logger.error('log-manager', `Failed to cleanup old logs: ${err.message}`)
   }
 }
 
@@ -117,6 +123,10 @@ export function stopLogCleanup() {
 // P2-34 FIX: Flag to suppress repeated ENOSPC warnings
 let _enospcWarned = false
 
+// FIX: Track approximate log file sizes per bot to warn on excessive growth
+const _logFileSizeEstimate = new Map<string, number>()
+let _sizeWarned = new Set<string>()
+
 // ─── Log Append Functions ─────────────────────────────────────────────────
 
 export function appendLog(botId: string, message: string, level: 'info' | 'warn' | 'error' | 'debug' = 'info') {
@@ -134,6 +144,15 @@ export function appendLog(botId: string, message: string, level: 'info' | 'warn'
     bot.logBuffer = bot.logBuffer.slice(-bot.maxLogLines)
   }
 
+  // FIX: Track approximate log file size and warn if it exceeds MAX_LOG_FILE_SIZE
+  const logLineBytes = Buffer.byteLength(`${timestamp} [${level}] ${safeMessage}\n`, 'utf-8')
+  const currentSize = (_logFileSizeEstimate.get(botId) || 0) + logLineBytes
+  _logFileSizeEstimate.set(botId, currentSize)
+  if (currentSize > MAX_LOG_FILE_SIZE && !_sizeWarned.has(botId)) {
+    logger.warn('log-manager', `Log file for bot ${botId} exceeds ${Math.round(MAX_LOG_FILE_SIZE / 1024 / 1024)}MB — consider rotating`)
+    _sizeWarned.add(botId)
+  }
+
   // P2-34 FIX: Handle ENOSPC (disk full) errors specifically instead of silently ignoring
   // P2-BR-8 FIX: Use async appendFile instead of sync appendFileSync to avoid blocking event loop
   // FIX: Also sanitize the message written to file
@@ -142,12 +161,12 @@ export function appendLog(botId: string, message: string, level: 'info' | 'warn'
     .catch((err: any) => {
       if (err.code === 'ENOSPC') {
         if (!_enospcWarned) {
-          console.warn(`[LogManager] Disk full (ENOSPC) — skipping log write for bot ${botId}`)
+          logger.warn('log-manager', `Disk full (ENOSPC) — skipping log write for bot ${botId}`)
           _enospcWarned = true
         }
       } else if (err.code !== 'ENOENT') {
         // ENOENT is fine (directory might not exist in edge cases), but other errors should be logged
-        console.error(`[LogManager] Log write error for bot ${botId}:`, err.message)
+        logger.error('log-manager', `Log write error for bot ${botId}:`, err.message)
       }
     })
 

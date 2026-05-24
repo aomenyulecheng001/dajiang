@@ -5,6 +5,7 @@ import path from 'path'
 import { resolveFromProjectRoot } from '@/lib/project-root'
 import { validateSessionAsync } from '@/lib/session'
 import { BOT_RUNNER_URL } from '@/lib/bot-runner-url'
+import { logger } from '@/lib/logger'
 
 // Track running service process
 let serviceProcess: ReturnType<typeof spawn> | null = null
@@ -157,7 +158,7 @@ function findRunnerDir(): string | null {
   const cwd = process.cwd()
   const standaloneRunnerDir = path.join(cwd, 'mini-services', 'bot-runner')
   if (existsSync(path.join(standaloneRunnerDir, 'index.ts')) || existsSync(path.join(standaloneRunnerDir, 'package.json'))) {
-    console.warn('[start-service] WARNING: Using standalone path for bot-runner — may lack node_modules')
+    logger.warn('start-service', 'Using standalone path for bot-runner — may lack node_modules')
     return standaloneRunnerDir
   }
 
@@ -232,7 +233,7 @@ export async function POST(request: Request) {
     // Find the bot-runner directory using robust path resolution
     const runnerDir = findRunnerDir()
     if (!runnerDir) {
-      console.error('[start-service] Could not find bot-runner directory in any expected location')
+      logger.error('start-service', 'Could not find bot-runner directory in any expected location')
       return NextResponse.json(
         {
           success: false,
@@ -245,7 +246,7 @@ export async function POST(request: Request) {
     // Check that the runner directory has its own node_modules (critical for Bun module resolution)
     const runnerNodeModules = path.join(runnerDir, 'node_modules')
     if (!existsSync(runnerNodeModules)) {
-      console.warn(`[start-service] Warning: ${runnerDir} does not have node_modules. Attempting bun install...`)
+      logger.warn('start-service', `${runnerDir} does not have node_modules. Attempting bun install...`)
       // Try to install dependencies on-the-fly
       try {
         const installProc = spawn('bun', ['install'], {
@@ -260,9 +261,9 @@ export async function POST(request: Request) {
           })
           installProc.on('error', reject)
         })
-        console.log(`[start-service] bun install completed in ${runnerDir}`)
+        logger.info('start-service', `bun install completed in ${runnerDir}`)
       } catch (installErr) {
-        console.error(`[start-service] bun install failed in ${runnerDir}:`, installErr)
+        logger.error('start-service', `bun install failed in ${runnerDir}`, installErr instanceof Error ? installErr.message : String(installErr))
       }
     }
 
@@ -313,7 +314,7 @@ export async function POST(request: Request) {
       }
     }
 
-    console.log(`[start-service] Starting bot-runner: ${runnerCmd} ${runnerArgs.join(' ')} (cwd: ${runnerDir})`)
+    logger.info('start-service', `Starting bot-runner: ${runnerCmd} ${runnerArgs.join(' ')} (cwd: ${runnerDir})`)
 
     serviceProcess = spawn(runnerCmd, runnerArgs, {
       cwd: runnerDir,
@@ -331,14 +332,14 @@ export async function POST(request: Request) {
 
     // Log service output for debugging (stdout/stderr)
     serviceProcess.stdout?.on('data', (data: Buffer) => {
-      console.log(`[bot-runner:${PORT}] ${data.toString().trimEnd()}`)
+      logger.info('start-service', `[bot-runner:${PORT}] ${data.toString().trimEnd()}`)
     })
     serviceProcess.stderr?.on('data', (data: Buffer) => {
-      console.error(`[bot-runner:${PORT}] ${data.toString().trimEnd()}`)
+      logger.error('start-service', `[bot-runner:${PORT}] ${data.toString().trimEnd()}`)
     })
     serviceProcess.on('exit', (code) => {
       if (code !== null && code !== 0) {
-        console.warn(`[bot-runner:${PORT}] exited with code ${code}`)
+        logger.warn('start-service', `[bot-runner:${PORT}] exited with code ${code}`)
       }
       serviceProcess = null
     })
@@ -377,7 +378,7 @@ export async function POST(request: Request) {
       { status: 200 }
     )
   } catch (error) {
-    console.error('Failed to start bot-runner service:', error)
+    logger.error('start-service', 'Failed to start bot-runner service', error instanceof Error ? error.message : String(error))
     // SECURITY FIX: Don't leak raw error messages (may contain internal paths, module names)
     return NextResponse.json(
       {

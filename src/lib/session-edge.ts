@@ -7,43 +7,48 @@
  * Used exclusively in middleware.ts for request authentication.
  */
 
-import { safeUnref } from '@/lib/logger'
+import { safeUnref, logger } from '@/lib/logger'
+import { generateHmacSecret, logMissingHmacSecret } from '@/lib/hmac-secret'
 
 if (process.env.NODE_ENV === 'production' && (!process.env.NEXT_PUBLIC_APP_URL || process.env.NEXT_PUBLIC_APP_URL === 'http://localhost:3000')) {
-  console.error('WARNING: NEXT_PUBLIC_APP_URL is not configured or set to localhost. Edge Runtime token validation may fail.')
-  console.error('Set NEXT_PUBLIC_APP_URL to your actual application URL (e.g., "https://your-domain.com")')
+  logger.error('session-edge', 'WARNING: NEXT_PUBLIC_APP_URL is not configured or set to localhost. Edge Runtime token validation may fail.')
+  logger.error('session-edge', 'Set NEXT_PUBLIC_APP_URL to your actual application URL (e.g., "https://your-domain.com")')
 }
 
 // ─── Constants ──────────────────────────────────────────────────────────
 function getHmacSecret(): string {
-  if (typeof process !== 'undefined' && process.env && process.env.HMAC_SECRET) {
+  if (typeof process !== 'undefined' && process.env?.HMAC_SECRET) {
     return process.env.HMAC_SECRET
   }
-  console.error('[session-edge] FATAL: HMAC_SECRET environment variable is not set!')
-  console.error('[session-edge] Attempting to read from .hmac-secret file...')
+  logMissingHmacSecret('edge')
+  // Try .hmac-secret file for cross-runtime consistency
   try {
     if (typeof require === 'function') {
       const fs = require('fs') as typeof import('fs')
       const path = require('path') as typeof import('path')
       const secretFile = path.join(
-        (typeof process !== 'undefined' && process.env && process.env.PROJECT_ROOT) || '/',
-        '.hmac-secret'
+        (process.env?.PROJECT_ROOT) || '/',
+        '.hmac-secret',
       )
       if (fs.existsSync(secretFile)) {
         const existing = fs.readFileSync(secretFile, 'utf-8').trim()
         if (existing.length >= 32) {
-          console.error('[session-edge] Loaded HMAC secret from .hmac-secret file')
+          logger.info('session-edge', 'Loaded HMAC secret from .hmac-secret file')
           return existing
         }
       }
+      // Generate and persist for cross-runtime consistency
+      const secret = generateHmacSecret()
+      try { fs.writeFileSync(secretFile, secret + '\n', { mode: 0o600 }) } catch { /* read-only FS */ }
+      return secret
     }
   } catch {
     // Edge Runtime doesn't support require() — fall through
   }
-  console.error('[session-edge] CRITICAL: No HMAC_SECRET available. Edge Runtime CANNOT validate tokens.')
-  console.error('[session-edge] Set HMAC_SECRET env var or ensure .hmac-secret file exists.')
-  console.error('[session-edge] All middleware auth checks will reject tokens until this is fixed.')
-  return ''
+  logger.error('session-edge', 'CRITICAL: No HMAC_SECRET available. Edge Runtime CANNOT validate tokens.')
+  logger.error('session-edge', 'Set HMAC_SECRET env var or ensure .hmac-secret file exists.')
+  logger.error('session-edge', 'All middleware auth checks will reject tokens until this is fixed.')
+  return generateHmacSecret()
 }
 
 const HMAC_SECRET = getHmacSecret()
@@ -53,7 +58,8 @@ const tokenVersionEdgeCache = new Map<string, { version: number; cachedAt: numbe
 const EDGE_CACHE_TTL_MS = 30 * 1000
 const MAX_EDGE_CACHE_SIZE = 10000
 
-// SECURITY FIX (SEC-89): Reduced cleanup interval from 60 minutes to 5 minutes.
+// SECURITY FIX (SEC-89): Cleanup interval aligned with cache TTL (30s)
+// to prevent expired entries from accumulating in Edge Runtime's limited memory.
 const _edgeCacheCleanupInterval = setInterval(() => {
   const now = Date.now()
   for (const [key, entry] of tokenVersionEdgeCache) {
@@ -61,7 +67,7 @@ const _edgeCacheCleanupInterval = setInterval(() => {
       tokenVersionEdgeCache.delete(key)
     }
   }
-}, 5 * 60 * 1000)
+}, 30 * 1000)
 safeUnref(_edgeCacheCleanupInterval)
 
 interface SessionPayload {
@@ -108,7 +114,7 @@ function base64UrlDecode(str: string): string {
 export async function validateSessionEdge(token: string): Promise<{ userId: string; username: string } | null> {
   try {
     if (!HMAC_SECRET) {
-      console.error('[session-edge] No HMAC secret — cannot validate any tokens')
+      logger.error('session-edge', 'No HMAC secret — cannot validate any tokens')
       return null
     }
 
@@ -147,8 +153,13 @@ export async function validateSessionEdge(token: string): Promise<{ userId: stri
           const internalSecret = typeof process !== 'undefined' && process.env?.INTERNAL_API_SECRET
             ? process.env.INTERNAL_API_SECRET
             : ''
-          const res = await fetch(`${baseUrl}/api/auth/token-version?userId=${encodeURIComponent(payload.userId)}`, {
-            headers: { 'X-Internal-Secret': internalSecret },
+          const res = await fetch(`${baseUrl}/api/auth/token-version`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Internal-Secret': internalSecret,
+            },
+            body: JSON.stringify({ userId: payload.userId }),
             signal: AbortSignal.timeout(3000),
           })
           if (res.ok) {
@@ -173,7 +184,7 @@ export async function validateSessionEdge(token: string): Promise<{ userId: stri
           // SECURITY FIX: Fail-closed — if we cannot verify tokenVersion, reject the token.
           // This prevents revoked tokens (e.g., after password change) from being accepted
           // when the token-version API is unreachable.
-          console.error('[session-edge] Cannot verify tokenVersion — rejecting token for safety')
+          logger.error('session-edge', 'Cannot verify tokenVersion — rejecting token for safety')
           return null
         }
       }

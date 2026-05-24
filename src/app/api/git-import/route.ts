@@ -5,6 +5,7 @@ import { join } from 'path'
 import { tmpdir } from 'os'
 import { lookup } from 'dns/promises'
 import { getCurrentUserId } from '@/lib/api-helpers'
+import { logger } from '@/lib/logger'
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
@@ -222,7 +223,7 @@ async function readRepoFiles(dirPath: string): Promise<{
   async function walkDir(currentDir: string, baseName: string, depth: number = 0) {
     // P2-API-8 FIX: Check directory depth limit
     if (depth > MAX_DIR_DEPTH) {
-      console.warn(`[GitImport] Max directory depth (${MAX_DIR_DEPTH}) exceeded at ${baseName}, skipping`)
+      logger.warn('git-import', `Max directory depth (${MAX_DIR_DEPTH}) exceeded at ${baseName}, skipping`)
       return
     }
 
@@ -231,7 +232,7 @@ async function readRepoFiles(dirPath: string): Promise<{
     for (const entry of entries) {
       // P2-API-8 FIX: Check total file count limit
       if (files.length >= MAX_TOTAL_FILES) {
-        console.warn(`[GitImport] Max file count (${MAX_TOTAL_FILES}) reached, skipping remaining files`)
+        logger.warn('git-import', `Max file count (${MAX_TOTAL_FILES}) reached, skipping remaining files`)
         return
       }
 

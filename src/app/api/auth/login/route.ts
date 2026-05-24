@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { authenticateUser } from '@/lib/auth'
 import { rateLimit, RATE_LIMIT_AUTH, getRateLimitHeaders } from '@/lib/rate-limit'
 import { getSecureClientIp, isSecureRequest } from '@/lib/api-helpers'
+import { logger } from '@/lib/logger'
 
 const COOKIE_NAME = 'session_token'
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000
@@ -99,7 +100,7 @@ export async function POST(request: NextRequest) {
     const result = await authenticateUser(normalizedUsername, password)
     if (!result) {
       const maskedUsername = username.length > 2 ? username.slice(0, 2) + '***' : '***'
-      console.warn(`[Auth] Failed login attempt for user: ${maskedUsername}, IP: ${clientIp}`)
+      logger.warn('auth-login', `Failed login attempt for user: ${maskedUsername}, IP: ${clientIp}`)
       const existing = failedLoginAttempts.get(lockoutKey) || { count: 0, lockedUntil: 0, createdAt: Date.now() }
       existing.count++
       if (existing.count >= MAX_FAILED_ATTEMPTS) {
@@ -130,7 +131,7 @@ export async function POST(request: NextRequest) {
 
     return response
   } catch (error) {
-    console.error('[Auth] Login error:', error)
+    logger.error('auth-login', 'Login error', error instanceof Error ? error.message : String(error))
     return NextResponse.json(
       { error: 'Internal server error' },
       { status: 500 }

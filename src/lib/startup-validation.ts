@@ -4,98 +4,9 @@
  * This runs once at server startup to catch configuration issues early.
  */
 
+import { logger } from '@/lib/logger'
+
 let validated = false
-
-export function validateRequiredEnvVars(): void {
-  if (validated) return
-  validated = true
-
-  const warnings: string[] = []
-
-  // HMAC_SECRET — required for session token generation
-  // If not set, a random one is generated on each restart, invalidating all sessions
-  if (!process.env.HMAC_SECRET) {
-    warnings.push('HMAC_SECRET is not set. Session tokens will not survive server restarts. Set this to a stable hex string in production.')
-  } else if (process.env.HMAC_SECRET.length < 32) {
-    warnings.push(`HMAC_SECRET is too short (${process.env.HMAC_SECRET.length} chars). Minimum 32 characters recommended for security.`)
-  }
-
-  // ENCRYPTION_KEY — required for encrypting sensitive data (BOT_TOKENs, API keys)
-  // If not set, a random one is generated, making previously encrypted data unreadable
-  if (!process.env.ENCRYPTION_KEY) {
-    warnings.push('ENCRYPTION_KEY is not set. Encrypted data (BOT_TOKENs, API keys) will be lost on server restart. Set this to a stable hex string in production.')
-  } else if (process.env.ENCRYPTION_KEY.length < 32) {
-    warnings.push(`ENCRYPTION_KEY is too short (${process.env.ENCRYPTION_KEY.length} chars). Minimum 32 characters recommended for security.`)
-  }
-
-  // DATABASE_URL — required for Prisma
-  if (!process.env.DATABASE_URL) {
-    warnings.push('DATABASE_URL is not set. Using default SQLite path. In standalone mode, set this to an absolute path.')
-  }
-
-  // SERVER_ORIGIN — recommended for production CORS
-  // Supports both HTTP and HTTPS deployments (e.g., http://1.2.3.4:3000 or https://yourdomain.com)
-  if (process.env.NODE_ENV === 'production' && !process.env.SERVER_ORIGIN) {
-    warnings.push('SERVER_ORIGIN is not set in production. Socket.IO CORS will be restrictive. Set this to your public URL (e.g., https://yourdomain.com or http://1.2.3.4:3000).')
-  }
-
-  if (warnings.length > 0) {
-    console.warn('')
-    console.warn('╔══════════════════════════════════════════════════════════════╗')
-    console.warn('║  [DEPLOYMENT WARNINGS] Environment Configuration Issues   ║')
-    console.warn('╠══════════════════════════════════════════════════════════════╣')
-    for (const w of warnings) {
-      // Wrap long warnings to fit in the box (60 chars per line)
-      const lines = wrapText(w, 56)
-      for (const line of lines) {
-        console.warn(`║  ${line.padEnd(58)}║`)
-      }
-      console.warn('║' + ' '.repeat(60) + '║')
-    }
-    console.warn('║  The application will still start, but some features may  ║')
-    console.warn('║  not work correctly after a restart.                      ║')
-    console.warn('╚══════════════════════════════════════════════════════════════╝')
-    console.warn('')
-  } else {
-    console.log('[Config] All required environment variables are set ✓')
-  }
-
-  // DEPLOY FIX: In production mode, FATAL exit if critical security keys are missing.
-  // Without these, session tokens are invalidated on every restart and encrypted
-  // data (BOT_TOKENs, API keys) becomes permanently unreadable.
-  if (process.env.NODE_ENV === 'production') {
-    const fatalIssues: string[] = []
-    if (!process.env.HMAC_SECRET) {
-      fatalIssues.push('HMAC_SECRET is not set. Session tokens will not survive restarts.')
-    }
-    if (!process.env.ENCRYPTION_KEY) {
-      fatalIssues.push('ENCRYPTION_KEY is not set. Encrypted bot credentials will be LOST on restart.')
-    }
-
-    if (fatalIssues.length > 0) {
-      console.error('')
-      console.error('╔══════════════════════════════════════════════════════════════╗')
-      console.error('║  🔴 FATAL: Production deployment cannot continue         ║')
-      console.error('╠══════════════════════════════════════════════════════════════╣')
-      for (const issue of fatalIssues) {
-        const lines = wrapText(issue, 54)
-        for (const line of lines) {
-          console.error(`║  🚫 ${line.padEnd(55)}║`)
-        }
-        console.error('║' + ' '.repeat(60) + '║')
-      }
-      console.error('║                                                          ║')
-      console.error('║  Fix: Set these in .env before starting:                  ║')
-      console.error('║    HMAC_SECRET=$(openssl rand -hex 32)                   ║')
-      console.error('║    ENCRYPTION_KEY=$(openssl rand -hex 32)                ║')
-      console.error('║                                                          ║')
-      console.error('║  Or run deploy.sh which auto-generates them.           ║')
-      console.error('╚══════════════════════════════════════════════════════════════╝')
-      console.error('')
-      process.exit(1)
-    }
-  }
-}
 
 function wrapText(text: string, maxLen: number): string[] {
   const words = text.split(' ')
@@ -112,4 +23,87 @@ function wrapText(text: string, maxLen: number): string[] {
   }
   if (currentLine) lines.push(currentLine)
   return lines
+}
+
+export function validateRequiredEnvVars(): void {
+  if (validated) return
+  validated = true
+
+  const warnings: string[] = []
+
+  if (!process.env.HMAC_SECRET) {
+    warnings.push('HMAC_SECRET is not set. Session tokens will not survive server restarts. Set this to a stable hex string in production.')
+  } else if (process.env.HMAC_SECRET.length < 32) {
+    warnings.push(`HMAC_SECRET is too short (${process.env.HMAC_SECRET.length} chars). Minimum 32 characters recommended for security.`)
+  }
+
+  if (!process.env.ENCRYPTION_KEY) {
+    warnings.push('ENCRYPTION_KEY is not set. Encrypted data (BOT_TOKENs, API keys) will be lost on server restart. Set this to a stable hex string in production.')
+  } else if (process.env.ENCRYPTION_KEY.length < 32) {
+    warnings.push(`ENCRYPTION_KEY is too short (${process.env.ENCRYPTION_KEY.length} chars). Minimum 32 characters recommended for security.`)
+  }
+
+  if (!process.env.DATABASE_URL) {
+    warnings.push('DATABASE_URL is not set. Prisma may connect to a wrong or empty database. In standalone mode, set this to an absolute path.')
+  } else if (process.env.DATABASE_URL.startsWith('file:./')) {
+    warnings.push('DATABASE_URL uses a relative path. In standalone mode this will resolve from the wrong directory. Use an absolute path (e.g., file:/www/wwwroot/bot-factory/db/custom.db).')
+  }
+
+  if (process.env.NODE_ENV === 'production' && !process.env.SERVER_ORIGIN) {
+    warnings.push('SERVER_ORIGIN is not set in production. Socket.IO CORS will be restrictive. Set this to your public URL (e.g., https://yourdomain.com or http://1.2.3.4:3000).')
+  }
+
+  if (warnings.length > 0) {
+    const lines: string[] = [
+      'Environment Configuration Issues',
+      '',
+    ]
+    for (const w of warnings) {
+      const wrapped = wrapText(w, 56)
+      for (const line of wrapped) {
+        lines.push(`  ${line}`)
+      }
+      lines.push('')
+    }
+    lines.push('  The application will still start, but some features may')
+    lines.push('  not work correctly after a restart.')
+    logger.warn('startup', lines.join('\n'))
+  } else {
+    logger.info('startup', 'All required environment variables are set')
+  }
+
+  if (process.env.NODE_ENV === 'production') {
+    const fatalIssues: string[] = []
+    if (!process.env.HMAC_SECRET) {
+      fatalIssues.push('HMAC_SECRET is not set. Session tokens will not survive restarts.')
+    }
+    if (!process.env.ENCRYPTION_KEY) {
+      fatalIssues.push('ENCRYPTION_KEY is not set. Encrypted bot credentials will be LOST on restart.')
+    }
+    if (!process.env.DATABASE_URL || process.env.DATABASE_URL.startsWith('file:./')) {
+      fatalIssues.push('DATABASE_URL is missing or uses a relative path. In standalone mode, Prisma resolves relative paths from the wrong directory, causing the app to use an empty database. Set DATABASE_URL to an absolute path (e.g., file:/www/wwwroot/bot-factory/db/custom.db).')
+    }
+
+    if (fatalIssues.length > 0) {
+      const lines: string[] = [
+        'FATAL: Production deployment cannot continue',
+        '',
+      ]
+      for (const issue of fatalIssues) {
+        const wrapped = wrapText(issue, 54)
+        for (const line of wrapped) {
+          lines.push(`  ${line}`)
+        }
+        lines.push('')
+      }
+      lines.push('')
+      lines.push('  Fix: Set these in .env before starting:')
+      lines.push('    HMAC_SECRET=$(openssl rand -hex 32)')
+      lines.push('    ENCRYPTION_KEY=$(openssl rand -hex 32)')
+      lines.push('')
+      lines.push('  Or run deploy.sh which auto-generates them.')
+      logger.error('startup', lines.join('\n'))
+      process.exit(1)
+    }
+  }
 }

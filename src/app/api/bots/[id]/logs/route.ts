@@ -3,6 +3,7 @@ import { NextResponse } from 'next/server'
 import { validateBotId } from '@/lib/validation'
 import { getBotIfAuthorized } from '@/lib/api-helpers'
 import { eventBus } from '@/lib/event-bus'
+import { logger } from '@/lib/logger'
 
 const MAX_MESSAGE_LENGTH = 10000
 const MAX_SOURCE_LENGTH = 200
@@ -73,12 +74,6 @@ export async function POST(
     // NOTE: Old log cleanup is handled by a scheduled task, not on every write.
     // This avoids unnecessary DB load on high-frequency log endpoints.
 
-    if (body.message && body.message.length > 10000) {
-      return NextResponse.json(
-        { error: 'Log message too long (max 10000 characters)' },
-        { status: 400 }
-      )
-    }
     const recentLogCount = await db.botLog.count({
       where: { botId: id, timestamp: { gte: new Date(Date.now() - 60 * 60 * 1000) } },
     })
@@ -119,7 +114,7 @@ export async function POST(
       timestamp: logEntry.timestamp.toISOString(),
     }, { status: 201 })
   } catch (error) {
-    console.error(`POST /api/bots/${id}/logs error:`, error)
+    logger.error('bot-logs', `POST /api/bots/${id}/logs error`, error instanceof Error ? error.message : String(error))
     return NextResponse.json({ error: 'Failed to create log entry' }, { status: 500 })
   }
 }
@@ -174,11 +169,14 @@ export async function GET(
       }
     }
 
-    const logs = await db.botLog.findMany({
-      where,
-      orderBy: { timestamp: 'desc' },
-      take: limit,
-    })
+    const [logs, total] = await Promise.all([
+      db.botLog.findMany({
+        where,
+        orderBy: { timestamp: 'desc' },
+        take: limit,
+      }),
+      includeTotal ? db.botLog.count({ where }) : Promise.resolve(0),
+    ])
 
     const formattedLogs = logs.map(l => ({
       id: l.id,
@@ -190,7 +188,6 @@ export async function GET(
     }))
 
     if (includeTotal) {
-      const total = await db.botLog.count({ where })
       return NextResponse.json({
         logs: formattedLogs,
         total,
@@ -201,7 +198,7 @@ export async function GET(
       logs: formattedLogs,
     })
   } catch (error) {
-    console.error(`GET /api/bots/${id}/logs error:`, error)
+    logger.error('bot-logs', `GET /api/bots/${id}/logs error`, error instanceof Error ? error.message : String(error))
     return NextResponse.json({ error: 'Failed to fetch logs' }, { status: 500 })
   }
 }

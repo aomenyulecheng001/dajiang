@@ -7,6 +7,7 @@ import { authFetch } from '@/store/bot-store'
 import { useAuthStore } from '@/store/auth-store'
 import { useI18nStore, getTranslation } from '@/lib/i18n'
 import type { TranslationKey } from '@/lib/i18n'
+import { logger } from '@/lib/logger'
 
 // ─── Types ───────────────────────────────────────────────────────────────
 
@@ -142,7 +143,7 @@ const BOT_RUNNER_URL = (typeof window !== 'undefined' && (window as unknown as R
     : `http://localhost:3100`)
 
 if (typeof window !== 'undefined' && (window as unknown as Record<string, unknown>).__DEBUG_BOT_RUNNER__) {
-  console.log('[BotRunner] BOT_RUNNER_URL =', BOT_RUNNER_URL, '| window.location.origin =', window.location.origin, '| __RUNNER_URL__ =', (window as unknown as Record<string, unknown>).__RUNNER_URL__)
+  logger.debug('bot-runner', `BOT_RUNNER_URL = ${BOT_RUNNER_URL} | window.location.origin = ${window.location.origin} | __RUNNER_URL__ = ${(window as unknown as Record<string, unknown>).__RUNNER_URL__}`)
 }
 
 // Maximum time (ms) to wait for a 'stopped' event after receiving 'stopping'.
@@ -242,7 +243,7 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
             if (res.status === 429) {
               const data = await res.json().catch(() => ({ retryAfter: 15 }))
               const waitMs = (data.retryAfter || 15) * 1000
-              console.warn(`[BotRunner] Rate limited, waiting ${waitMs / 1000}s before retry`)
+              logger.warn('bot-runner', `Rate limited, waiting ${waitMs / 1000}s before retry`)
               retryCount++
               if (retryCount >= MAX_RETRIES) {
                 setConnectionError('Unable to connect to bot runner service. Please check if the service is running.')
@@ -320,7 +321,7 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
         // re-initialize the entire socket after 30 seconds.
         // Also invalidate cached token so we re-fetch on next attempt.
         socket.on('reconnect_failed', () => {
-          console.warn('[BotRunner] Socket.IO reconnection failed — re-initializing in 30s')
+          logger.warn('bot-runner', 'Socket.IO reconnection failed — re-initializing in 30s')
           cachedTokenRef.current = null
           setReconnecting(false)
           socket.disconnect()
@@ -338,7 +339,7 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
         socket.on('connect_error', (err) => {
           const msg = err instanceof Error ? err.message : String(err)
           if (msg.includes('token') || msg.includes('auth') || msg.includes('unauthorized') || msg.includes('forbidden') || msg.includes('401') || msg.includes('403')) {
-            console.warn('[BotRunner] Auth error on connect, refreshing token')
+            logger.warn('bot-runner', 'Auth error on connect, refreshing token')
             cachedTokenRef.current = null
             socket.disconnect()
             if (retryTimerRef.current) clearTimeout(retryTimerRef.current)
@@ -625,7 +626,7 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ messages: msgs }),
             }).catch(err => {
-              console.warn(`Failed to persist ${msgs.length} messages for bot ${botId}:`, err)
+              logger.warn('bot-runner', `Failed to persist ${msgs.length} messages for bot ${botId}`, err instanceof Error ? err.message : String(err))
             })
           }
         }
@@ -920,7 +921,7 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
 
   const deployBot = useCallback((config: DeployConfig): boolean => {
     if (!socketRef.current || !socketRef.current.connected) {
-      console.warn('[BotRunner] Cannot deploy: socket not connected')
+      logger.warn('bot-runner', 'Cannot deploy: socket not connected')
       import('sonner').then(({ toast }) => {
         const { locale } = useI18nStore.getState()
         const t = (key: TranslationKey) => getTranslation(locale, key)
@@ -934,7 +935,7 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
 
   const stopBot = useCallback((botId: string) => {
     if (!socketRef.current) {
-      console.warn('[BotRunner] Cannot stop: socket not connected')
+      logger.warn('bot-runner', 'Cannot stop: socket not connected')
       return
     }
     socketRef.current.emit('bot:stop', { botId })

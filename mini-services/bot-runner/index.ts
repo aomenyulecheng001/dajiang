@@ -1,6 +1,6 @@
 /**
  * Bot Runner Service - Telegram Bot Process Manager
- * 
+ *
  * This service manages the lifecycle of Telegram bot processes:
  * - Generate bot code from custom code or project files
  * - Install dependencies (npm install / pip install)
@@ -23,6 +23,7 @@ import { httpServer, io } from './socket'
 import { handleBotExit, startBotProcess, stopBotProcess, clearAllRestartTimers, intentionalStopSet, memoryKilledSet, cancelRestartTimer } from './process-manager'
 import { registerHandlers } from './handlers'
 import { startMonitoring, stopMonitoring } from './monitor'
+import { logger } from './logger'
 
 // ─── Shared State ────────────────────────────────────────────────────────
 
@@ -32,7 +33,6 @@ const deployStatus = new Map<string, { stage: DeployStage; progress: number; err
 // ─── Runner Secret for HTTP Auth ────────────────────────────────────────────
 
 function loadRunnerSecret(): string {
-  // P2-BR-10 NOTE: Sync fs at startup is acceptable — runs only once during initialization
   try {
     const secretPath = `${CONFIG_DIR}/runner-secret`
     if (existsSync(secretPath)) {
@@ -45,16 +45,14 @@ function loadRunnerSecret(): string {
 const RUNNER_SECRET = loadRunnerSecret()
 
 if (!RUNNER_SECRET && process.env.NODE_ENV === 'production') {
-  console.error('[FATAL] RUNNER_SECRET is empty in production. Refusing to start without authentication.')
-  // Kill all child processes before exiting to prevent orphaned bot processes.
-  // The child_process.kill() sends SIGTERM to each tracked process.
+  logger.error('main', 'RUNNER_SECRET is empty in production. Refusing to start without authentication.')
   for (const [, bot] of botProcesses) {
     try { bot.process?.kill('SIGTERM') } catch { /* ignore */ }
   }
   process.exit(1)
 }
 if (!RUNNER_SECRET) {
-  console.warn('[WARN] RUNNER_SECRET is empty — all HTTP endpoints are unauthenticated. Set RUNNER_SECRET for production.')
+  logger.warn('main', 'RUNNER_SECRET is empty — all HTTP endpoints are unauthenticated. Set RUNNER_SECRET for production.')
 }
 
 // ─── Wire Up Log Manager ─────────────────────────────────────────────────
@@ -63,54 +61,39 @@ setLogState(botProcesses, deployStatus)
 
 // ─── Create Bound Process Functions ──────────────────────────────────────
 
-/** Bound startBotProcess that carries botProcesses reference */
 async function boundStartBotProcess(botId: string): Promise<void> {
   await startBotProcess(botId, botProcesses, boundHandleBotExit)
 }
 
-/** Bound handleBotExit that carries botProcesses and startBotProcess references */
 async function boundHandleBotExit(botId: string, code: number | null, signal: string | null, exitedProcess?: import('child_process').ChildProcess): Promise<void> {
   await handleBotExit(botId, code, signal, botProcesses, boundStartBotProcess, exitedProcess)
 }
 
-/** Bound stopBotProcess that carries botProcesses reference */
 function boundStopBotProcess(botId: string): void {
   stopBotProcess(botId, botProcesses)
 }
 
 // ─── Cleanup Old Logs ────────────────────────────────────────────────────
 
-// P3-6 FIX: cleanupOldLogs is now async — fire-and-forget at startup
 cleanupOldLogs().catch(() => {})
-startLogCleanup() // P2-33 FIX: Start periodic log cleanup every 6 hours
+startLogCleanup()
 
 // ─── Webhook HTTP Endpoint ───────────────────────────────────────────────
 
-/**
- * P0-4 FIX: Verify webhook secret passed from the Next.js API gateway.
- * The Next.js API already verifies the Telegram secret_token header,
- * but we add a second layer of defense here for direct HTTP access.
- *
- * Verification logic:
- * 1. If no X-Webhook-Secret header → allow (backward compat)
- * 2. If header present → load bot config and compare against stored webhookSecret
- * 3. If bot has no webhookSecret in config → allow (not configured)
- */
 async function verifyWebhookSecret(req: IncomingMessage, botId: string, body?: string): Promise<boolean> {
   const signature = req.headers['x-webhook-signature'] as string | undefined
   const forwardedSecret = req.headers['x-webhook-secret'] as string | undefined
 
-  // FIX: Load config once at the start, not twice (once in no-auth branch, once in auth branch)
   const config = await loadBotConfigAsync(botId)
   if (!config) {
-    console.warn(`[Webhook] Unknown bot ${botId}, rejecting webhook`)
+    logger.warn('webhook', `Unknown bot ${botId}, rejecting webhook`)
     return false
   }
   const storedSecret = config.envVars?.WEBHOOK_SECRET || config.webhookSecret
 
   if (!signature && !forwardedSecret) {
     if (storedSecret) {
-      console.warn(`[Webhook] No auth header for bot ${botId} with configured secret — rejecting`)
+      logger.warn('webhook', `No auth header for bot ${botId} with configured secret — rejecting`)
       return false
     }
     return true
@@ -119,15 +102,11 @@ async function verifyWebhookSecret(req: IncomingMessage, botId: string, body?: s
     return true
   }
   if (signature && body) {
-    // FIX: Remove double-hashing. The sender generates `sha256=<HMAC-hex>`,
-    // so we compute the expected HMAC and compare directly (with timing-safe
-    // hash comparison to avoid length leakage). The old code did an extra
-    // SHA-256 on top of the HMAC output, which never matched the sender's format.
     const expectedSig = `sha256=${createHmac('sha256', storedSecret).update(body).digest('hex')}`
     const expectedHash = createHash('sha256').update(expectedSig, 'utf-8').digest()
     const providedHash = createHash('sha256').update(signature, 'utf-8').digest()
     if (!timingSafeEqual(expectedHash, providedHash)) {
-      console.warn(`[Webhook] Invalid webhook signature for bot ${botId}`)
+      logger.warn('webhook', `Invalid webhook signature for bot ${botId}`)
       return false
     }
     return true
@@ -136,7 +115,7 @@ async function verifyWebhookSecret(req: IncomingMessage, botId: string, body?: s
     const tokenHash = createHash('sha256').update(forwardedSecret, 'utf-8').digest()
     const secretHash = createHash('sha256').update(storedSecret, 'utf-8').digest()
     if (!timingSafeEqual(tokenHash, secretHash)) {
-      console.warn(`[Webhook] Invalid webhook secret for bot ${botId}`)
+      logger.warn('webhook', `Invalid webhook secret for bot ${botId}`)
       return false
     }
     return true
@@ -145,12 +124,7 @@ async function verifyWebhookSecret(req: IncomingMessage, botId: string, body?: s
 }
 
 httpServer.on('request', async (req: IncomingMessage, res: ServerResponse) => {
-  // CRITICAL FIX: Top-level try-catch to prevent hanging responses on errors.
-  // Without this, any unhandled exception in the async handler leaves the
-  // client waiting forever (no response sent, socket stays open).
   try {
-  // Skip Socket.IO transport requests — Socket.IO handles these asynchronously,
-  // and our catch-all 404 would fire before Socket.IO's async handler completes.
   if (req.url?.startsWith('/socket.io')) {
     return
   }
@@ -195,18 +169,15 @@ httpServer.on('request', async (req: IncomingMessage, res: ServerResponse) => {
         res.end(JSON.stringify({ ok: false, error: 'Invalid JSON body' }))
         return
       }
-      // P2-BR-12 FIX: Handle stdin.write() backpressure and errors
       const payload = JSON.stringify({ type: 'webhook', data: parsedBody }) + '\n'
       const canWrite = bot.process.stdin.write(payload)
       if (!canWrite) {
-        // Backpressure: log warning but don't block the response
-        console.warn(`[Webhook] stdin backpressure for bot ${botId}, data buffered`)
+        logger.warn('webhook', `stdin backpressure for bot ${botId}, data buffered`)
       }
-      // Add error handler if not already present
       if (!bot._stdinErrorHandler) {
         bot._stdinErrorHandler = true
         bot.process.stdin.on('error', (err: Error) => {
-          console.error(`[Webhook] stdin error for bot ${botId}:`, err.message)
+          logger.error('webhook', `stdin error for bot ${botId}`, err.message)
         })
       }
       res.writeHead(200, { 'Content-Type': 'application/json' })
@@ -217,8 +188,7 @@ httpServer.on('request', async (req: IncomingMessage, res: ServerResponse) => {
     }
   }
 
-  // ── P2-1 FIX: HTTP cleanup endpoint for bot deletion ──
-  // Called by Next.js API DELETE handler to stop process + clean disk
+  // ── HTTP cleanup endpoint for bot deletion ──
   if (req.method === 'DELETE' && req.url?.startsWith('/cleanup/')) {
     const rawBotId = req.url.replace('/cleanup/', '').split('?')[0]
     const botId = sanitizeBotId(rawBotId)
@@ -229,9 +199,6 @@ httpServer.on('request', async (req: IncomingMessage, res: ServerResponse) => {
       return
     }
 
-    // P1-FIX: Require runner secret for cleanup endpoint
-    // P2-BR-2 FIX: Use SHA-256 hashing + timing-safe comparison for cleanup auth
-    // (same approach as webhook secret verification to prevent length-leak timing attacks)
     if (RUNNER_SECRET) {
       const authHeader = req.headers['x-runner-secret'] as string | undefined
       if (!authHeader) {
@@ -248,7 +215,6 @@ httpServer.on('request', async (req: IncomingMessage, res: ServerResponse) => {
       }
     }
 
-    // P2-30 FIX: Add 10-second timeout to cleanup handler
     let responded = false
     const cleanupTimeout = setTimeout(() => {
       if (!responded) {
@@ -258,48 +224,34 @@ httpServer.on('request', async (req: IncomingMessage, res: ServerResponse) => {
       }
     }, 10000)
 
-    console.log(`[Cleanup] Cleaning up bot ${botId}`)
+    logger.info('cleanup', `Cleaning up bot ${botId}`)
 
-    // SEC FIX: Audit log for destructive cleanup operation.
-    // Records who/when triggered cleanup, what was affected, and from which IP.
     const clientIp = req.headers['x-forwarded-for']?.toString().split(',')[0]?.trim()
       || req.socket?.remoteAddress
       || 'unknown'
-    console.log(`[Cleanup-Audit] bot=${botId} action=cleanup ip=${clientIp} time=${new Date().toISOString()} running=${botProcesses.has(botId)}`)
+    logger.info('cleanup-audit', `bot=${botId} action=cleanup ip=${clientIp} running=${botProcesses.has(botId)}`)
 
-    // Stop process if running
-    // FIX: Cancel restart timer and mark intentional stop BEFORE stopping,
-    // matching the Socket.IO bot:delete handler's logic.
     cancelRestartTimer(botId)
     boundStopBotProcess(botId)
 
-    // Clean up disk
     const botDir = getBotDir(botId)
     const configPath = `${CONFIG_DIR}/${botId}.json`
     const logPath = `${LOGS_DIR}/${botId}.log`
     const runningPath = `${CONFIG_DIR}/${botId}.running`
 
-    // P2-BR-1 FIX: Use async fs operations instead of sync to avoid blocking event loop
     ;(async () => {
       try {
-        // BUG FIX: Wait for the bot process to actually exit before deleting files.
-        // Previously, boundStopBotProcess sends SIGTERM but returns immediately —
-        // the process may still be running when rm() executes. On Linux this can
-        // leave zombie files; on Windows the files may be locked and deletion silently fails.
         const bot = botProcesses.get(botId)
         if (bot?.process) {
           await new Promise<void>(resolve => {
-            const exitTimeout = setTimeout(resolve, 5000) // Max 5s wait
+            const exitTimeout = setTimeout(resolve, 5000)
             bot.process!.once('close', () => { clearTimeout(exitTimeout); resolve() })
           })
         }
 
-        // Re-deployment guard: if the bot was re-deployed with the same ID
-        // while this cleanup was in flight, abort to avoid destroying the new
-        // bot's files and process entry.
         const currentBot = botProcesses.get(botId)
         if (currentBot && (currentBot.status === 'running' || currentBot.status === 'starting')) {
-          console.log(`[Cleanup] Bot ${botId} was re-deployed, aborting cleanup`)
+          logger.info('cleanup', `Bot ${botId} was re-deployed, aborting cleanup`)
           if (!responded) {
             responded = true
             clearTimeout(cleanupTimeout)
@@ -315,31 +267,35 @@ httpServer.on('request', async (req: IncomingMessage, res: ServerResponse) => {
         await access(runningPath).then(() => rm(runningPath, { force: true })).catch(() => {})
       } catch { /* ignore cleanup errors */ }
 
-      // Remove from memory
       botProcesses.delete(botId)
       deployStatus.delete(botId)
-      // FIX: Clean up ALL tracking sets, not just intentionalStopSet
       intentionalStopSet.delete(botId)
       memoryKilledSet.delete(botId)
 
-      // Notify frontend to clean up stale runner state
       io.emit('bot:deleted', { botId })
 
-      console.log(`[Cleanup] Bot ${botId} fully removed`)
-      console.log(`[Cleanup-Audit] bot=${botId} action=cleanup-complete ip=${clientIp} time=${new Date().toISOString()} result=success`)
+      logger.info('cleanup', `Bot ${botId} fully removed`)
+      logger.info('cleanup-audit', `bot=${botId} action=cleanup-complete ip=${clientIp} result=success`)
       if (!responded) {
         responded = true
         clearTimeout(cleanupTimeout)
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ ok: true }))
       }
-    })()
+    })().catch((err) => {
+      logger.error('cleanup', `Unhandled error for bot ${botId}`, err instanceof Error ? err.message : String(err))
+      if (!responded) {
+        responded = true
+        clearTimeout(cleanupTimeout)
+        res.writeHead(500, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: false, error: 'Cleanup failed' }))
+      }
+    })
     return
   }
 
-  // P2-BR-7 FIX: Health check endpoint for container orchestration
+  // Health check endpoint
   if (req.method === 'GET' && req.url === '/health') {
-    // P0-4 FIX: Require runner-secret for health endpoint to prevent information leakage
     if (RUNNER_SECRET) {
       const authHeader = req.headers['x-runner-secret'] as string | undefined
       if (!authHeader) {
@@ -360,16 +316,13 @@ httpServer.on('request', async (req: IncomingMessage, res: ServerResponse) => {
     return
   }
 
-  // P1-FIX: Return 404 for unmatched routes (prevents hanging connections)
   if (!res.writableEnded) {
     res.writeHead(404, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify({ ok: false, error: 'Not found' }))
   }
 
   } catch (error) {
-    // Top-level catch: handle unexpected errors (e.g., client disconnect during body read,
-    // disk I/O errors, etc.) and ensure a response is always sent.
-    console.error('[HTTP] Unhandled request error:', error)
+    logger.error('http', 'Unhandled request error', error instanceof Error ? error.message : String(error))
     if (!res.writableEnded) {
       res.writeHead(500, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ ok: false, error: 'Internal server error' }))
@@ -387,8 +340,6 @@ startMonitoring(botProcesses)
 
 // ─── Startup Recovery ────────────────────────────────────────────────────
 
-/** Load bot configs from disk and create stopped BotProcess records */
-// P2-BR-10 FIX: Made async to use loadBotConfigAsync and readdir
 async function recoverBotConfigs() {
   try {
     const files = await readdir(CONFIG_DIR)
@@ -416,7 +367,6 @@ async function recoverBotConfigs() {
           maxRestarts: 5,
           maxMemoryMb: 256,
         })
-        // P1-19 FIX: Track bots that were running before shutdown for auto-restart
         const runningMarker = `${CONFIG_DIR}/${botId}.running`
         if (existsSync(runningMarker)) {
           const botEntry = botProcesses.get(botId)!
@@ -425,20 +375,17 @@ async function recoverBotConfigs() {
         loaded++
       }
     }
-    console.log(`[Startup] Loaded ${loaded} bot configs from disk`)
+    logger.info('startup', `Loaded ${loaded} bot configs from disk`)
   } catch (err: any) {
-    console.error(`[Startup] Failed to load bot configs: ${err.message}`)
+    logger.error('startup', `Failed to load bot configs: ${err.message}`)
   }
 }
 
 // ─── Start Server ────────────────────────────────────────────────────────
 
 httpServer.listen(PORT, async () => {
-  // Recover bot configs from disk (stopped state, no auto-start)
-  // Await to ensure configs are loaded before accepting connections
   await recoverBotConfigs()
 
-  // P1-19 FIX: Auto-start bots that were running before shutdown
   const autoStartBots: string[] = []
   for (const [id, bot] of botProcesses.entries()) {
     if ((bot as any)._wasRunning) {
@@ -447,48 +394,35 @@ httpServer.listen(PORT, async () => {
     }
   }
   if (autoStartBots.length > 0) {
-    console.log(`[Startup] Auto-starting ${autoStartBots.length} previously running bot(s): ${autoStartBots.join(', ')}`)
-    // PERF FIX: Start bots in batches to avoid CPU/IO spikes from concurrent
-    // npm install / pip install. Batch size and delay are conservative defaults;
-    // adjust AUTO_START_BATCH_SIZE and AUTO_START_BATCH_DELAY_MS env vars for tuning.
+    logger.info('startup', `Auto-starting ${autoStartBots.length} previously running bot(s): ${autoStartBots.join(', ')}`)
     const BATCH_SIZE = parseInt(process.env.AUTO_START_BATCH_SIZE || '3', 10) || 3
     const BATCH_DELAY_MS = parseInt(process.env.AUTO_START_BATCH_DELAY_MS || '2000', 10) || 2000
     for (let i = 0; i < autoStartBots.length; i += BATCH_SIZE) {
       const batch = autoStartBots.slice(i, i + BATCH_SIZE)
       if (i > 0) {
-        console.log(`[Startup] Waiting ${BATCH_DELAY_MS}ms before next batch...`)
+        logger.info('startup', `Waiting ${BATCH_DELAY_MS}ms before next batch...`)
         await new Promise(r => setTimeout(r, BATCH_DELAY_MS))
       }
-      console.log(`[Startup] Starting batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(autoStartBots.length / BATCH_SIZE)}: ${batch.join(', ')}`)
+      logger.info('startup', `Starting batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(autoStartBots.length / BATCH_SIZE)}: ${batch.join(', ')}`)
       await Promise.all(
         batch.map(botId =>
-          boundStartBotProcess(botId).catch(err => console.error(`[Startup] Failed to auto-start ${botId}:`, err))
+          boundStartBotProcess(botId).catch(err => logger.error('startup', `Failed to auto-start ${botId}`, err instanceof Error ? err.message : String(err)))
         )
       )
     }
   }
 
-  console.log(``)
-  console.log(`🚀 Bot Runner Service`)
-  console.log(`   Port: ${PORT}`)
-  console.log(`   Bots Dir: ${BOTS_DIR}`)
-  console.log(`   Templates: removed`)
-  console.log(``)
+  logger.info('startup', `Bot Runner Service started on port ${PORT} (bots dir: ${BOTS_DIR})`)
 })
 
 // ─── Graceful Shutdown ──────────────────────────────────────────────────
 
-/**
- * P1-9 FIX: Unified graceful shutdown handler.
- * Handles both SIGINT (Ctrl+C) and SIGTERM (Docker/containers/kill).
- */
 function gracefulShutdown(signal: string) {
-  console.log(`\n🛑 Received ${signal}, shutting down gracefully...`)
+  logger.info('shutdown', `Received ${signal}, shutting down gracefully...`)
   stopMonitoring()
-  stopLogCleanup() // P2-33 FIX: Stop periodic log cleanup on shutdown
-  clearAllRestartTimers() // P2-BR-4 FIX: Cancel pending auto-restart timers
+  stopLogCleanup()
+  clearAllRestartTimers()
 
-  // Stop all running bot processes
   const runningBots: string[] = []
   for (const [id, bot] of botProcesses.entries()) {
     if (bot.status === 'running' || bot.status === 'starting') {
@@ -498,23 +432,20 @@ function gracefulShutdown(signal: string) {
   }
 
   if (runningBots.length > 0) {
-    console.log(`   Stopping ${runningBots.length} bot process(es): ${runningBots.join(', ')}`)
+    logger.info('shutdown', `Stopping ${runningBots.length} bot process(es): ${runningBots.join(', ')}`)
   }
 
-  // Force exit after timeout (in case any process hangs)
   const forceExitTimer = setTimeout(() => {
-    console.log('   ⚠️  Forced exit after timeout')
+    logger.warn('shutdown', 'Forced exit after timeout')
     process.exit(1)
   }, 5000)
-  forceExitTimer.unref() // Don't let this timer prevent Node.js from exiting naturally
+  forceExitTimer.unref()
 
-  // Close HTTP server (stops accepting new connections)
   httpServer.close(() => {
-    console.log('   HTTP server closed')
+    logger.info('shutdown', 'HTTP server closed')
     process.exit(0)
   })
 
-  // Also disconnect all Socket.IO clients
   io.disconnectSockets(true)
 }
 

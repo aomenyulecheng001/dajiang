@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from 'fs'
 import { join, resolve, sep } from 'path'
+import { logger } from '@/lib/logger'
 
 /**
  * In standalone mode (output: "standalone"), the server.js calls process.chdir(__dirname)
@@ -81,7 +82,7 @@ export function getProjectRoot(): string {
   }
 
   // Fallback: use cwd
-  console.warn('[project-root] Warning: Could not determine project root, falling back to process.cwd()')
+  logger.warn('project-root', 'Could not determine project root, falling back to process.cwd()')
   _projectRoot = cwd
   return _projectRoot
 }

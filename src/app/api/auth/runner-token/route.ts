@@ -4,6 +4,7 @@ import { resolveFromProjectRoot } from '@/lib/project-root'
 import { validateSessionAsync } from '@/lib/session'
 import { extractToken, getSecureClientIp } from '@/lib/api-helpers'
 import { rateLimit, RATE_LIMIT_RUNNER_TOKEN, getRateLimitHeaders } from '@/lib/rate-limit'
+import { logger } from '@/lib/logger'
 
 function getSecretFilePath(): string {
   return resolveFromProjectRoot('mini-services', 'bot-runner', 'config', 'runner-secret')
@@ -54,7 +55,7 @@ export async function GET(request: NextRequest) {
     }
 
     const secret = (await readFile(secretFilePath, 'utf-8')).trim()
-    console.info(`[Audit] Runner token accessed by user: ${session.userId}, IP: ${clientIp}`)
+    logger.info('runner-token', `Runner token accessed by user: ${session.userId}, IP: ${clientIp}`)
     return NextResponse.json(
       { token: secret },
       {
@@ -65,7 +66,7 @@ export async function GET(request: NextRequest) {
       }
     )
   } catch (error) {
-    console.error('Failed to read runner secret:', error)
+    logger.error('runner-token', 'Failed to read runner secret', error instanceof Error ? error.message : String(error))
     return NextResponse.json({ token: '' })
   }
 }

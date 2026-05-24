@@ -61,7 +61,7 @@ Browser → Next.js (port 3000)
 ### Key Runtime Constraints
 
 - **Middleware runs in Edge Runtime** — no Node.js APIs (`fs`, `process.cwd()`, `crypto.createHmac`). Use Web Crypto API (`crypto.subtle`) for auth. Two session modules exist: `session.ts` (Node.js) and `session-edge.ts` (Edge) — both must verify tokens identically.
-- **SQLite** — single-file database at `data/bot-factory.db`. JSON fields (`codeBlocks`, `dependencies`, `envVars`, `config`, `stats`, `projectFiles`) are stored as JSON-encoded strings (no native JSON type in SQLite). Parse/serialize in API helpers.
+- **SQLite** — single-file database. Dev uses `prisma/data/bot-factory.db`, production uses `db/custom.db` (configured via `DATABASE_URL` in `.env`). Deploy scripts set DATABASE_URL to an absolute path to avoid resolution issues in standalone mode. JSON fields (`codeBlocks`, `dependencies`, `envVars`, `config`, `stats`, `projectFiles`) are stored as JSON-encoded strings (no native JSON type in SQLite). Parse/serialize in API helpers.
 - **Standalone output** — Next.js configured with `output: "standalone"`. The build script copies static files and public assets into `.next/standalone/` manually.
 
 ### Auth & Security

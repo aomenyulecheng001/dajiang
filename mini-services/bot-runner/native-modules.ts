@@ -1,3 +1,4 @@
+import { logger } from './logger'
 import { spawn, execFile } from 'child_process'
 import { readFile, writeFile, stat, readdir } from 'fs/promises'
 import { readFileSync } from 'fs'
@@ -94,7 +95,7 @@ export async function patchTelegrafRedactToken(botDir: string): Promise<void> {
       if (patched) {
         content = lines.join('\n')
         await writeFile(clientPath, content, 'utf-8')
-        console.log(`[Patch] Fixed Telegraf redactToken in ${clientPath}`)
+        logger.info('native-modules', `Fixed Telegraf redactToken in ${clientPath}`)
       }
     } catch { /* file not found or patch failed */ }
   }

@@ -2,12 +2,13 @@ import { db } from '@/lib/db'
 import { eventBus } from '@/lib/event-bus'
 import { NextResponse } from 'next/server'
 import { readFile, rm } from 'fs/promises'
-import { safeJsonParse, serializeBotResponse, getCurrentUserId, isBotOwner } from '@/lib/api-helpers'
+import { safeJsonParse, serializeBotResponse, getCurrentUserId, isBotOwner, parseJsonBody, mergeAndEncryptEnvVars } from '@/lib/api-helpers'
 import { resolveFromProjectRoot } from '@/lib/project-root'
 import { validateBotId, validateBotUpdate, validateBotPatch, sanitizeBotName, sanitizeBotDescription, sanitizeEmoji, sanitizeCustomIcon, VALID_BOT_STATUSES, VALID_BOT_HEALTHS } from '@/lib/validation'
 import type { BotStatus, BotHealth } from '@/types/bot'
-import { decryptEnvVarsMaskedAsync, decryptEnvVarsAsync, encryptEnvVarsOnSaveAsync, ENCRYPTED_PLACEHOLDER } from '@/lib/crypto'
+import { decryptEnvVarsMaskedAsync, decryptEnvVarsAsync } from '@/lib/crypto'
 import { BOT_RUNNER_URL } from '@/lib/bot-runner-url'
+import { logger } from '@/lib/logger'
 
 async function checkOwnership(request: Request, botId: string): Promise<{ authorized: boolean; userId: string | null }> {
   const userId = await getCurrentUserId(request)
@@ -42,7 +43,7 @@ async function checkOwnership(request: Request, botId: string): Promise<{ author
       const currentBot = await db.bot.findUnique({ where: { id: botId }, select: { ownerId: true } })
       return { authorized: currentBot?.ownerId === userId, userId }
     }
-    console.warn(`[Security] Bot ${botId} has no ownerId — access denied. Set ALLOW_BOT_AUTO_CLAIM=true or assign ownerId manually.`)
+    logger.warn('bot-api', `Bot ${botId} has no ownerId — access denied. Set ALLOW_BOT_AUTO_CLAIM=true or assign ownerId manually.`)
     return { authorized: false, userId }
   }
   return { authorized: isBotOwner(bot.ownerId, userId), userId }
@@ -107,7 +108,7 @@ export async function GET(
       headers: { 'Cache-Control': 'private, no-store, no-cache, must-revalidate' },
     })
   } catch (error) {
-    console.error(`GET /api/bots/${id} error:`, error)
+    logger.error('bot-api', `GET /api/bots/${id} error`, error instanceof Error ? error.message : String(error))
     return NextResponse.json({ error: 'Failed to fetch bot' }, { status: 500 })
   }
 }
@@ -131,25 +132,10 @@ export async function PUT(
       return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
 
-    // Parse request body with size limit protection
-    let bot: Record<string, unknown>
-    try {
-      const text = await request.text()
-      if (!text.trim()) {
-        return NextResponse.json({ error: 'Request body is empty' }, { status: 400 })
-      }
-      if (Buffer.byteLength(text, 'utf-8') > 25_000_000) {
-        return NextResponse.json({ error: 'Request body too large (max 25MB)' }, { status: 413 })
-      }
-      bot = JSON.parse(text)
-    } catch {
-      return NextResponse.json({ error: 'Invalid JSON in request body' }, { status: 400 })
-    }
-
-    // Ensure body is a plain object
-    if (typeof bot !== 'object' || bot === null || Array.isArray(bot)) {
-      return NextResponse.json({ error: 'Request body must be a JSON object' }, { status: 400 })
-    }
+    // Parse request body with size limit protection (shared utility)
+    const parsed = await parseJsonBody(request)
+    if (parsed instanceof NextResponse) return parsed
+    const bot = parsed
 
     // Full input validation
     const validation = validateBotUpdate(bot)
@@ -164,8 +150,8 @@ export async function PUT(
     // When the client sends masked placeholders (••••••••••••) for encrypted vars,
     // preserve the existing encrypted value from the database instead of encrypting
     // the placeholder and destroying the real secret.
-    const incomingEnvVars = (bot.envVars as { key: string; value: string; isEncrypted?: boolean }[]) || []
-    
+    const incomingEnvVars = (bot.envVars as { key: string; value: string; isEncrypted?: boolean; id?: string; description?: string }[]) || []
+
     const updated = await db.$transaction(async (tx) => {
       const existingBot = await tx.bot.findUnique({
         where: { id },
@@ -174,24 +160,7 @@ export async function PUT(
       if (!existingBot) {
         throw new Error('BOT_NOT_FOUND')
       }
-      const existingEnvVarsForMerge = safeJsonParse(existingBot.envVars, []) as { key: string; value: string; isEncrypted?: boolean }[]
-      const mergedEnvVars = incomingEnvVars.map((incoming) => {
-        if (incoming.value === ENCRYPTED_PLACEHOLDER && incoming.isEncrypted) {
-          const existing = existingEnvVarsForMerge.find((e) => e.key === incoming.key)
-          if (existing && existing.isEncrypted) {
-            return { ...incoming, value: existing.value }
-          }
-        }
-        return incoming
-      })
-      const needsReEncrypt = mergedEnvVars.filter(
-        (v) => !existingEnvVarsForMerge.some(
-          (e) => e.key === v.key && e.value === v.value && v.isEncrypted,
-        ),
-      )
-      const processedEnvVars = needsReEncrypt.length > 0
-        ? await encryptEnvVarsOnSaveAsync(mergedEnvVars)
-        : mergedEnvVars
+      const processedEnvVars = await mergeAndEncryptEnvVars(incomingEnvVars, existingBot.envVars)
       const existingConfig = safeJsonParse(existingBot.config, {}) as Record<string, unknown>
       const configObj = { ...existingConfig, ...((bot.config as Record<string, unknown>) || {}) }
       if (!(('webhookSecret' in ((bot.config as Record<string, unknown>) || {}))) && existingBot.webhookSecret) {
@@ -240,7 +209,7 @@ export async function PUT(
     if (error instanceof Error && error.message === 'BOT_NOT_FOUND') {
       return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
-    console.error(`PUT /api/bots/${id} error:`, error)
+    logger.error('bot-api', `PUT /api/bots/${id} error`, error instanceof Error ? error.message : String(error))
     return NextResponse.json({ error: 'Failed to update bot' }, { status: 500 })
   }
 }
@@ -264,24 +233,10 @@ export async function PATCH(
       return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
 
-    // Parse request body with size limit protection (outside transaction to avoid holding it open)
-    let body: Record<string, unknown>
-    try {
-      const text = await request.text()
-      if (!text.trim()) {
-        return NextResponse.json({ error: 'Request body is empty' }, { status: 400 })
-      }
-      if (Buffer.byteLength(text, 'utf-8') > 25_000_000) {
-        return NextResponse.json({ error: 'Request body too large (max 25MB)' }, { status: 413 })
-      }
-      body = JSON.parse(text)
-    } catch {
-      return NextResponse.json({ error: 'Invalid JSON in request body' }, { status: 400 })
-    }
-
-    if (typeof body !== 'object' || body === null || Array.isArray(body)) {
-      return NextResponse.json({ error: 'Request body must be a JSON object' }, { status: 400 })
-    }
+    // Parse request body with size limit protection (shared utility)
+    const parsed = await parseJsonBody(request)
+    if (parsed instanceof NextResponse) return parsed
+    const body = parsed
 
     // Partial input validation (all fields optional for PATCH)
     const validation = validateBotPatch(body)
@@ -329,25 +284,8 @@ export async function PATCH(
       if ('codeBlocks' in body) updateData.codeBlocks = JSON.stringify(body.codeBlocks || [])
       if ('dependencies' in body) updateData.dependencies = JSON.stringify(body.dependencies || [])
       if ('envVars' in body) {
-        const incomingEnvVars = (body.envVars as { key: string; value: string; isEncrypted?: boolean }[]) || []
-        const existingEnvVars = safeJsonParse(existing.envVars, []) as { key: string; value: string; isEncrypted?: boolean }[]
-        const mergedEnvVars = incomingEnvVars.map((incoming) => {
-          if (incoming.value === ENCRYPTED_PLACEHOLDER && incoming.isEncrypted) {
-            const existingVar = existingEnvVars.find((e) => e.key === incoming.key)
-            if (existingVar && existingVar.isEncrypted) {
-              return { ...incoming, value: existingVar.value }
-            }
-          }
-          return incoming
-        })
-        const needsReEncrypt = mergedEnvVars.filter(
-          (v) => !existingEnvVars.some(
-            (e) => e.key === v.key && e.value === v.value && v.isEncrypted,
-          ),
-        )
-        const processedEnvVars = needsReEncrypt.length > 0
-          ? await encryptEnvVarsOnSaveAsync(mergedEnvVars)
-          : mergedEnvVars
+        const incomingEnvVars = (body.envVars as { key: string; value: string; isEncrypted?: boolean; id?: string; description?: string }[]) || []
+        const processedEnvVars = await mergeAndEncryptEnvVars(incomingEnvVars, existing.envVars)
         updateData.envVars = JSON.stringify(processedEnvVars)
       }
       if ('config' in body) {
@@ -387,7 +325,7 @@ export async function PATCH(
     if (error instanceof Error && error.message === 'BOT_NOT_FOUND') {
       return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
-    console.error(`PATCH /api/bots/${id} error:`, error)
+    logger.error('bot-api', `PATCH /api/bots/${id} error`, error instanceof Error ? error.message : String(error))
     return NextResponse.json({ error: 'Failed to update bot' }, { status: 500 })
   }
 }
@@ -432,7 +370,7 @@ export async function DELETE(
     }
 
     // SECURITY FIX (SEC-86): Audit log for bot deletion
-    console.info(`[Audit] Bot deleted: id=${id}, owner=${deleteUserId || 'unknown'}`)
+    logger.info('bot-api', `Bot deleted: id=${id}, owner=${deleteUserId || 'unknown'}`)
 
     // P1 OPT: Emit deleted event so SSE clients disconnect gracefully
     eventBus.emit(`bot:${id}`, 'deleted', { botId: id })
@@ -456,10 +394,10 @@ export async function DELETE(
         signal: AbortSignal.timeout(15000), // 15s — process needs time to exit
       })
       if (!resp.ok) {
-        console.warn(`[DELETE] Runner cleanup returned ${resp.status} for bot ${id}`)
+        logger.warn('bot-api', `Runner cleanup returned ${resp.status} for bot ${id}`)
       }
     } catch (err) {
-      console.warn(`[DELETE] Runner cleanup request failed for bot ${id}:`, err instanceof Error ? err.message : err)
+      logger.warn('bot-api', `Runner cleanup request failed for bot ${id}`, err instanceof Error ? err.message : err)
       // Continue with file cleanup even if runner is unreachable
     }
 
@@ -476,7 +414,7 @@ export async function DELETE(
       const expectedLogsDir = resolveFromProjectRoot('mini-services', 'bot-runner', 'logs')
       const expectedConfigDir = resolveFromProjectRoot('mini-services', 'bot-runner', 'config')
       if (!botDir.startsWith(expectedBotsDir) || !logFile.startsWith(expectedLogsDir) || !configFile.startsWith(expectedConfigDir)) {
-        console.error(`[SECURITY] Path traversal detected in bot delete: id=${id}, botDir=${botDir}`)
+        logger.error('bot-api', `Path traversal detected in bot delete: id=${id}, botDir=${botDir}`)
       } else {
         await Promise.all([
           rm(botDir, { recursive: true, force: true }),
@@ -486,7 +424,7 @@ export async function DELETE(
         ])
       }
     } catch (err) {
-      console.warn(`[DELETE] File cleanup warning for bot ${id}:`, err instanceof Error ? err.message : err)
+      logger.warn('bot-api', `File cleanup warning for bot ${id}`, err instanceof Error ? err.message : err)
     }
 
     return NextResponse.json({ success: true })
@@ -494,7 +432,7 @@ export async function DELETE(
     if (isPrismaNotFoundError(error)) {
       return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
-    console.error(`DELETE /api/bots/${id} error:`, error)
+    logger.error('bot-api', `DELETE /api/bots/${id} error`, error instanceof Error ? error.message : String(error))
     return NextResponse.json({ error: 'Failed to delete bot' }, { status: 500 })
   }
 }

@@ -6,6 +6,7 @@ import { getBotDir, loadBotConfigAsync, sanitizeBotId, CONFIG_DIR } from './util
 import { MAX_LOG_LINES, LOGS_DIR } from './log-manager'
 import { deployBot } from './deploy'
 import { cancelRestartTimer, markIntentionalStop, clearIntentionalStop, intentionalStopSet, memoryKilledSet } from './process-manager'
+import { logger } from './logger'
 
 // ─── Deploy Concurrency Control ──────────────────────────────────────────────
 // BUG FIX: Use Map with abort flag instead of Set, so we can cancel in-progress
@@ -62,7 +63,7 @@ async function loadBotOrCreate(
     maxMemoryMb: 256,
   }
   botProcesses.set(botId, bot)
-  console.log(`[Load] Loaded config from disk for ${botId}`)
+  logger.info('load', `Loaded config from disk for ${botId}`)
   return bot
 }
 
@@ -97,9 +98,11 @@ export function registerHandlers(
 ): void {
 
   io.on('connection', (socket) => {
-    console.log(`[Socket] 客户端连接: ${socket.id}`)
+    logger.info('socket', `Client connected: ${socket.id}`)
 
-    // Send current state (filter out BOT_TOKEN from env var names)
+    // Send current state (filter out sensitive env var keys from client)
+    // CANONICAL SOURCE: Keep in sync with src/lib/security-utils.ts SENSITIVE_ENV_KEY_PATTERNS.
+    // Any changes here should be mirrored there and vice versa.
 const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIKEY', 'API_KEY', 'ACCESS_KEY', 'PRIVATE', 'CREDENTIAL', 'DATABASE_URL']
 
     socket.emit('init', {
@@ -140,7 +143,7 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
 
       const abortCtrl = { aborted: false }
       activeDeploys.set(botId, abortCtrl)
-      console.log(`[Deploy] ${data.config.name} (${botId})`)
+      logger.info('deploy', `${data.config.name} (${botId})`)
       try {
         await deployBot(botId, data.config, botProcesses, deployStatus, startBotProcess, () => abortCtrl.aborted)
       } catch (err: unknown) {
@@ -151,7 +154,7 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
         // - Native module rebuild failures (better-sqlite3)
         // - Disk space exhaustion
         const message = err instanceof Error ? err.message : String(err)
-        console.error(`[Deploy] ${data.config.name} (${botId}) failed:`, message)
+        logger.error('deploy', `${data.config.name} (${botId}) failed`, message)
         io.emit('bot:status', { botId, status: 'error', error: message })
         io.emit('deploy:progress', { botId, stage: 'error' as DeployStage, progress: 0, logs: [`❌ 部署失败: ${message}`] })
       } finally {
@@ -167,7 +170,7 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
       if (!isValidBotId(data.botId)) return
       const botId = safeSanitizeBotId(data.botId)
       if (!botId) return
-      console.log(`[Stop] ${botId}`)
+      logger.info('stop', botId)
 
       // BUG FIX: Cancel any in-progress deploy for this bot.
       // Without this, stopping during a deploy doesn't prevent the deploy
@@ -190,7 +193,7 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
         socket.emit('bot:status', { botId: data.botId, status: 'error', error: 'Invalid bot ID' })
         return
       }
-      console.log(`[Start] ${botId}`)
+      logger.info('start', botId)
 
       // BUG FIX: Cancel any pending auto-restart timer before manual start.
       // Without this, if the bot crashed and an auto-restart timer is pending,
@@ -223,7 +226,7 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
         socket.emit('bot:status', { botId: data.botId, status: 'error', error: 'Invalid bot ID' })
         return
       }
-      console.log(`[Restart] ${botId}`)
+      logger.info('restart', botId)
 
       // BUG FIX: Cancel any pending auto-restart timer to prevent double-start
       cancelRestartTimer(botId)
@@ -255,7 +258,7 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
             b.restartCount = 0 // Reset restart count on manual restart
             b.logBuffer = []
             clearIntentionalStop(botId)
-            startBotProcess(botId).catch(e => console.error('[Restart timeout] start failed:', e))
+            startBotProcess(botId).catch(e => logger.error('restart-timeout', 'start failed', e instanceof Error ? e.message : String(e)))
           }
         }, 6000)
         restartTimeout.unref()
@@ -267,7 +270,7 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
             b.restartCount = 0 // Reset restart count on manual restart
             b.logBuffer = []
             clearIntentionalStop(botId)
-            startBotProcess(botId).catch(e => console.error('[Restart close] start failed:', e))
+            startBotProcess(botId).catch(e => logger.error('restart-close', 'start failed', e instanceof Error ? e.message : String(e)))
           }
         })
       } else {
@@ -287,7 +290,7 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
       if (!isValidBotId(data.botId)) return
       const botId = safeSanitizeBotId(data.botId)
       if (!botId) return
-      console.log(`[Delete] ${botId}`)
+      logger.info('delete', botId)
       // BUG FIX: Cancel auto-restart timer before stopping for delete
       cancelRestartTimer(botId)
       // Also cancel any in-progress deploy
@@ -301,7 +304,7 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
         deleteCalled = true
         // Check if the bot was re-deployed while we were waiting
         if (botProcesses.has(botId) && botProcesses.get(botId)?.status === 'running') {
-          console.log(`[Delete] Bot ${botId} was restarted, skipping file deletion`)
+          logger.info('delete', `Bot ${botId} was restarted, skipping file deletion`)
           return
         }
         const botDir = getBotDir(botId)
@@ -374,7 +377,7 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
 
       const abortCtrl = { aborted: false }
       activeDeploys.set(botId, abortCtrl)
-      console.log(`[Recover] ${botId}`)
+      logger.info('recover', botId)
       try {
         const savedConfig = await loadBotConfigAsync(botId)
         if (!savedConfig) {
@@ -405,7 +408,7 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
     })
 
     socket.on('disconnect', () => {
-      console.log(`[Socket] 客户端断开: ${socket.id}`)
+      logger.info('socket', `Client disconnected: ${socket.id}`)
     })
 
     // ── PM2-style process management events ──────────────────────────────
@@ -458,7 +461,7 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
               b.restartCount = 0
               b.logBuffer = []
               clearIntentionalStop(botId)
-              startBotProcess(botId).catch(e => console.error('[PM2 restart timeout] start failed:', e))
+              startBotProcess(botId).catch(e => logger.error('pm2-restart-timeout', 'start failed', e instanceof Error ? e.message : String(e)))
             }
           }, 6000)
           restartTimeout.unref()
@@ -470,7 +473,7 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
               b.restartCount = 0
               b.logBuffer = []
               clearIntentionalStop(botId)
-              startBotProcess(botId).catch(e => console.error('[PM2 restart close] start failed:', e))
+              startBotProcess(botId).catch(e => logger.error('pm2-restart-close', 'start failed', e instanceof Error ? e.message : String(e)))
             }
           })
         } else {
@@ -521,7 +524,7 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
           callback?.({ success: false, error: 'Invalid bot ID' })
           return
         }
-        console.log(`[PM2:Delete] ${botId}`)
+        logger.info('pm2-delete', botId)
         // BUG FIX: Cancel auto-restart timer and active deploy before stopping for delete
         cancelRestartTimer(botId)
         cancelActiveDeploy(botId)
@@ -535,7 +538,7 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
           deleteCalled = true
           // Check if the bot was re-deployed while we were waiting
           if (botProcesses.has(botId) && botProcesses.get(botId)?.status === 'running') {
-            console.log(`[PM2:Delete] Bot ${botId} was restarted, skipping file deletion`)
+            logger.info('pm2-delete', `Bot ${botId} was restarted, skipping file deletion`)
             callback?.({ success: false, error: 'Bot was restarted during deletion' })
             return
           }
@@ -557,7 +560,7 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
           intentionalStopSet.delete(botId)
           memoryKilledSet.delete(botId)
 
-          console.log(`[PM2:Delete] ${botId} fully removed (memory + disk)`)
+          logger.info('pm2-delete', `${botId} fully removed (memory + disk)`)
           // FIX: Broadcast bot:deleted to all clients (not just the requester)
           io.emit('bot:deleted', { botId })
           callback?.({ success: true })
@@ -566,7 +569,7 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
         if (bot?.process) {
           // Wait for process to close, with a 5s timeout fallback
           const closeTimeout = setTimeout(() => {
-            console.log(`[PM2:Delete] Timeout waiting for ${botId} to close, proceeding with deletion`)
+            logger.info('pm2-delete', `Timeout waiting for ${botId} to close, proceeding with deletion`)
             deleteFiles()
           }, 5000)
           bot.process.once('close', () => {
@@ -578,7 +581,7 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
           deleteFiles()
         }
       } catch (err: unknown) {
-        console.error(`[PM2:Delete] Error deleting ${rawBotId}:`, err instanceof Error ? err.message : err)
+        logger.error('pm2-delete', `Error deleting ${rawBotId}`, err instanceof Error ? err.message : String(err))
         callback?.({ success: false, error: err instanceof Error ? err.message : String(err) })
       }
     })

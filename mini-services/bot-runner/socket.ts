@@ -1,6 +1,7 @@
 import { createServer, type Server as HTTPServer, type IncomingMessage, type ServerResponse } from 'http'
 import { Server as SocketIOServer } from 'socket.io'
 import { randomBytes, timingSafeEqual, createHash } from 'crypto'
+import { logger } from './logger'
 import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync } from 'fs'
 import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
@@ -66,7 +67,7 @@ const ALLOWED_ORIGINS = (() => {
   // Fallback: if no origins are configured, allow localhost (safe default for dev)
   if (origins.length === 0) {
     if (process.env.NODE_ENV === 'production') {
-      console.error('[Socket] No CORS origins configured in production. Set SERVER_ORIGIN env var. Rejecting all origins.')
+      logger.error('socket', 'No CORS origins configured in production. Set SERVER_ORIGIN env var. Rejecting all origins.')
     } else {
       origins.push('http://localhost:3000', 'http://127.0.0.1:3000')
     }
@@ -108,14 +109,14 @@ export const io = new SocketIOServer(httpServer, {
 io.use((socket, next) => {
   const token = socket.handshake.auth?.token as string | undefined
   if (!token) {
-    console.warn(`[Socket] Rejected unauthorized connection from ${socket.handshake.address}`)
+    logger.warn('socket', `Rejected unauthorized connection from ${socket.handshake.address}`)
     return next(new Error('Authentication required'))
   }
   // Hash both values so timingSafeEqual always compares equal-length buffers
   const tokenHash = createHash('sha256').update(token, 'utf-8').digest()
   const secretHash = createHash('sha256').update(RUNNER_SECRET, 'utf-8').digest()
   if (!timingSafeEqual(tokenHash, secretHash)) {
-    console.warn(`[Socket] Rejected unauthorized connection from ${socket.handshake.address}`)
+    logger.warn('socket', `Rejected unauthorized connection from ${socket.handshake.address}`)
     return next(new Error('Authentication required'))
   }
   next()

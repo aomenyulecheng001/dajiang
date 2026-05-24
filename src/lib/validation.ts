@@ -255,6 +255,13 @@ export function validateBotCreate(body: Record<string, unknown>): ValidationResu
     errors.push(...validateEntryPoint(body.entryPoint))
   }
 
+  // Optional: lastDeployedAt (ISO 8601 date)
+  if (body.lastDeployedAt !== undefined && body.lastDeployedAt !== null) {
+    if (!isString(body.lastDeployedAt) || isNaN(Date.parse(body.lastDeployedAt as string))) {
+      errors.push(err('lastDeployedAt', 'lastDeployedAt must be a valid ISO 8601 date string'))
+    }
+  }
+
   return { valid: errors.length === 0, errors }
 }
 
@@ -382,6 +389,12 @@ export function validateBotPatch(body: Record<string, unknown>): ValidationResul
 
   if ('entryPoint' in body && body.entryPoint !== undefined && body.entryPoint !== null) {
     errors.push(...validateEntryPoint(body.entryPoint))
+  }
+
+  if ('lastDeployedAt' in body && body.lastDeployedAt !== undefined && body.lastDeployedAt !== null) {
+    if (!isString(body.lastDeployedAt) || isNaN(Date.parse(body.lastDeployedAt as string))) {
+      errors.push(err('lastDeployedAt', 'lastDeployedAt must be a valid ISO 8601 date string'))
+    }
   }
 
   return { valid: errors.length === 0, errors }

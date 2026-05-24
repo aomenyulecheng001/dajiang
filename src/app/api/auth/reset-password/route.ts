@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { resetPassword } from '@/lib/auth'
 import { validateSessionAsync } from '@/lib/session'
 import { extractToken, isSecureRequest } from '@/lib/api-helpers'
+import { logger } from '@/lib/logger'
 
 export async function POST(request: NextRequest) {
   try {
@@ -105,7 +106,7 @@ export async function POST(request: NextRequest) {
 
     return response
   } catch (error) {
-    console.error('[Auth] Password reset error:', error)
+    logger.error('reset-password', 'Password reset error', error instanceof Error ? error.message : String(error))
     return NextResponse.json(
       { error: 'Internal server error' },
       { status: 500 }

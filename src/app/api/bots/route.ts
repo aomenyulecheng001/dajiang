@@ -1,10 +1,11 @@
 import { db } from '@/lib/db'
 import { NextResponse } from 'next/server'
-import { safeJsonParse, serializeBotListResponse, serializeBotResponse, getCurrentUserId } from '@/lib/api-helpers'
+import { safeJsonParse, serializeBotListResponse, serializeBotResponse, getCurrentUserId, parseJsonBody } from '@/lib/api-helpers'
 import { validateBotCreate, sanitizeBotName, sanitizeBotDescription, sanitizeEmoji, sanitizeCustomIcon } from '@/lib/validation'
 import { decryptEnvVarsMaskedAsync, decryptEnvVarsAsync, encryptEnvVarsOnSaveAsync } from '@/lib/crypto'
 import { PAGINATION } from '@/lib/bot-constants'
 import { generateSecret } from '@/lib/utils'
+import { logger } from '@/lib/logger'
 
 function generateWebhookSecret(): string {
   return generateSecret()
@@ -102,7 +103,7 @@ export async function GET(request: Request) {
       },
     })
   } catch (error) {
-    console.error('GET /api/bots error:', error)
+    logger.error('bots', 'GET /api/bots error', error instanceof Error ? error.message : String(error))
     return NextResponse.json({ error: 'Failed to fetch bots' }, { status: 500 })
   }
 }
@@ -114,33 +115,10 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    // Parse request body with size limit protection
-    let bot: Record<string, unknown>
-    try {
-      const text = await request.text()
-      if (!text.trim()) {
-        return NextResponse.json({ error: 'Request body is empty' }, { status: 400 })
-      }
-      // Reject payloads larger than 25MB (projectFiles from Git/ZIP can be large)
-      // Use Buffer.byteLength() instead of text.length.
-      // text.length counts UTF-16 code units, not actual bytes.
-      // For multi-byte content (Chinese descriptions, base64 customIcon),
-      // the actual size could be 2-3× the character count.
-      if (Buffer.byteLength(text, 'utf-8') > 25_000_000) {
-        return NextResponse.json({ error: 'Request body too large (max 25MB)' }, { status: 413 })
-      }
-      bot = JSON.parse(text)
-    } catch {
-      return NextResponse.json(
-        { error: 'Invalid JSON in request body' },
-        { status: 400 }
-      )
-    }
-
-    // Ensure body is a plain object (not array, null, etc.)
-    if (typeof bot !== 'object' || bot === null || Array.isArray(bot)) {
-      return NextResponse.json({ error: 'Request body must be a JSON object' }, { status: 400 })
-    }
+    // Parse request body with size limit protection (shared utility)
+    const parsed = await parseJsonBody(request)
+    if (parsed instanceof NextResponse) return parsed
+    const bot = parsed
 
     // Full input validation
     const validation = validateBotCreate(bot)
@@ -194,13 +172,13 @@ export async function POST(request: Request) {
     const created = await db.bot.create({ data: createData })
 
     // SECURITY FIX (SEC-86): Audit log for bot creation
-    console.info(`[Audit] Bot created: id=${created.id}, name=${sanitizeBotName(bot.name)}, owner=${userId}`)
+    logger.info('bots', `Bot created: id=${created.id}, name=${sanitizeBotName(bot.name)}, owner=${userId}`)
 
     // POST returns full bot data (including envVars for immediate use)
     const serialized = await serializeBotResponse(created, decryptEnvVarsMaskedAsync, decryptEnvVarsAsync)
-    return NextResponse.json(serialized)
+    return NextResponse.json(serialized, { status: 201 })
   } catch (error: unknown) {
-    console.error('POST /api/bots error:', error)
+    logger.error('bots', 'POST /api/bots error', error instanceof Error ? error.message : String(error))
     // Handle Prisma unique constraint violations with specific error messages
     if (error && typeof error === 'object' && 'code' in error && (error as { code: string }).code === 'P2002') {
       const meta = 'meta' in error ? (error as { meta?: { target?: string[] } }).meta : undefined

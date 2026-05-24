@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { validateBotId } from '@/lib/validation'
 import { getCurrentUserId, isBotOwner } from '@/lib/api-helpers'
+import { logger } from '@/lib/logger'
 
 const STATS_CACHE_TTL = 10_000
 const MAX_CACHE_SIZE = 200
@@ -133,7 +134,7 @@ export async function GET(
 
     return NextResponse.json(result)
   } catch (error) {
-    console.error(`[Stats] Failed to compute stats for bot ${botId}:`, error)
+    logger.error('bot-stats', `Failed to compute stats for bot ${botId}`, error instanceof Error ? error.message : String(error))
     return NextResponse.json({ error: 'Failed to compute stats' }, { status: 500 })
   }
 }

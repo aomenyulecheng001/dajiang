@@ -1,6 +1,7 @@
 import type { Bot, Dependency, ProjectFile } from '@/types/bot'
 import type { DeployConfig } from '@/lib/bot-runner-context'
 import { useI18nStore, getTranslation } from '@/lib/i18n'
+import { logger } from '@/lib/logger'
 
 interface PrepareDeployResult {
   config: DeployConfig['config']
@@ -30,7 +31,7 @@ export async function fetchRevealEnvVars(botId: string): Promise<{ envVarsMap: R
       return { envVarsMap, botToken }
     }
   } catch (err) {
-    console.warn('[deploy-utils] fetchRevealEnvVars failed:', err instanceof Error ? err.message : err)
+    logger.warn('deploy-utils', 'fetchRevealEnvVars failed.', err instanceof Error ? err.message : err)
   }
   return null
 }

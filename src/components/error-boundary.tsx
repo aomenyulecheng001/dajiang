@@ -4,6 +4,7 @@ import React from 'react'
 import { AlertTriangle, RotateCcw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { useI18nStore, type Locale } from '@/lib/i18n'
+import { logger } from '@/lib/logger'
 
 interface ErrorBoundaryProps {
   children: React.ReactNode
@@ -41,7 +42,7 @@ export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoun
   }
 
   componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
-    console.error('[ErrorBoundary] Unhandled error:', error, errorInfo)
+    logger.error('error-boundary', 'Unhandled error', { message: error instanceof Error ? error.message : String(error), componentStack: errorInfo.componentStack })
   }
 
   handleReset = () => {

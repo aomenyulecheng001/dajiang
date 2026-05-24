@@ -8,6 +8,7 @@
  */
 
 import { createHash, timingSafeEqual } from 'crypto'
+import { logger } from '@/lib/logger'
 
 // ─── Path Validation ────────────────────────────────────────────────────────
 
@@ -44,6 +45,20 @@ export function isValidFilename(filename: string): boolean {
   if (filename === '.' || filename === '..') return false
   return true
 }
+
+// ─── Sensitive Env Var Key Patterns ──────────────────────────────────────────
+
+/**
+ * Env var key name patterns that should never be exposed to clients.
+ * Used when filtering bot env var keys in API responses and Socket.IO events.
+ *
+ * CANONICAL SOURCE: Keep in sync with mini-services/bot-runner/handlers.ts
+ * SENSITIVE_ENV_PATTERNS. Any changes here should be mirrored there.
+ */
+export const SENSITIVE_ENV_KEY_PATTERNS = [
+  'BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIKEY', 'API_KEY',
+  'ACCESS_KEY', 'PRIVATE', 'CREDENTIAL', 'DATABASE_URL',
+] as const
 
 // ─── Sensitive Data Sanitization ────────────────────────────────────────────
 
@@ -197,7 +212,7 @@ export function createSecureError(
     const sanitizedDetails = typeof internalDetails === 'string' 
       ? redactSensitiveData(internalDetails)
       : '[OBJECT]'
-    console.error(`[Security] Error (${errorType}): ${sanitizedDetails}`)
+    logger.error('security-utils', `Error (${errorType}): ${sanitizedDetails}`)
   }
   
   return SECURE_ERROR_RESPONSES[errorType]

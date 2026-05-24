@@ -52,6 +52,7 @@ async function getNodePath(): Promise<string> {
   return 'node'
 }
 
+import { logger } from './logger'
 import { getBotDir, loadBotConfigAsync, CONFIG_DIR } from './utils'
 import { appendLog } from './log-manager'
 import { io } from './socket'
@@ -239,14 +240,14 @@ export async function handleBotExit(
   // BUG FIX: If a new process was started (e.g., re-deploy), ignore the exit
   // of the old process — it's stale and would corrupt the new process record.
   if (exitedProcess && bot.process && bot.process !== exitedProcess) {
-    console.log(`[Exit] Ignoring stale process exit for ${botId} — a new process is already running`)
+    logger.info('process-manager', `Ignoring stale process exit for ${botId} — a new process is already running`)
     return
   }
   // BUG FIX: Also ignore if the BotProcess record was replaced (e.g., deploy timeout
   // created a new record before old process exited). Without this, handleBotExit would
   // corrupt the new record by setting status='stopped' and stale exitCode.
   if (exitedProcess && !bot.process) {
-    console.log(`[Exit] Ignoring stale process exit for ${botId} — process record was replaced`)
+    logger.info('process-manager', `Ignoring stale process exit for ${botId} — process record was replaced`)
     return
   }
 
@@ -284,6 +285,17 @@ export async function handleBotExit(
   // Without this, a prior auto-restart timer could fire during/after a manual restart,
   // causing a double-start.
   cancelRestartTimer(botId)
+
+  // FIX: Never auto-restart after a spawn error (ENOENT/EACCES).
+  // These are permanent failures — restarting will fail the same way.
+  if (bot._spawnError) {
+    bot.status = 'error'
+    bot.error = '进程启动失败: 运行时或命令不存在。请检查运行环境配置。'
+    appendLog(botId, bot.error, 'error')
+    bot._spawnError = undefined // Clear flag after handling
+    io.emit('bot:status', { botId, status: 'error', error: bot.error })
+    return
+  }
 
   // Determine the effective max restarts based on fast-fail detection
   const effectiveMaxRestarts = isFastFail ? FAST_FAIL_MAX_RESTARTS : bot.maxRestarts
@@ -415,7 +427,7 @@ export async function startBotProcess(
 
   // P1-FIX: Guard against double-start — prevent orphaned processes
   if (bot.status === 'running' || bot.status === 'stopping' || bot.status === 'starting') {
-    console.warn(`[Start] Bot ${botId} is ${bot.status}, skipping start`)
+    logger.warn('process-manager', `Bot ${botId} is ${bot.status}, skipping start`)
     return
   }
 
@@ -461,7 +473,7 @@ export async function startBotProcess(
     if (SAFE_ENV_KEYS.has(k)) continue // Already set above (from host env)
     // BUG FIX: Use prefix check for BASH_FUNC_* since Set.has() doesn't support globs
     if (DANGEROUS_ENV_KEYS.has(k) || k.startsWith('BASH_FUNC_')) {
-      console.warn(`[Security] Blocked dangerous env var: ${k}`)
+      logger.warn('process-manager', `Blocked dangerous env var: ${k}`)
       continue
     }
     safeEnv[k] = v
@@ -541,12 +553,21 @@ export async function startBotProcess(
   child.on('error', (err) => {
     bot.status = 'error'
     bot.error = err.message
-    appendLog(botId, `进程错误: ${err.message}`, 'error')
+    // FIX: Mark spawn errors (ENOENT, EACCES) as permanent failures to prevent
+    // auto-restart loop. These errors mean the command/runtime doesn't exist
+    // (e.g., tsx not installed, wrong Node.js path) and restarting won't help.
+    const code = (err as NodeJS.ErrnoException).code
+    if (code === 'ENOENT' || code === 'EACCES') {
+      bot._spawnError = true
+      appendLog(botId, `进程启动失败 (${code}): ${err.message} — 不会自动重启`, 'error')
+    } else {
+      appendLog(botId, `进程错误: ${err.message}`, 'error')
+    }
     io.emit('bot:status', { botId, status: 'error', error: err.message })
   })
 
   child.on('close', (code, signal) => {
-    handleExit(botId, code, signal, child).catch(e => console.error(`[Process] handleExit error for ${botId}:`, e))
+    handleExit(botId, code, signal, child).catch(e => logger.error('process-manager', `handleExit error for ${botId}:`, e))
   })
 
   io.emit('bot:status', { botId, status: 'running', pid: child.pid })

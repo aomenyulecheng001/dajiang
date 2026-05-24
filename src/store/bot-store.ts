@@ -6,6 +6,7 @@ import type { Locale } from '@/lib/i18n'
 import { useI18nStore } from '@/lib/i18n'
 import { generateUUID, generateSecret } from '@/lib/utils'
 import { PAGINATION } from '@/lib/bot-constants'
+import { logger } from '@/lib/logger'
 
 // ─── Store Interface ───────────────────────────────────────────────────────
 
@@ -257,6 +258,27 @@ function stripEnvVarIds(envVars: unknown): unknown {
 const LARGE_ARRAY_KEYS = new Set(['projectFiles', 'codeBlocks', 'code'])
 const LARGE_ARRAY_THRESHOLD = 50
 
+/**
+ * PERF FIX: Dedicated projectFiles comparator with O(n) path-indexed lookup
+ * and early exit. Avoids JSON.stringify() on up to 25MB of data that would
+ * block the main thread for hundreds of milliseconds on every keystroke.
+ */
+function isProjectFilesEqual(a: unknown, b: unknown): boolean {
+  if (!Array.isArray(a) || !Array.isArray(b)) return false
+  if (a.length !== b.length) return false
+  // Build path→content index for O(n) comparison with early exit
+  const bIndex = new Map<string, unknown>()
+  for (const f of b as Array<Record<string, unknown>>) {
+    if (f && typeof f.path === 'string') bIndex.set(f.path, f.content)
+  }
+  for (const f of a as Array<Record<string, unknown>>) {
+    if (!f || typeof f.path !== 'string') return false
+    if (!bIndex.has(f.path)) return false
+    if (f.content !== bIndex.get(f.path)) return false
+  }
+  return true
+}
+
 function fastArrayEqual(a: unknown, b: unknown): boolean {
   if (!Array.isArray(a) || !Array.isArray(b)) return false
   if (a.length !== b.length) return false
@@ -283,7 +305,9 @@ function computePatchDiff(bot: Bot, prev: Record<string, unknown> | undefined): 
     if (key === 'envVars') {
       if (isDeepEqual(stripEnvVarIds(prevVal), stripEnvVarIds(value))) continue
     } else if (REF_EQUAL_FIELDS.has(key)) { if (value === prevVal) continue }
-    else if (LARGE_ARRAY_KEYS.has(key)) {
+    else if (key === 'projectFiles' && Array.isArray(value)) {
+      if (isProjectFilesEqual(prevVal, value)) continue
+    } else if (LARGE_ARRAY_KEYS.has(key)) {
       if (fastArrayEqual(prevVal, value)) continue
     } else if (isDeepEqual(prevVal, value)) continue
     patchData[key] = value
@@ -301,8 +325,13 @@ async function executePatch(botId: string, _retryCount = 0): Promise<boolean | n
   if (!bot) { persistTimers.delete(botId); return false }
   const patchData = computePatchDiff(bot, botSnapshots.get(botId))
   if (!patchData) { persistTimers.delete(botId); return null }
+  // BUG FIX: Preserve env var IDs in PATCH body so the server merge logic
+  // can match existing vars by key AND preserve their id/description fields.
+  // Previously, stripping IDs caused server merges to lose them, which broke
+  // the reveal API: fetchRevealedValues maps decrypted values by v.id → v.value,
+  // and with v.id === undefined, all revealed values were lost.
   if (patchData.envVars) {
-    patchData.envVars = (patchData.envVars as EnvVar[]).map(({ id: _id, ...rest }) => rest)
+    // Keep IDs — the server uses key-based matching, so IDs are preserved through merge
   }
   try {
     const res = await authFetch(`/api/bots/${botId}`, {
@@ -317,7 +346,7 @@ async function executePatch(botId: string, _retryCount = 0): Promise<boolean | n
         return executePatch(botId, _retryCount + 1)
       }
       const errorBody = await res.text().catch(() => '')
-      console.error(`[BotStore] PATCH /api/bots/${botId} failed: ${res.status}`, errorBody)
+      logger.error('bot-store', `PATCH /api/bots/${botId} failed: ${res.status}`, errorBody)
       if (res.status === 404) {
         // If the bot hasn't been persisted yet (client UUID), retry later
         // rather than marking changes as synced. persistNewBot will swap the
@@ -362,7 +391,7 @@ async function executePatch(botId: string, _retryCount = 0): Promise<boolean | n
       await new Promise(r => setTimeout(r, 1000 * Math.pow(2, _retryCount)))
       return executePatch(botId, _retryCount + 1)
     }
-    console.error(`[BotStore] PATCH /api/bots/${botId} error:`, error)
+    logger.error('bot-store', `PATCH /api/bots/${botId} error`, error instanceof Error ? error.message : String(error))
     showErrorToastWithCooldown(botId)
     // Keep the diff dirty — don't update snapshot, so future edits compound
     // and get another chance to persist.
@@ -428,18 +457,18 @@ async function persistNewBot(bot: Bot): Promise<string | null> {
       const data = await res.json()
       const serverId = data.id
       if (!serverId || typeof serverId !== 'string') {
-        console.warn('Server did not return a valid bot ID:', data)
+        logger.warn('bot-store', 'Server did not return a valid bot ID', data)
         return null
       }
       dbBotIds.add(serverId)
       return serverId
     } else {
       const errText = await res.text().catch(() => 'Unknown error')
-      console.warn(`Failed to persist new bot: HTTP ${res.status}:`, errText)
+      logger.warn('bot-store', `Failed to persist new bot: HTTP ${res.status}`, errText)
       return null
     }
   } catch (e) {
-    console.warn(`Failed to persist new bot ${bot.id}:`, e)
+    logger.warn('bot-store', `Failed to persist new bot ${bot.id}`, e instanceof Error ? e.message : String(e))
     return null
   }
 }
@@ -458,10 +487,10 @@ async function deleteBotFromDB(botId: string): Promise<boolean> {
       dbBotIds.delete(botId)
       return true
     }
-    console.warn(`Failed to delete bot ${botId}: HTTP ${res.status}`)
+    logger.warn('bot-store', `Failed to delete bot ${botId}: HTTP ${res.status}`)
     return false
   } catch (e) {
-    console.warn(`Failed to delete bot ${botId}:`, e)
+    logger.warn('bot-store', `Failed to delete bot ${botId}`, e instanceof Error ? e.message : String(e))
     return false
   }
 }
@@ -475,7 +504,7 @@ function persistLogEntry(botId: string, entry: Omit<LogEntry, 'id'>) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(entry),
   }).catch((e) => {
-    console.warn(`Failed to persist log for bot ${botId}:`, e)
+    logger.warn('bot-store', `Failed to persist log for bot ${botId}`, e instanceof Error ? e.message : String(e))
   })
 }
 
@@ -603,7 +632,7 @@ export const useBotStore = create<BotStore>((set, get) => ({
           hasMore = data.pagination?.hasNextPage ?? false
           page++
           if (page > 10) {
-            console.warn(`[BotStore] Pagination limit reached at page ${page}, got ${allBots.length} bots so far`)
+            logger.warn('bot-store', `Pagination limit reached at page ${page}, got ${allBots.length} bots so far`)
             break
           }
         }
@@ -613,7 +642,7 @@ export const useBotStore = create<BotStore>((set, get) => ({
         // _hasHydrated from ever being set to true on empty databases, causing
         // infinite re-hydration attempts on every interaction that triggers hydration.
         if (hasMore) {
-          console.warn(`[BotStore] Partial hydration: got ${allBots.length} bots, more pages available`)
+          logger.warn('bot-store', `Partial hydration: got ${allBots.length} bots, more pages available`)
         }
         const currentBots = get().bots
         const mergedBots = allBots.map((dbBot) => {
@@ -644,7 +673,7 @@ export const useBotStore = create<BotStore>((set, get) => ({
         set({ _hasHydrated: true })
         break
       } catch (e) {
-        console.warn(`Failed to hydrate from DB (attempt ${attempt + 1}/${MAX_RETRIES}):`, e)
+        logger.warn('bot-store', `Failed to hydrate from DB (attempt ${attempt + 1}/${MAX_RETRIES})`, e instanceof Error ? e.message : String(e))
       }
       attempt++
       if (attempt < MAX_RETRIES) {
@@ -784,7 +813,7 @@ export const useBotStore = create<BotStore>((set, get) => ({
       const store = get()
       const bot = store.bots.find(b => b.id === clientUUID)
       if (bot && !dbBotIds.has(clientUUID)) {
-        console.warn(`[BotStore] Bot ${newBot.name} (${clientUUID}) persist timed out after 15s — keeping in store, persistNewBot may still resolve`)
+        logger.warn('bot-store', `Bot ${newBot.name} (${clientUUID}) persist timed out after 15s — keeping in store, persistNewBot may still resolve`)
       }
     }, 15000)
 
@@ -1364,7 +1393,7 @@ export const useBotStore = create<BotStore>((set, get) => ({
         }
       }
     } catch (e) {
-      console.warn(`Failed to fetch bot detail for ${botId}:`, e)
+      logger.warn('bot-store', `Failed to fetch bot detail for ${botId}`, e instanceof Error ? e.message : String(e))
     }
   },
 
@@ -1484,7 +1513,7 @@ export const useBotStore = create<BotStore>((set, get) => ({
         }
       }
     } catch (e) {
-      console.warn(`Failed to fetch stats for bot ${botId}:`, e)
+      logger.warn('bot-store', `Failed to fetch stats for bot ${botId}`, e instanceof Error ? e.message : String(e))
     }
   },
 
@@ -1545,17 +1574,23 @@ if (typeof window !== 'undefined') {
       if (!bot) continue
       const patchData = computePatchDiff(bot, botSnapshots.get(botId))
       if (!patchData) continue
-      if (patchData.envVars) {
-        patchData.envVars = (patchData.envVars as EnvVar[]).map(({ id: _id, ...rest }) => rest)
-      }
+      // BUG FIX: Keep env var IDs in PATCH body (same fix as executePatch)
       for (const key of Object.keys(patchData)) {
         if (patchData[key] === undefined) delete patchData[key]
       }
       try {
+        const body = JSON.stringify(patchData)
+        // BUG FIX: keepalive fetch has a 64KB body limit in browsers.
+        // Large projectFiles can exceed this, causing silent data loss on tab close.
+        const KEEPALIVE_MAX_BYTES = 64 * 1024
+        if (new TextEncoder().encode(body).length > KEEPALIVE_MAX_BYTES) {
+          logger.warn('bot-store', `beforeunload PATCH for ${botId} exceeds keepalive limit (${body.length}B), unsaved changes may be lost`)
+          continue
+        }
         fetch(`/api/bots/${botId}`, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(patchData),
+          body,
           credentials: 'include',
           keepalive: true,
         }).catch(() => {})

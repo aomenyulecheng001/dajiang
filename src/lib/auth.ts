@@ -3,6 +3,7 @@ import { db } from '@/lib/db'
 import { createSession, validateSessionAsync, deleteSession, incrementTokenVersion, invalidateTokenVersionCache } from '@/lib/session'
 import { writeFile } from 'fs/promises'
 import { resolveFromProjectRoot } from '@/lib/project-root'
+import { logger } from '@/lib/logger'
 
 // Re-export session functions for other modules
 export { validateSessionAsync, deleteSession }
@@ -50,8 +51,7 @@ export async function ensureDefaultAccount(): Promise<void> {
         
         if (envPassword && envPassword.length >= 6) {
           password = envPassword
-          console.warn(`[Auth] ⚠️  Using ADMIN_INITIAL_PASSWORD from environment variable.`
-            + ` Change this password after first login!`)
+          logger.warn('auth', 'Using ADMIN_INITIAL_PASSWORD from environment variable. Change this password after first login!')
         } else {
           // Generate a random 16-character password using Web Crypto API
           password = Array.from(crypto.getRandomValues(new Uint8Array(12)))
@@ -61,9 +61,9 @@ export async function ensureDefaultAccount(): Promise<void> {
             await writeFile(credFile,
               `Username: ${defaultUsername}\nPassword: ${password}\n\n⚠️ CHANGE THIS PASSWORD AFTER FIRST LOGIN!\n`,
               'utf-8')
-            console.warn(`[Auth] Initial admin credentials written to .admin-credentials file. Delete after first login.`)
+            logger.warn('auth', 'Initial admin credentials written to .admin-credentials file. Delete after first login.')
           } catch {
-            console.warn(`[Auth] ⚠️ Could not write .admin-credentials file. Check server logs for credentials.`)
+            logger.warn('auth', 'Could not write .admin-credentials file. Check server logs for credentials.')
           }
         }
 

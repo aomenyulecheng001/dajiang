@@ -395,7 +395,6 @@ function CodeDisplay({
         />
       ) : stylesLoaded && _oneDark && _oneLight ? (
         <div className={`overflow-auto ${isDark ? 'bg-zinc-950/50 dark:bg-black/20' : 'bg-zinc-50/50'}`}>
-          {/* @ts-expect-error - react-syntax-highlighter has incomplete TS types */}
           <SyntaxHighlighter
             language={prismLanguage}
             style={isDark ? _oneDark : _oneLight}

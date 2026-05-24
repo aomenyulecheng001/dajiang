@@ -2,6 +2,7 @@ import { db } from '@/lib/db'
 import { NextResponse } from 'next/server'
 import { validateBotId } from '@/lib/validation'
 import { getBotIfAuthorized } from '@/lib/api-helpers'
+import { logger } from '@/lib/logger'
 
 const MAX_TEXT_LENGTH = 5000
 const MAX_USER_ID_LENGTH = 200
@@ -128,7 +129,7 @@ export async function POST(
       timestamp: message.timestamp.toISOString(),
     }, { status: 201 })
   } catch (error) {
-    console.error(`POST /api/bots/${id}/messages error:`, error)
+    logger.error('messages', `POST /api/bots/${id}/messages error`, error instanceof Error ? error.message : String(error))
     return NextResponse.json({ error: 'Failed to record message' }, { status: 500 })
   }
 }
@@ -185,7 +186,7 @@ export async function GET(
       limit,
     })
   } catch (error) {
-    console.error(`GET /api/bots/${id}/messages error:`, error)
+    logger.error('messages', `GET /api/bots/${id}/messages error`, error instanceof Error ? error.message : String(error))
     return NextResponse.json({ error: 'Failed to fetch messages' }, { status: 500 })
   }
 }

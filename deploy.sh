@@ -228,11 +228,36 @@ if [ ! -f .env ]; then
   echo_info "环境变量已全自动配置完成！"
   echo_info "如需修改，稍后可编辑 .env 文件"
 else
-  echo_success ".env 文件已存在，跳过配置"
+  echo_success ".env 文件已存在，验证并修复关键配置..."
+
+  # BUG FIX: Always ensure DATABASE_URL is an absolute path.
+  # Previously this was skipped entirely on re-deploy, so a relative
+  # DATABASE_URL (e.g., file:./data/bot-factory.db) would survive
+  # redeploys and break in standalone mode where the working directory is
+  # .next/standalone/ instead of the project root.
+  DB_PATH="${PROJECT_DIR}/db/custom.db"
+  if grep -q "^DATABASE_URL=" .env; then
+    CURRENT_DB=$(grep "^DATABASE_URL=" .env | head -1)
+    if echo "$CURRENT_DB" | grep -q "file:\.\/"; then
+      echo_warn "DATABASE_URL 使用相对路径，修复为绝对路径..."
+      if [[ "$OSTYPE" == "darwin"* ]]; then
+        sed -i '' "s|^DATABASE_URL=.*$|DATABASE_URL=\"file:${DB_PATH}?journal_mode=WAL&synchronous=NORMAL&cache_size=-64000\"|" .env
+      else
+        sed -i "s|^DATABASE_URL=.*$|DATABASE_URL=\"file:${DB_PATH}?journal_mode=WAL&synchronous=NORMAL&cache_size=-64000\"|" .env
+      fi
+      echo_success "DATABASE_URL 已修复为绝对路径"
+    else
+      echo_info "DATABASE_URL 已经是绝对路径，跳过"
+    fi
+  else
+    echo "DATABASE_URL=\"file:${DB_PATH}?journal_mode=WAL&synchronous=NORMAL&cache_size=-64000\"" >> .env
+    echo_success "已添加 DATABASE_URL"
+  fi
+
   # 确保 PROJECT_ROOT 在 .env 中设置
   if ! grep -q "^PROJECT_ROOT=" .env || grep -q "^PROJECT_ROOT=$" .env || grep -q "^PROJECT_ROOT=\"\"" .env; then
-    echo "PROJECT_ROOT=\"${PROJECT_DIR}\"" >> .env
-    echo_success "已添加 PROJECT_ROOT=${PROJECT_DIR} 到 .env"
+    sed -i "s|^PROJECT_ROOT=.*$|PROJECT_ROOT=\"${PROJECT_DIR}\"|" .env 2>/dev/null || echo "PROJECT_ROOT=\"${PROJECT_DIR}\"" >> .env
+    echo_success "已更新 PROJECT_ROOT=${PROJECT_DIR}"
   fi
 fi
 
@@ -353,7 +378,6 @@ mkdir -p db
 if [ ! -f db/custom.db ]; then
   echo_info "数据库文件不存在，创建数据库..."
   $PRISMA_CMD db push
-  $PRISMA_CMD migrate dev --name init 2>/dev/null || true
   echo_success "数据库创建完成"
 else
   echo_info "数据库已存在，应用迁移..."
@@ -402,8 +426,17 @@ cp .env .next/standalone/.env 2>/dev/null || true
 mkdir -p .next/standalone/prisma
 cp prisma/schema.prisma .next/standalone/prisma/ 2>/dev/null || true
 # 将 db 目录链接到 standalone 目录
-if [ ! -d .next/standalone/db ]; then
-  ln -sf "${PROJECT_DIR}/db" .next/standalone/db 2>/dev/null || cp -r db .next/standalone/db
+# BUG FIX: With absolute DATABASE_URL, Prisma resolves the DB file directly.
+# The symlink is a convenience — if it fails, we warn instead of falling back
+# to cp -r, which silently creates a diverging copy that causes data loss on
+# the next redeploy (standalone dir is replaced entirely).
+if [ ! -d .next/standalone/db ] && [ ! -L .next/standalone/db ]; then
+  if ln -sf "${PROJECT_DIR}/db" .next/standalone/db 2>/dev/null; then
+    echo_info "已创建 db/ 到 standalone 的软链接"
+  else
+    echo_warn "⚠️  无法创建软链接。由于 DATABASE_URL 是绝对路径，应用仍可正常工作。"
+    echo_warn "    如需排查: ln -sf ${PROJECT_DIR}/db .next/standalone/db"
+  fi
 fi
 
 echo_success "构建产物验证通过"
@@ -429,6 +462,22 @@ if [ ${#MISSING_VARS[@]} -gt 0 ]; then
   exit 1
 fi
 echo_success "关键环境变量验证通过"
+
+# BUG FIX: Verify the database file actually exists at the configured path.
+# A misconfigured DATABASE_URL pointing to a non-existent file causes Prisma
+# to silently create an empty database, making all bots/environments vanish.
+DB_FILE=$(echo "$DATABASE_URL" | sed 's|^file:||' | sed 's|?.*$||')
+if [ ! -f "$DB_FILE" ]; then
+  echo_error "数据库文件不存在: ${DB_FILE}"
+  echo_error "DATABASE_URL 指向的文件不存在。可能的原因："
+  echo_error "  1. 数据库文件尚未创建（运行 prisma db push）"
+  echo_error "  2. DATABASE_URL 路径拼写错误"
+  echo_error "  3. 旧数据在其他位置，需要迁移"
+  echo_error ""
+  echo_error "请检查: ls -lh ${PROJECT_DIR}/db/"
+  exit 1
+fi
+echo_success "数据库文件存在: ${DB_FILE}"
 
 # 创建日志目录
 mkdir -p logs
