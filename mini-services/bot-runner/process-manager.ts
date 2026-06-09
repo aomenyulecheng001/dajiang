@@ -1,4 +1,4 @@
-import { readdirSync, writeFileSync, unlinkSync } from 'fs'
+import { readdirSync, writeFileSync, unlinkSync, existsSync, readFileSync } from 'fs'
 import { readFile } from 'fs/promises'
 import { spawn, execFile } from 'child_process'
 import type { BotProcess } from './types'
@@ -56,6 +56,93 @@ import { logger } from './logger'
 import { getBotDir, loadBotConfigAsync, CONFIG_DIR } from './utils'
 import { appendLog } from './log-manager'
 import { io } from './socket'
+
+// ─── PID File Management ───────────────────────────────────────────────────
+// PID files allow detection of orphan processes — child processes that survive
+// after the bot-runner crashes or is SIGKILLed. Before starting a new process,
+// we check for and clean up any existing process with the same botId.
+
+function getPidFilePath(botDir: string): string {
+  return `${botDir}/.pid`
+}
+
+function writePidFile(botDir: string, pid: number): void {
+  try {
+    writeFileSync(getPidFilePath(botDir), String(pid), 'utf-8')
+  } catch { /* non-critical — process will still run without PID file */ }
+}
+
+function readPidFile(botDir: string): number | null {
+  try {
+    const pidPath = getPidFilePath(botDir)
+    if (!existsSync(pidPath)) return null
+    const content = readFileSync(pidPath, 'utf-8').trim()
+    const pid = parseInt(content, 10)
+    return Number.isFinite(pid) && pid > 0 ? pid : null
+  } catch {
+    return null
+  }
+}
+
+function isPidAlive(pid: number): boolean {
+  try {
+    // process.kill(pid, 0) sends no signal — only checks if process exists
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+export function cleanupPidFile(botDir: string): void {
+  try {
+    const pidPath = getPidFilePath(botDir)
+    if (existsSync(pidPath)) {
+      unlinkSync(pidPath)
+    }
+  } catch { /* ignore — file may already be deleted */ }
+}
+
+/**
+ * Find and kill any orphan process for the given bot directory.
+ * An orphan is a process whose PID is recorded in .pid file but is not tracked
+ * in the botProcesses Map. This happens when the bot-runner restarts after a
+ * crash, leaving child processes alive.
+ *
+ * Returns true if an orphan was found and killed.
+ */
+export async function findAndKillOrphan(botDir: string): Promise<boolean> {
+  const pid = readPidFile(botDir)
+  if (pid === null) return false
+  if (!isPidAlive(pid)) {
+    // Dead PID file — clean it up
+    cleanupPidFile(botDir)
+    return false
+  }
+
+  // Orphan found — try to kill it gracefully
+  logger.warn('process-manager', `Found orphan process PID ${pid} in ${botDir}, killing...`)
+  try { process.kill(pid, 'SIGTERM') } catch { /* already dead */ }
+
+  // Wait up to 5s for the process to exit, then force-kill
+  const startTime = Date.now()
+  while (isPidAlive(pid) && Date.now() - startTime < 5000) {
+    await new Promise(r => setTimeout(r, 200))
+  }
+  if (isPidAlive(pid)) {
+    logger.warn('process-manager', `Orphan PID ${pid} didn't respond to SIGTERM, sending SIGKILL`)
+    try { process.kill(pid, 'SIGKILL') } catch { /* ignore */ }
+    await new Promise(r => setTimeout(r, 500))
+  }
+
+  cleanupPidFile(botDir)
+  if (!isPidAlive(pid)) {
+    logger.info('process-manager', `Orphan process PID ${pid} killed successfully`)
+    return true
+  }
+  logger.error('process-manager', `Failed to kill orphan process PID ${pid} — it may still hold ports`)
+  return false
+}
 
 // ─── Safe Environment Whitelist ───────────────────────────────────────────
 
@@ -263,8 +350,9 @@ export async function handleBotExit(
   bot.process = undefined
   bot.pid = undefined
 
-  // P1-19 FIX: Remove running marker when bot exits (won't auto-restart unless handleBotExit restarts it)
+  // P1-19 FIX: Remove running marker and PID file when bot exits
   try { unlinkSync(`${CONFIG_DIR}/${botId}.running`) } catch { /* ignore */ }
+  try { cleanupPidFile(getBotDir(botId)) } catch { /* ignore */ }
 
   appendLog(botId, `进程已退出 (code: ${code}, signal: ${signal})`, code === 0 ? 'info' : 'error')
   io.emit('bot:status', { botId, status: bot.status, exitCode: code })
@@ -425,12 +513,6 @@ export async function startBotProcess(
   const bot = processes.get(botId)
   if (!bot) return
 
-  // P1-FIX: Guard against double-start — prevent orphaned processes
-  if (bot.status === 'running' || bot.status === 'stopping' || bot.status === 'starting') {
-    logger.warn('process-manager', `Bot ${botId} is ${bot.status}, skipping start`)
-    return
-  }
-
   let botDir: string
   try {
     botDir = getBotDir(botId)
@@ -439,6 +521,17 @@ export async function startBotProcess(
     bot.error = e instanceof Error ? e.message : 'Invalid bot directory path'
     appendLog(botId, `Error: ${bot.error}`, 'error')
     io.emit('bot:status', { botId, status: 'error', error: bot.error })
+    return
+  }
+
+  // CRITICAL: Kill any orphan process from a previous bot-runner instance before
+  // starting a new one. Without this, two processes can bind the same TCP port
+  // (EADDRINUSE), causing "port conflict" errors for bots with embedded HTTP servers.
+  await findAndKillOrphan(botDir)
+
+  // P1-FIX: Guard against double-start — prevent orphaned processes
+  if (bot.status === 'running' || bot.status === 'stopping' || bot.status === 'starting') {
+    logger.warn('process-manager', `Bot ${botId} is ${bot.status}, skipping start`)
     return
   }
 
@@ -519,6 +612,11 @@ export async function startBotProcess(
 
   bot.process = child
   bot.pid = child.pid
+  // Write PID file so orphan processes from a bot-runner crash can be detected
+  // and killed before starting a new process (prevents TCP port conflicts).
+  if (child.pid) {
+    writePidFile(botDir, child.pid)
+  }
   bot.status = 'running'
   bot.startedAt = new Date().toISOString()
   bot.error = undefined // P1-FIX: Clear previous error when successfully starting
@@ -608,8 +706,9 @@ export function stopBotProcess(botId: string, botProcesses: Map<string, BotProce
   // before a manual startBotProcess.
   markIntentionalStop(botId)
 
-  // P1-19 FIX: Remove running marker so bot won't auto-start after shutdown
+  // P1-19 FIX: Remove running marker and PID file so bot won't auto-start after shutdown
   try { unlinkSync(`${CONFIG_DIR}/${botId}.running`) } catch { /* ignore */ }
+  try { cleanupPidFile(getBotDir(botId)) } catch { /* ignore */ }
 
   // BUG FIX: Cancel any pending auto-restart timer from a previous crash.
   cancelRestartTimer(botId)

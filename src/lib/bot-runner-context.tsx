@@ -17,6 +17,7 @@ export interface BotRunnerStatus {
   language: string
   status: 'stopped' | 'starting' | 'running' | 'error' | 'stopping'
   pid?: number
+  port?: number
   startedAt?: string
   stoppedAt?: string
   exitCode?: number | null
@@ -33,6 +34,7 @@ export interface ResourceData {
   pid?: number
   restartCount: number
   uptime?: number
+  port?: number
 }
 
 export interface DeployProgress {

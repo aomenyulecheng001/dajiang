@@ -742,6 +742,7 @@ export const en = {
     noData: 'No resource data available',
     running: 'Running',
     mb: 'MB',
+    port: 'Listening Port',
     processManager: 'Process Manager',
     processName: 'Process',
     status: 'Status',

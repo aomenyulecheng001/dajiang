@@ -20,7 +20,7 @@ import {
 import { logger } from './logger'
 import { MAX_LOG_LINES, appendDeployLog } from './log-manager'
 import { io } from './socket'
-import { cancelRestartTimer, markIntentionalStop, clearIntentionalStop } from './process-manager'
+import { cancelRestartTimer, markIntentionalStop, clearIntentionalStop, findAndKillOrphan } from './process-manager'
 
 // ─── P2-31 FIX: Shared helpers for dependency parsing and package.json generation ──────
 
@@ -547,6 +547,12 @@ export async function deployBot(
     io.emit('bot:status', { botId, status: 'stopped' })
     return true
   }
+
+  // CRITICAL: Kill orphan processes before deploy (same logic as startBotProcess).
+  // If the bot-runner was SIGKILLed and restarted, the old child process may still
+  // be alive, bound to the bot's TCP port. Without this, deploying would start a
+  // second process that fails with EADDRINUSE (port conflict).
+  try { await findAndKillOrphan(botDir) } catch { /* non-critical — proceed with deploy */ }
 
   // BUG FIX: Stop existing process and cancel auto-restart before re-deploying.
   // Without this, re-deploying a running bot creates an orphaned process

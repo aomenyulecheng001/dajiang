@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect, useRef, useMemo } from 'react'
 import { toast } from 'sonner'
-import { Play, Square, Pencil, Trash2, Loader2, Clock, Package, Code2 } from 'lucide-react'
+import { Play, Square, Pencil, Trash2, Loader2, Clock, Package, Code2, Network } from 'lucide-react'
 import { Card, CardHeader, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -12,7 +12,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import type { Bot } from '@/types/bot'
 import { useBotStore } from '@/store/bot-store'
 import { ConfirmDialog } from './confirm-dialog'
-import { useBotRunnerConnection, useBotRunnerActions } from '@/lib/bot-runner-context'
+import { useBotRunnerConnection, useBotRunnerActions, useBotResourceData } from '@/lib/bot-runner-context'
 import { fetchRevealEnvVars, hasMaskedEnvVars, buildEnvVarsFallback, buildDeployConfig } from '@/lib/deploy-utils'
 import { BotAvatar } from './bot-avatar'
 
@@ -88,6 +88,7 @@ export const BotCard = React.memo(function BotCard({ bot, viewMode }: BotCardPro
   const [localPending, setLocalPending] = useState<'starting' | 'stopping' | null>(null)
   const { connected } = useBotRunnerConnection()
   const { getBotStatus, deployBot, stopBot } = useBotRunnerActions()
+  const resource = useBotResourceData(bot.id) // For port display
   const pendingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const startingRef = useRef(false)
 
@@ -267,6 +268,7 @@ export const BotCard = React.memo(function BotCard({ bot, viewMode }: BotCardPro
     isLocalStarting: effectiveLocalPending === 'starting',
     isLocalStopping: effectiveLocalPending === 'stopping',
     hasValidToken,
+    port: resource?.port,
   }
 
   if (viewMode === 'list') {
@@ -475,6 +477,7 @@ const GridModeCard = React.memo(function GridModeCard({
   isLocalStarting,
   isLocalStopping,
   hasValidToken,
+  port,
 }: {
   bot: Bot
   status: { label: string; className: string; dotClass: string }
@@ -494,6 +497,7 @@ const GridModeCard = React.memo(function GridModeCard({
   isLocalStarting: boolean
   isLocalStopping: boolean
   hasValidToken: boolean
+  port?: number
 }) {
   const t = useT()
 
@@ -572,7 +576,7 @@ const GridModeCard = React.memo(function GridModeCard({
           <HighlightText text={bot.description || t('common.noDescription')} query={searchQuery} />
         </p>
 
-        {/* Meta row — language, deps, updated */}
+        {/* Meta row — language, deps, port, updated */}
         <div className="flex items-center gap-3 text-[11px] text-muted-foreground/60 mt-0.5">
           <span className="inline-flex items-center gap-1">
             <Code2 className="size-3" />
@@ -582,6 +586,12 @@ const GridModeCard = React.memo(function GridModeCard({
             <span className="inline-flex items-center gap-1">
               <Package className="size-3" />
               {bot.dependencies.length}{bot.dependencies.length === 1 ? ` ${t('common.dep')}` : ` ${t('common.deps')}`}
+            </span>
+          )}
+          {port && isBotRunning && (
+            <span className="inline-flex items-center gap-1 text-cyan-600 dark:text-cyan-400 font-mono">
+              <Network className="size-3" />
+              :{port}
             </span>
           )}
           <span className="inline-flex items-center gap-1 ml-auto">
@@ -617,6 +627,7 @@ const ListModeCard = React.memo(function ListModeCard({
   isLocalStarting,
   isLocalStopping,
   hasValidToken,
+  port,
 }: {
   bot: Bot
   status: { label: string; className: string; dotClass: string }
@@ -636,6 +647,7 @@ const ListModeCard = React.memo(function ListModeCard({
   isLocalStarting: boolean
   isLocalStopping: boolean
   hasValidToken: boolean
+  port?: number
 }) {
   const t = useT()
   const needsRestart = bot.status === 'inactive' && bot.lastRunnerStatus === 'stopped'
@@ -696,6 +708,18 @@ const ListModeCard = React.memo(function ListModeCard({
           <Code2 className="size-3 text-muted-foreground/50" />
           <span className="text-xs text-muted-foreground capitalize">{bot.language}</span>
         </div>
+      </td>
+
+      {/* Port */}
+      <td className="py-3 px-4 hidden lg:table-cell">
+        {port && isBotRunning ? (
+          <div className="flex items-center gap-1.5">
+            <Network className="size-3 text-cyan-500" />
+            <span className="text-xs font-mono text-cyan-600 dark:text-cyan-400">:{port}</span>
+          </div>
+        ) : (
+          <span className="text-xs text-muted-foreground/30">—</span>
+        )}
       </td>
 
       {/* Updated */}

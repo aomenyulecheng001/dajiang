@@ -5,7 +5,7 @@ import type { BotProcess, BotConfig, DeployStage } from './types'
 import { getBotDir, loadBotConfigAsync, sanitizeBotId, CONFIG_DIR } from './utils'
 import { MAX_LOG_LINES, LOGS_DIR } from './log-manager'
 import { deployBot } from './deploy'
-import { cancelRestartTimer, markIntentionalStop, clearIntentionalStop, intentionalStopSet, memoryKilledSet } from './process-manager'
+import { cancelRestartTimer, markIntentionalStop, clearIntentionalStop, intentionalStopSet, memoryKilledSet, cleanupPidFile } from './process-manager'
 import { logger } from './logger'
 
 // ─── Deploy Concurrency Control ──────────────────────────────────────────────
@@ -112,6 +112,7 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
         language: bot.language,
         status: bot.status,
         pid: bot.pid,
+        port: bot.port,
         startedAt: bot.startedAt,
         stoppedAt: bot.stoppedAt,
         exitCode: bot.exitCode,
@@ -308,6 +309,8 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
           return
         }
         const botDir = getBotDir(botId)
+        // Clean up PID file first (prevents ghost port conflicts on restart)
+        try { cleanupPidFile(botDir) } catch { /* ignore */ }
         await rm(botDir, { recursive: true, force: true }).catch(() => {})
         await rm(join(CONFIG_DIR, `${botId}.json`), { force: true }).catch(() => {})
         await rm(join(LOGS_DIR, `${botId}.log`), { force: true }).catch(() => {})
@@ -548,6 +551,8 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
           const logPath = join(LOGS_DIR, `${botId}.log`)
           const runningPath = join(CONFIG_DIR, `${botId}.running`)
 
+          // Clean up PID file first (prevents ghost port conflicts on restart)
+          try { cleanupPidFile(botDir) } catch { /* ignore */ }
           await rm(botDir, { recursive: true, force: true }).catch(() => {})
           await rm(configPath, { force: true }).catch(() => {})
           await rm(logPath, { force: true }).catch(() => {})

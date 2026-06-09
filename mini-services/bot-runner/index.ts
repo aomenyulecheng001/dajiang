@@ -20,7 +20,7 @@ import { PORT, CONFIG_DIR, loadBotConfigAsync, BOTS_DIR, sanitizeBotId, getBotDi
 import { MAX_LOG_LINES, setLogState, cleanupOldLogs, startLogCleanup, stopLogCleanup, LOGS_DIR } from './log-manager'
 
 import { httpServer, io } from './socket'
-import { handleBotExit, startBotProcess, stopBotProcess, clearAllRestartTimers, intentionalStopSet, memoryKilledSet, cancelRestartTimer } from './process-manager'
+import { handleBotExit, startBotProcess, stopBotProcess, clearAllRestartTimers, intentionalStopSet, memoryKilledSet, cancelRestartTimer, findAndKillOrphan, cleanupPidFile } from './process-manager'
 import { registerHandlers } from './handlers'
 import { startMonitoring, stopMonitoring } from './monitor'
 import { logger } from './logger'
@@ -215,82 +215,118 @@ httpServer.on('request', async (req: IncomingMessage, res: ServerResponse) => {
       }
     }
 
-    let responded = false
-    const cleanupTimeout = setTimeout(() => {
-      if (!responded) {
-        responded = true
-        res.writeHead(504, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ ok: false, error: 'Cleanup timeout' }))
-      }
-    }, 10000)
-
-    logger.info('cleanup', `Cleaning up bot ${botId}`)
-
     const clientIp = req.headers['x-forwarded-for']?.toString().split(',')[0]?.trim()
       || req.socket?.remoteAddress
       || 'unknown'
+    logger.info('cleanup', `Cleaning up bot ${botId}`)
     logger.info('cleanup-audit', `bot=${botId} action=cleanup ip=${clientIp} running=${botProcesses.has(botId)}`)
-
-    cancelRestartTimer(botId)
-    boundStopBotProcess(botId)
 
     const botDir = getBotDir(botId)
     const configPath = `${CONFIG_DIR}/${botId}.json`
     const logPath = `${LOGS_DIR}/${botId}.log`
     const runningPath = `${CONFIG_DIR}/${botId}.running`
 
-    ;(async () => {
+    // Wrap cleanup in a timeout — if it takes >15s, force-respond with an error.
+    // The actual cleanup continues in the background.
+    const CLEANUP_TIMEOUT_MS = 15_000
+    let responded = false
+
+    const cleanupPromise = (async (): Promise<{ processKilled: boolean; filesDeleted: boolean; reDeployed: boolean }> => {
+      let processKilled = false
+
+      // 1. Cancel auto-restart and mark as intentional stop
+      cancelRestartTimer(botId)
+      intentionalStopSet.add(botId)
+
+      // 2. Kill any orphan process (survived from a previous bot-runner crash)
       try {
-        const bot = botProcesses.get(botId)
-        if (bot?.process) {
+        processKilled = await findAndKillOrphan(botDir)
+      } catch { /* non-critical */ }
+
+      // 3. Stop the tracked process (if any)
+      boundStopBotProcess(botId)
+
+      // 4. Wait for tracked process to exit
+      const bot = botProcesses.get(botId)
+      if (bot?.process) {
+        try {
           await new Promise<void>(resolve => {
             const exitTimeout = setTimeout(resolve, 5000)
             bot.process!.once('close', () => { clearTimeout(exitTimeout); resolve() })
           })
-        }
+          processKilled = true
+        } catch { /* ignore */ }
+      }
 
-        const currentBot = botProcesses.get(botId)
-        if (currentBot && (currentBot.status === 'running' || currentBot.status === 'starting')) {
-          logger.info('cleanup', `Bot ${botId} was re-deployed, aborting cleanup`)
-          if (!responded) {
-            responded = true
-            clearTimeout(cleanupTimeout)
-            res.writeHead(200, { 'Content-Type': 'application/json' })
-            res.end(JSON.stringify({ ok: true, skipped: 're-deployed' }))
-          }
-          return
-        }
+      // 5. Check if bot was re-deployed while we were cleaning up
+      const currentBot = botProcesses.get(botId)
+      if (currentBot && (currentBot.status === 'running' || currentBot.status === 'starting')) {
+        logger.info('cleanup', `Bot ${botId} was re-deployed, aborting cleanup`)
+        return { processKilled: false, filesDeleted: false, reDeployed: true }
+      }
 
+      // 6. Clean up PID file explicitly (handleBotExit may not have fired)
+      try { cleanupPidFile(botDir) } catch { /* ignore */ }
+
+      // 7. Delete all bot files
+      let filesDeleted = false
+      try {
         await access(botDir).then(() => rm(botDir, { recursive: true, force: true })).catch(() => {})
         await access(configPath).then(() => rm(configPath, { force: true })).catch(() => {})
         await access(logPath).then(() => rm(logPath, { force: true })).catch(() => {})
         await access(runningPath).then(() => rm(runningPath, { force: true })).catch(() => {})
-      } catch { /* ignore cleanup errors */ }
+        filesDeleted = true
+      } catch { /* cleanup errors are non-fatal */ }
 
+      // 8. Remove from memory maps
       botProcesses.delete(botId)
       deployStatus.delete(botId)
       intentionalStopSet.delete(botId)
       memoryKilledSet.delete(botId)
 
+      // 9. Notify all clients
       io.emit('bot:deleted', { botId })
 
       logger.info('cleanup', `Bot ${botId} fully removed`)
       logger.info('cleanup-audit', `bot=${botId} action=cleanup-complete ip=${clientIp} result=success`)
-      if (!responded) {
-        responded = true
-        clearTimeout(cleanupTimeout)
-        res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ ok: true }))
+
+      return { processKilled, filesDeleted, reDeployed: false }
+    })()
+
+    // Race the cleanup against a hard timeout
+    const timeoutPromise = new Promise<'timeout'>((resolve) =>
+      setTimeout(() => resolve('timeout'), CLEANUP_TIMEOUT_MS)
+    )
+
+    Promise.race([cleanupPromise, timeoutPromise]).then((result) => {
+      if (responded) return
+      responded = true
+
+      if (result === 'timeout') {
+        logger.warn('cleanup', `Cleanup timed out for bot ${botId} after ${CLEANUP_TIMEOUT_MS}ms`)
+        res.writeHead(504, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: false, error: 'Cleanup timeout — process may not have been fully stopped', processKilled: false, filesDeleted: false }))
+        // Cleanup continues in background — the promise is still running
+        return
       }
-    })().catch((err) => {
+
+      if (result.reDeployed) {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, skipped: 're-deployed', processKilled: false, filesDeleted: false }))
+        return
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, processKilled: result.processKilled, filesDeleted: result.filesDeleted }))
+    }).catch((err) => {
       logger.error('cleanup', `Unhandled error for bot ${botId}`, err instanceof Error ? err.message : String(err))
       if (!responded) {
         responded = true
-        clearTimeout(cleanupTimeout)
         res.writeHead(500, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ ok: false, error: 'Cleanup failed' }))
+        res.end(JSON.stringify({ ok: false, error: 'Cleanup failed', processKilled: false, filesDeleted: false }))
       }
     })
+
     return
   }
 

@@ -1,7 +1,7 @@
 'use client'
 
 import React, { useState, useEffect, useMemo } from 'react'
-import { Cpu, MemoryStick, RotateCcw, Clock, AlertTriangle, Activity } from 'lucide-react'
+import { Cpu, MemoryStick, RotateCcw, Clock, AlertTriangle, Activity, Network } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { useBotRunnerConnection, useBotStatus, useBotResourceData } from '@/lib/bot-runner-context'
@@ -35,7 +35,8 @@ export const ResourceMonitor = React.memo(function ResourceMonitor({ botId }: { 
     const cpuAvailable = isRunning && hasCpuData
     const restartCount = resource?.restartCount ?? 0
     const uptimeSeconds = resource?.uptime || 0
-    return { isRunning, memoryMb, maxMemoryMb, memoryPercent, cpuPercent, hasCpuData, cpuAvailable, restartCount, uptimeSeconds }
+    const port = resource?.port
+    return { isRunning, memoryMb, maxMemoryMb, memoryPercent, cpuPercent, hasCpuData, cpuAvailable, restartCount, uptimeSeconds, port }
   }, [status, resource])
 
   if (!mounted || !connected) return null
@@ -108,6 +109,18 @@ export const ResourceMonitor = React.memo(function ResourceMonitor({ botId }: { 
             </div>
           </div>
         </div>
+
+        {derived.isRunning && derived.port && (
+          <div className="rounded-md p-2 mt-2 bg-muted/30">
+            <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              <Network className="size-3" />
+              {t('resourceMonitor.port')}
+            </div>
+            <div className="text-sm font-mono font-semibold mt-0.5 text-cyan-600 dark:text-cyan-400">
+              :{derived.port}
+            </div>
+          </div>
+        )}
 
         {!derived.isRunning && derived.memoryMb === 0 && !derived.cpuAvailable && (
           <div className="text-center text-xs text-muted-foreground py-2">
