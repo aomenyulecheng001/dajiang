@@ -15,7 +15,7 @@ export async function testNativeModuleLoad(botDir: string): Promise<boolean> {
     await new Promise<void>((resolve, reject) => {
       const child = execFile(
         process.execPath || 'node',
-        ['-e', `try { require('better-sqlite3'); process.exit(0) } catch(e) { process.exit(1) }`],
+        ['-e', `try { const D=require('better-sqlite3'); new D(':memory:').close(); process.exit(0) } catch(e) { process.exit(1) }`],
         { cwd: botDir, timeout: 10000 },
       )
       child.on('exit', (code) => code === 0 ? resolve() : reject(new Error('load failed')))
