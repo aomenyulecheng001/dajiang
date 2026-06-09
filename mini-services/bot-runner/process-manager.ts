@@ -682,6 +682,7 @@ export async function startBotProcess(
     return undefined
   })()
   io.emit('bot:status', { botId, status: 'running', pid: child.pid, port: portFromEnv })
+}
 
 // ─── Stop Bot Process ─────────────────────────────────────────────────────
 
