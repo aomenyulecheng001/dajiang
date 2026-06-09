@@ -16,7 +16,9 @@ function generateWebhookSecret(): string {
  * Excludes heavy fields that are only needed in detail view:
  *   - projectFiles (up to 25MB per bot)
  *   - code (redundant with codeBlocks)
- *   - envVars (expensive decryption, only needed in detail view)
+ *
+ * Note: envVars is included (lightweight, typically < 10 entries).
+ * Non-encrypted values pass through unmasked; encrypted ones show as ••••
  */
 const BOT_LIST_SELECT: Record<string, true> = {
   id: true,
@@ -31,6 +33,7 @@ const BOT_LIST_SELECT: Record<string, true> = {
   version: true,
   codeBlocks: true,
   dependencies: true,
+  envVars: true,
   config: true,
   stats: true,
   entryPoint: true,

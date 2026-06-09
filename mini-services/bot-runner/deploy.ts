@@ -605,13 +605,35 @@ export async function deployBot(
   // Check cancellation after stopping existing process
   if (checkCancelled()) return
 
+  // Extract PORT from .env in projectFiles if not already in envVars (ZIP import scenario)
+  const mergedEnvVars = { ...config.envVars, BOT_TOKEN: botToken }
+  if (!mergedEnvVars.PORT && !mergedEnvVars.HTTP_PORT && !mergedEnvVars.WEBHOOK_PORT) {
+    const dotEnv = config.projectFiles?.find(f => f.path === '.env' || f.path?.endsWith('/.env'))
+    if (dotEnv?.content) {
+      for (const line of dotEnv.content.split('\n')) {
+        const eqIdx = line.indexOf('=')
+        if (eqIdx === -1) continue
+        const k = line.slice(0, eqIdx).trim()
+        const v = line.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, '')
+        if (['PORT', 'HTTP_PORT', 'WEBHOOK_PORT', 'SERVER_PORT', 'LISTEN_PORT'].includes(k.toUpperCase())) {
+          mergedEnvVars[k] = v
+          const parsed = parseInt(v, 10)
+          if (Number.isFinite(parsed) && parsed > 0 && parsed < 65536) {
+            appendDeployLog(botId, `🔌 从 .env 文件检测到端口: ${parsed}`)
+          }
+          break
+        }
+      }
+    }
+  }
+
   // Initialize bot process record
   botProcesses.set(botId, {
     id: botId,
     name: config.name,
     language: config.language,
     status: 'stopped',
-    envVars: { ...config.envVars, BOT_TOKEN: botToken },
+    envVars: mergedEnvVars,
     logBuffer: [],
     maxLogLines: MAX_LOG_LINES,
     entryPoint: config.entryPoint,
@@ -627,7 +649,7 @@ export async function deployBot(
   // P2-BR-10 FIX: Use async saveBotConfig to avoid blocking event loop
   // BUG FIX: Include customCode and dependencies so recovery doesn't lose them
   await saveBotConfigAsync(botId, {
-    envVars: { ...config.envVars, BOT_TOKEN: botToken },
+    envVars: mergedEnvVars,
     name: config.name,
     language: config.language,
     projectFiles: config.projectFiles,
