@@ -14,13 +14,13 @@ import { appendDeployLog } from './log-manager'
  * by Node.js. This catches version mismatches and platform incompatibilities
  * that simple file existence checks miss.
  */
-export async function testNativeModuleLoad(nodeModulesPath: string): Promise<boolean> {
+export async function testNativeModuleLoad(botDir: string): Promise<boolean> {
   try {
     await new Promise<void>((resolve, reject) => {
       const child = execFile(
         process.execPath || 'node',
         ['-e', `try { require('better-sqlite3'); process.exit(0) } catch(e) { process.exit(1) }`],
-        { cwd: nodeModulesPath, timeout: 10000 },
+        { cwd: botDir, timeout: 10000 },
       )
       child.on('exit', (code) => code === 0 ? resolve() : reject(new Error('load failed')))
       child.on('error', reject)
@@ -145,7 +145,7 @@ export async function rebuildNativeModules(botId: string, botDir: string): Promi
 
     // NATIVE FIX: Try to actually load the native module to verify it works.
     // This is more reliable than just checking if a .node file exists.
-    const canLoadNative = await testNativeModuleLoad(nmPath)
+    const canLoadNative = await testNativeModuleLoad(botDir)
     if (canLoadNative) return // Module loads fine, no rebuild needed
 
     appendDeployLog(botId, '🔧 检测到原生模块需要重新编译...')
@@ -203,7 +203,7 @@ export async function rebuildNativeModules(botId: string, botDir: string): Promi
       child.on('close', (code) => {
         if (code === 0) {
           appendDeployLog(botId, '✅ 原生模块编译完成')
-          testNativeModuleLoad(nmPath).then(ok => {
+          testNativeModuleLoad(botDir).then(ok => {
             if (!ok) {
               appendDeployLog(botId, '⚠️ 编译后模块仍无法加载')
               appendDeployLog(botId, `   ${buildToolsHint}`)
