@@ -150,24 +150,44 @@ export async function rebuildNativeModules(botId: string, botDir: string): Promi
 
     appendDeployLog(botId, '🔧 检测到原生模块需要重新编译...')
 
-    // Determine OS-appropriate build tools install command for error messages
     const buildToolsHint = getBuildToolsInstallCommand()
-    const pm = await getPackageManager()
-    const rebuildCmd = process.platform === 'win32'
-      ? (pm.cmd === 'pnpm' ? 'pnpm.cmd' : pm.cmd === 'bun' ? 'bun.cmd' : 'npm.cmd')
-      : (pm.cmd === 'pnpm' ? 'pnpm' : pm.cmd === 'bun' ? 'bun' : 'npm')
-    const rebuildArgs = ['rebuild']
 
-    await new Promise<void>((resolve, reject) => {
-      const child = spawn(rebuildCmd, rebuildArgs, {
-        cwd: botDir,
+    // Find the actual better-sqlite3 module directory (pnpm uses .pnpm store)
+    let sqlite3Dir = join(nmPath, 'better-sqlite3')
+    try {
+      const s = await stat(sqlite3Dir)
+      if (!s.isDirectory()) sqlite3Dir = ''
+    } catch { sqlite3Dir = '' }
+
+    if (!sqlite3Dir) {
+      // Search pnpm virtual store for better-sqlite3
+      try {
+        const pnpmDir = join(nmPath, '.pnpm')
+        const entries = await readdir(pnpmDir)
+        const match = entries.find(e => e.startsWith('better-sqlite3'))
+        if (match) sqlite3Dir = join(pnpmDir, match, 'node_modules', 'better-sqlite3')
+      } catch { /* not found */ }
+    }
+
+    if (!sqlite3Dir) {
+      appendDeployLog(botId, '⚠️ 找不到 better-sqlite3 模块目录')
+      return
+    }
+
+    // Use node-gyp rebuild directly (bypasses pnpm's strict script isolation
+    // which can't find prebuild-install). node-gyp rebuild --release works
+    // reliably because it invokes g++/make directly from the module directory.
+    const nodeGypCmd = process.platform === 'win32' ? 'npx.cmd' : 'npx'
+    const nodeGypArgs = ['node-gyp', 'rebuild', '--release']
+
+    await new Promise<void>((resolve) => {
+      const child = spawn(nodeGypCmd, nodeGypArgs, {
+        cwd: sqlite3Dir,
         timeout: 120000,
         stdio: ['pipe', 'pipe', 'pipe'],
         shell: process.platform === 'win32',
       })
-      let stdout = ''
       let stderr = ''
-      child.stdout?.on('data', (data: Buffer) => { stdout += data.toString() })
       child.stderr?.on('data', (data: Buffer) => {
         const chunk = data.toString()
         stderr += chunk
@@ -176,25 +196,24 @@ export async function rebuildNativeModules(botId: string, botDir: string): Promi
         }
       })
       child.on('error', (err) => {
-        appendDeployLog(botId, `⚠️ 原生模块重编译失败: ${err.message}`)
+        appendDeployLog(botId, `⚠️ 原生模块编译失败: ${err.message}`)
         appendDeployLog(botId, `   提示: ${buildToolsHint}`)
-        resolve() // Non-critical, don't block deploy
+        resolve()
       })
       child.on('close', (code) => {
         if (code === 0) {
-          appendDeployLog(botId, '✅ 原生模块重编译完成')
-          // Verify the rebuild worked by testing load again
+          appendDeployLog(botId, '✅ 原生模块编译完成')
           testNativeModuleLoad(nmPath).then(ok => {
             if (!ok) {
-              appendDeployLog(botId, '⚠️ 重编译后模块仍无法加载，可能需要安装编译工具链')
+              appendDeployLog(botId, '⚠️ 编译后模块仍无法加载')
               appendDeployLog(botId, `   ${buildToolsHint}`)
             }
           }).catch(() => {})
         } else {
-          appendDeployLog(botId, `⚠️ 原生模块重编译退出码: ${code}`)
+          appendDeployLog(botId, `⚠️ 原生模块编译退出码: ${code}`)
           appendDeployLog(botId, `   提示: ${buildToolsHint}`)
         }
-        resolve() // Non-critical, don't block deploy
+        resolve()
       })
     })
   } catch { /* non-critical */ }
