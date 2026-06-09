@@ -105,6 +105,23 @@ export function registerHandlers(
     // Any changes here should be mirrored there and vice versa.
 const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIKEY', 'API_KEY', 'ACCESS_KEY', 'PRIVATE', 'CREDENTIAL', 'DATABASE_URL']
 
+    // Helper: get port from bot (detected or config fallback)
+    const getBotPort = (bot: BotProcess): number | undefined => {
+      if (bot.port) return bot.port
+      // Fallback: check env vars for PORT-like keys
+      const portKeys = ['PORT', 'HTTP_PORT', 'WEBHOOK_PORT', 'SERVER_PORT', 'LISTEN_PORT']
+      for (const key of portKeys) {
+        const val = bot.envVars?.[key]
+        if (val) {
+          const parsed = parseInt(val, 10)
+          if (Number.isFinite(parsed) && parsed > 0 && parsed < 65536) {
+            return parsed
+          }
+        }
+      }
+      return undefined
+    }
+
     socket.emit('init', {
       bots: Array.from(botProcesses.entries()).map(([id, bot]) => ({
         id: bot.id,
@@ -112,7 +129,7 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
         language: bot.language,
         status: bot.status,
         pid: bot.pid,
-        port: bot.port,
+        port: getBotPort(bot),
         startedAt: bot.startedAt,
         stoppedAt: bot.stoppedAt,
         exitCode: bot.exitCode,

@@ -741,7 +741,17 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
             const next = new Map(prev)
             for (const [botId, rd] of Object.entries(data)) {
               const existing = prev.get(botId)
-              if (!existing || existing.cpuUsage !== rd.cpuUsage || existing.memoryUsageMb !== rd.memoryUsageMb || existing.status !== rd.status || existing.uptime !== rd.uptime) {
+              // CRITICAL: Include port in comparison so port detection updates are not
+              // silently dropped. Also include pid and restartCount for completeness.
+              if (!existing
+                || existing.cpuUsage !== rd.cpuUsage
+                || existing.memoryUsageMb !== rd.memoryUsageMb
+                || existing.status !== rd.status
+                || existing.uptime !== rd.uptime
+                || existing.port !== rd.port
+                || existing.pid !== rd.pid
+                || existing.restartCount !== rd.restartCount
+              ) {
                 next.set(botId, rd)
                 changed = true
               }

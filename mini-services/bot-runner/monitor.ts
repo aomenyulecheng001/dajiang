@@ -247,6 +247,22 @@ export function startMonitoring(botProcesses: Map<string, BotProcess>): void {
         // Port detection failure is non-critical
       }
 
+      // Fallback: if process detection failed, check bot's env vars for PORT
+      // This covers bots where port detection can't work (permission issues, non-Linux)
+      if (!bot.port) {
+        const portKeys = ['PORT', 'HTTP_PORT', 'WEBHOOK_PORT', 'SERVER_PORT', 'LISTEN_PORT']
+        for (const key of portKeys) {
+          const val = bot.envVars?.[key]
+          if (val) {
+            const parsed = parseInt(val, 10)
+            if (Number.isFinite(parsed) && parsed > 0 && parsed < 65536) {
+              bot.port = parsed
+              break
+            }
+          }
+        }
+      }
+
       // Memory watchdog — auto-restart if exceeding limit
       // Only act if not already in memoryKilledSet (prevent re-triggering every 3s)
       if (bot.memoryUsage > bot.maxMemoryMb * 1024 * 1024 && bot.memoryUsage > 0 && !memoryKilledSet.has(botId)) {

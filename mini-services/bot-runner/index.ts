@@ -403,6 +403,19 @@ async function recoverBotConfigs() {
           maxRestarts: 5,
           maxMemoryMb: 256,
         })
+        // Extract port from env vars as fallback (before process detection runs)
+        const portKeys = ['PORT', 'HTTP_PORT', 'WEBHOOK_PORT', 'SERVER_PORT', 'LISTEN_PORT']
+        for (const key of portKeys) {
+          const val = config.envVars?.[key]
+          if (val) {
+            const parsed = parseInt(val, 10)
+            if (Number.isFinite(parsed) && parsed > 0 && parsed < 65536) {
+              const entry = botProcesses.get(botId)!
+              entry.port = parsed
+              break
+            }
+          }
+        }
         const runningMarker = `${CONFIG_DIR}/${botId}.running`
         if (existsSync(runningMarker)) {
           const botEntry = botProcesses.get(botId)!
