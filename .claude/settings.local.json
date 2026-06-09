@@ -13,7 +13,9 @@
       "Bash(bun run *)",
       "PowerShell(bun run *)",
       "PowerShell(Get-Command *)",
-      "PowerShell(npx tsc --noEmit 2>&1)"
+      "PowerShell(npx tsc --noEmit 2>&1)",
+      "Bash(ssh *)",
+      "Bash(git commit *)"
     ]
   }
 }

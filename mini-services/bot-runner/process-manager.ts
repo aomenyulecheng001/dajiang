@@ -668,8 +668,20 @@ export async function startBotProcess(
     handleExit(botId, code, signal, child).catch(e => logger.error('process-manager', `handleExit error for ${botId}:`, e))
   })
 
-  io.emit('bot:status', { botId, status: 'running', pid: child.pid })
-}
+  // Compute port from envVars if not yet detected by monitoring cycle
+  const portFromEnv = (() => {
+    if (bot.port) return bot.port
+    const portKeys = ['PORT', 'HTTP_PORT', 'WEBHOOK_PORT', 'SERVER_PORT', 'LISTEN_PORT']
+    for (const key of portKeys) {
+      const val = bot.envVars?.[key]
+      if (val) {
+        const parsed = parseInt(val, 10)
+        if (Number.isFinite(parsed) && parsed > 0 && parsed < 65536) return parsed
+      }
+    }
+    return undefined
+  })()
+  io.emit('bot:status', { botId, status: 'running', pid: child.pid, port: portFromEnv })
 
 // ─── Stop Bot Process ─────────────────────────────────────────────────────
 
