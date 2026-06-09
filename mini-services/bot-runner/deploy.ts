@@ -315,8 +315,16 @@ export async function installDependencies(botId: string, language: string, optio
         const oldHash = await readDepsHashAsync(botDir)
 
         if (oldHash !== null && oldHash === newHash) {
-          // Hash exists and matches — skip install entirely
-          return { status: 'skipped' }
+          // Hash matches — verify installed packages directory exists
+          // (someone may have deleted it manually)
+          const sitePackages = join(botDir, 'site-packages')
+          try {
+            await access(sitePackages)
+            return { status: 'skipped' }
+          } catch {
+            appendDeployLog(botId, '📦 Python 依赖丢失，重新安装...')
+            // Fall through to full install below
+          }
         }
 
         // Hash missing or changed — fall through to full pip install below
@@ -339,8 +347,13 @@ export async function installDependencies(botId: string, language: string, optio
         const oldHash = await readDepsHashAsync(botDir)
 
         if (oldHash !== null && oldHash === newHash) {
-          // Hash exists and matches — skip install entirely
-          return { status: 'skipped' }
+          // Hash matches — but verify node_modules actually exists
+          try {
+            await access(join(botDir, 'node_modules'))
+            return { status: 'skipped' }
+          } catch {
+            appendDeployLog(botId, '📦 node_modules 丢失，重新安装...')
+          }
         }
 
         // Hash missing or changed — try incremental install
