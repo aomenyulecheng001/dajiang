@@ -89,18 +89,33 @@ export const BotCard = React.memo(function BotCard({ bot, viewMode }: BotCardPro
   const { connected } = useBotRunnerConnection()
   const { getBotStatus, deployBot, stopBot } = useBotRunnerActions()
   const resource = useBotResourceData(bot.id) // For port display
-  // Extract port from bot's configured envVars (always available, even when stopped)
+  // Extract port from multiple config sources (always available, even when stopped)
   const portFromConfig = useMemo(() => {
     const portKeys = ['PORT', 'HTTP_PORT', 'WEBHOOK_PORT', 'SERVER_PORT', 'LISTEN_PORT']
+    // 1. Check bot.envVars (UI environment variables tab)
     for (const key of portKeys) {
       const v = bot.envVars?.find(ev => ev.key?.toUpperCase() === key.toUpperCase())
-      if (v?.value) {
+      if (v?.value && !v.value.includes('•') /* skip masked */) {
         const parsed = parseInt(v.value, 10)
         if (Number.isFinite(parsed) && parsed > 0 && parsed < 65536) return parsed
       }
     }
+    // 2. Parse .env file from uploaded project files (ZIP import)
+    const dotEnv = bot.projectFiles?.find(f => f.path === '.env' || f.path?.endsWith('/.env'))
+    if (dotEnv?.content) {
+      for (const line of dotEnv.content.split('\n')) {
+        const eqIdx = line.indexOf('=')
+        if (eqIdx === -1) continue
+        const k = line.slice(0, eqIdx).trim()
+        if (portKeys.includes(k.toUpperCase())) {
+          const v = line.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, '')
+          const parsed = parseInt(v, 10)
+          if (Number.isFinite(parsed) && parsed > 0 && parsed < 65536) return parsed
+        }
+      }
+    }
     return undefined
-  }, [bot.envVars])
+  }, [bot.envVars, bot.projectFiles])
   const pendingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const startingRef = useRef(false)
 

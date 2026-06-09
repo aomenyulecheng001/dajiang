@@ -20,7 +20,7 @@ export const ResourceMonitor = React.memo(function ResourceMonitor({ botId }: { 
   // entire Map, causing re-renders when ANY bot's status changed.
   const status = useBotStatus(botId)
   const resource = useBotResourceData(botId)
-  const botEnvVars = useBotStore(state => state.bots.find(b => b.id === botId)?.envVars)
+  const botData = useBotStore(state => state.bots.find(b => b.id === botId))
   const [mounted, setMounted] = useState(false)
 
   useEffect(() => {
@@ -37,20 +37,35 @@ export const ResourceMonitor = React.memo(function ResourceMonitor({ botId }: { 
     const cpuAvailable = isRunning && hasCpuData
     const restartCount = resource?.restartCount ?? 0
     const uptimeSeconds = resource?.uptime || 0
-    // Port: runner detection > monitoring data > configured envVars
+    // Port: runner > monitor > DB envVars > uploaded .env file
     const port = status?.port || resource?.port || (() => {
       const portKeys = ['PORT', 'HTTP_PORT', 'WEBHOOK_PORT', 'SERVER_PORT', 'LISTEN_PORT']
+      // Check DB envVars
       for (const key of portKeys) {
-        const v = botEnvVars?.find(ev => ev.key?.toUpperCase() === key.toUpperCase())
-        if (v?.value) {
+        const v = botData?.envVars?.find(ev => ev.key?.toUpperCase() === key.toUpperCase())
+        if (v?.value && !v.value.includes('•')) {
           const p = parseInt(v.value, 10)
           if (Number.isFinite(p) && p > 0 && p < 65536) return p
+        }
+      }
+      // Parse .env from uploaded project files
+      const dotEnv = botData?.projectFiles?.find(f => f.path === '.env' || f.path?.endsWith('/.env'))
+      if (dotEnv?.content) {
+        for (const line of dotEnv.content.split('\n')) {
+          const eqIdx = line.indexOf('=')
+          if (eqIdx === -1) continue
+          const k = line.slice(0, eqIdx).trim()
+          if (portKeys.includes(k.toUpperCase())) {
+            const v = line.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, '')
+            const p = parseInt(v, 10)
+            if (Number.isFinite(p) && p > 0 && p < 65536) return p
+          }
         }
       }
       return undefined
     })()
     return { isRunning, memoryMb, maxMemoryMb, memoryPercent, cpuPercent, hasCpuData, cpuAvailable, restartCount, uptimeSeconds, port }
-  }, [status, resource, botEnvVars])
+  }, [status, resource, botData])
 
   if (!mounted || !connected) return null
 
