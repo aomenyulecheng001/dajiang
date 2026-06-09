@@ -485,19 +485,37 @@ export async function installDependencies(botId: string, language: string, optio
   const result1 = await runInstall(command, args, 'normal')
 
   if (!result1.success && language !== 'python') {
-    // Native module compilation (e.g., better-sqlite3) likely failed.
-    // Retry with --ignore-scripts, then rebuildNativeModules will handle
-    // compilation separately after install.
-    appendDeployLog(botId, '⚠️ 常规安装失败（可能是原生模块编译出错），尝试跳过编译重试...')
-    const retryArgs = [...args, '--ignore-scripts']
-    const result2 = await runInstall(command, retryArgs, 'retry')
+    // pnpm may fail on native modules (e.g. better-sqlite3).
+    // Fall back to npm — it has prebuilt binaries, no compilation needed.
+    const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm'
+    const npmArgs = ['install', '--omit=dev']
+    // Only retry with npm if we weren't already using it
+    if (command !== npmCmd && command !== 'npm') {
+      appendDeployLog(botId, `⚠️ ${command} 安装失败，改用 npm 重试（预编译原生模块）...`)
+      const result2 = await runInstall(npmCmd, npmArgs, 'npm-retry')
 
-    if (!result2.success) {
-      throw new Error(`依赖安装失败: ${result2.stderr || `exit code 1`}`)
+      if (!result2.success) {
+        // Last resort: try with --ignore-scripts
+        appendDeployLog(botId, '⚠️ npm 安装也失败，尝试跳过编译重试...')
+        const result3 = await runInstall(npmCmd, [...npmArgs, '--ignore-scripts'], 'npm-ignore-scripts')
+        if (!result3.success) {
+          throw new Error(`依赖安装失败: ${result3.stderr || 'exit code 1'}`)
+        }
+        appendDeployLog(botId, '✅ 依赖安装完成（已跳过原生编译）')
+      } else {
+        appendDeployLog(botId, '✅ npm 安装成功')
+      }
+    } else {
+      // Already using npm, retry with --ignore-scripts
+      appendDeployLog(botId, '⚠️ npm 安装失败，尝试跳过编译重试...')
+      const result2 = await runInstall(command, [...args, '--ignore-scripts'], 'retry')
+      if (!result2.success) {
+        throw new Error(`依赖安装失败: ${result2.stderr || 'exit code 1'}`)
+      }
+      appendDeployLog(botId, '✅ 依赖安装完成（已跳过原生编译）')
     }
-    appendDeployLog(botId, '✅ 依赖安装完成（已跳过原生编译，将在后续步骤中重建）')
   } else if (!result1.success) {
-    throw new Error(`依赖安装失败: ${result1.stderr || `exit code 1`}`)
+    throw new Error(`依赖安装失败: ${result1.stderr || 'exit code 1'}`)
   } else {
     appendDeployLog(botId, '✅ 依赖安装完成')
   }
