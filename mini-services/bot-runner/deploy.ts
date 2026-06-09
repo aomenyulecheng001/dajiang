@@ -722,7 +722,10 @@ export async function deployBot(
     if (config.language !== 'python') {
       try {
         await rebuildNativeModules(botId, botDir)
-      } catch { /* non-critical, continue deploy */ }
+      } catch (err) {
+        // Native module rebuild is critical for bots depending on better-sqlite3
+        throw err
+      }
     }
 
     // Stage 3: Build (TypeScript only)
