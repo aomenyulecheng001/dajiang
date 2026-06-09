@@ -268,7 +268,7 @@ export const BotCard = React.memo(function BotCard({ bot, viewMode }: BotCardPro
     isLocalStarting: effectiveLocalPending === 'starting',
     isLocalStopping: effectiveLocalPending === 'stopping',
     hasValidToken,
-    port: resource?.port,
+    port: runnerStatus?.port || resource?.port,
   }
 
   if (viewMode === 'list') {

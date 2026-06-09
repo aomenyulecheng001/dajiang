@@ -35,7 +35,7 @@ export const ResourceMonitor = React.memo(function ResourceMonitor({ botId }: { 
     const cpuAvailable = isRunning && hasCpuData
     const restartCount = resource?.restartCount ?? 0
     const uptimeSeconds = resource?.uptime || 0
-    const port = resource?.port
+    const port = status?.port || resource?.port
     return { isRunning, memoryMb, maxMemoryMb, memoryPercent, cpuPercent, hasCpuData, cpuAvailable, restartCount, uptimeSeconds, port }
   }, [status, resource])
 
