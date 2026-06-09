@@ -1,11 +1,10 @@
 'use client'
 
 import React, { useState, useEffect, useMemo } from 'react'
-import { Cpu, MemoryStick, RotateCcw, Clock, AlertTriangle, Activity, Network } from 'lucide-react'
+import { Cpu, MemoryStick, RotateCcw, Clock, AlertTriangle, Activity } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { useBotRunnerConnection, useBotStatus, useBotResourceData } from '@/lib/bot-runner-context'
-import { useBotStore } from '@/store/bot-store'
 import { useT } from '@/lib/i18n'
 import { cn, formatUptimeShort } from '@/lib/utils'
 import { DEFAULT_MAX_MEMORY_MB } from '@/lib/bot-constants'
@@ -20,7 +19,6 @@ export const ResourceMonitor = React.memo(function ResourceMonitor({ botId }: { 
   // entire Map, causing re-renders when ANY bot's status changed.
   const status = useBotStatus(botId)
   const resource = useBotResourceData(botId)
-  const botData = useBotStore(state => state.bots.find(b => b.id === botId))
   const [mounted, setMounted] = useState(false)
 
   useEffect(() => {
@@ -37,35 +35,8 @@ export const ResourceMonitor = React.memo(function ResourceMonitor({ botId }: { 
     const cpuAvailable = isRunning && hasCpuData
     const restartCount = resource?.restartCount ?? 0
     const uptimeSeconds = resource?.uptime || 0
-    // Port: runner > monitor > DB envVars > uploaded .env file
-    const port = status?.port || resource?.port || (() => {
-      const portKeys = ['PORT', 'HTTP_PORT', 'WEBHOOK_PORT', 'SERVER_PORT', 'LISTEN_PORT']
-      // Check DB envVars
-      for (const key of portKeys) {
-        const v = botData?.envVars?.find(ev => ev.key?.toUpperCase() === key.toUpperCase())
-        if (v?.value && !v.value.includes('•')) {
-          const p = parseInt(v.value, 10)
-          if (Number.isFinite(p) && p > 0 && p < 65536) return p
-        }
-      }
-      // Parse .env from uploaded project files
-      const dotEnv = botData?.projectFiles?.find(f => f.path === '.env' || f.path?.endsWith('/.env'))
-      if (dotEnv?.content) {
-        for (const line of dotEnv.content.split('\n')) {
-          const eqIdx = line.indexOf('=')
-          if (eqIdx === -1) continue
-          const k = line.slice(0, eqIdx).trim()
-          if (portKeys.includes(k.toUpperCase())) {
-            const v = line.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, '')
-            const p = parseInt(v, 10)
-            if (Number.isFinite(p) && p > 0 && p < 65536) return p
-          }
-        }
-      }
-      return undefined
-    })()
-    return { isRunning, memoryMb, maxMemoryMb, memoryPercent, cpuPercent, hasCpuData, cpuAvailable, restartCount, uptimeSeconds, port }
-  }, [status, resource, botData])
+    return { isRunning, memoryMb, maxMemoryMb, memoryPercent, cpuPercent, hasCpuData, cpuAvailable, restartCount, uptimeSeconds }
+  }, [status, resource])
 
   if (!mounted || !connected) return null
 
@@ -137,21 +108,6 @@ export const ResourceMonitor = React.memo(function ResourceMonitor({ botId }: { 
             </div>
           </div>
         </div>
-
-        {derived.port && (
-          <div className="rounded-md p-2 mt-2 bg-muted/30">
-            <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-              <Network className="size-3" />
-              {t('resourceMonitor.port')}
-            </div>
-            <div className={cn(
-              'text-sm font-mono font-semibold mt-0.5',
-              derived.isRunning ? 'text-cyan-600 dark:text-cyan-400' : 'text-muted-foreground/60'
-            )}>
-              :{derived.port}
-            </div>
-          </div>
-        )}
 
         {!derived.isRunning && derived.memoryMb === 0 && !derived.cpuAvailable && (
           <div className="text-center text-xs text-muted-foreground py-2">

@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect, useRef, useMemo } from 'react'
 import { toast } from 'sonner'
-import { Play, Square, Pencil, Trash2, Loader2, Clock, Package, Code2, Network } from 'lucide-react'
+import { Play, Square, Pencil, Trash2, Loader2, Clock, Package, Code2 } from 'lucide-react'
 import { Card, CardHeader, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -12,7 +12,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import type { Bot } from '@/types/bot'
 import { useBotStore } from '@/store/bot-store'
 import { ConfirmDialog } from './confirm-dialog'
-import { useBotRunnerConnection, useBotRunnerActions, useBotResourceData } from '@/lib/bot-runner-context'
+import { useBotRunnerConnection, useBotRunnerActions } from '@/lib/bot-runner-context'
 import { fetchRevealEnvVars, hasMaskedEnvVars, buildEnvVarsFallback, buildDeployConfig } from '@/lib/deploy-utils'
 import { BotAvatar } from './bot-avatar'
 
@@ -88,34 +88,6 @@ export const BotCard = React.memo(function BotCard({ bot, viewMode }: BotCardPro
   const [localPending, setLocalPending] = useState<'starting' | 'stopping' | null>(null)
   const { connected } = useBotRunnerConnection()
   const { getBotStatus, deployBot, stopBot } = useBotRunnerActions()
-  const resource = useBotResourceData(bot.id) // For port display
-  // Extract port from multiple config sources (always available, even when stopped)
-  const portFromConfig = useMemo(() => {
-    const portKeys = ['PORT', 'HTTP_PORT', 'WEBHOOK_PORT', 'SERVER_PORT', 'LISTEN_PORT']
-    // 1. Check bot.envVars (UI environment variables tab)
-    for (const key of portKeys) {
-      const v = bot.envVars?.find(ev => ev.key?.toUpperCase() === key.toUpperCase())
-      if (v?.value && !v.value.includes('•') /* skip masked */) {
-        const parsed = parseInt(v.value, 10)
-        if (Number.isFinite(parsed) && parsed > 0 && parsed < 65536) return parsed
-      }
-    }
-    // 2. Parse .env file from uploaded project files (ZIP import)
-    const dotEnv = bot.projectFiles?.find(f => f.path === '.env' || f.path?.endsWith('/.env'))
-    if (dotEnv?.content) {
-      for (const line of dotEnv.content.split('\n')) {
-        const eqIdx = line.indexOf('=')
-        if (eqIdx === -1) continue
-        const k = line.slice(0, eqIdx).trim()
-        if (portKeys.includes(k.toUpperCase())) {
-          const v = line.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, '')
-          const parsed = parseInt(v, 10)
-          if (Number.isFinite(parsed) && parsed > 0 && parsed < 65536) return parsed
-        }
-      }
-    }
-    return undefined
-  }, [bot.envVars, bot.projectFiles])
   const pendingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const startingRef = useRef(false)
 
@@ -295,7 +267,6 @@ export const BotCard = React.memo(function BotCard({ bot, viewMode }: BotCardPro
     isLocalStarting: effectiveLocalPending === 'starting',
     isLocalStopping: effectiveLocalPending === 'stopping',
     hasValidToken,
-    port: runnerStatus?.port || resource?.port || portFromConfig,
   }
 
   if (viewMode === 'list') {
@@ -504,7 +475,6 @@ const GridModeCard = React.memo(function GridModeCard({
   isLocalStarting,
   isLocalStopping,
   hasValidToken,
-  port,
 }: {
   bot: Bot
   status: { label: string; className: string; dotClass: string }
@@ -524,7 +494,6 @@ const GridModeCard = React.memo(function GridModeCard({
   isLocalStarting: boolean
   isLocalStopping: boolean
   hasValidToken: boolean
-  port?: number
 }) {
   const t = useT()
 
@@ -603,7 +572,7 @@ const GridModeCard = React.memo(function GridModeCard({
           <HighlightText text={bot.description || t('common.noDescription')} query={searchQuery} />
         </p>
 
-        {/* Meta row — language, deps, port, updated */}
+        {/* Meta row — language, deps, updated */}
         <div className="flex items-center gap-3 text-[11px] text-muted-foreground/60 mt-0.5">
           <span className="inline-flex items-center gap-1">
             <Code2 className="size-3" />
@@ -613,15 +582,6 @@ const GridModeCard = React.memo(function GridModeCard({
             <span className="inline-flex items-center gap-1">
               <Package className="size-3" />
               {bot.dependencies.length}{bot.dependencies.length === 1 ? ` ${t('common.dep')}` : ` ${t('common.deps')}`}
-            </span>
-          )}
-          {port && (
-            <span className={cn(
-              'inline-flex items-center gap-1 font-mono',
-              isBotRunning ? 'text-cyan-600 dark:text-cyan-400' : 'text-muted-foreground/50'
-            )}>
-              <Network className="size-3" />
-              :{port}
             </span>
           )}
           <span className="inline-flex items-center gap-1 ml-auto">
@@ -657,7 +617,6 @@ const ListModeCard = React.memo(function ListModeCard({
   isLocalStarting,
   isLocalStopping,
   hasValidToken,
-  port,
 }: {
   bot: Bot
   status: { label: string; className: string; dotClass: string }
@@ -677,7 +636,6 @@ const ListModeCard = React.memo(function ListModeCard({
   isLocalStarting: boolean
   isLocalStopping: boolean
   hasValidToken: boolean
-  port?: number
 }) {
   const t = useT()
   const needsRestart = bot.status === 'inactive' && bot.lastRunnerStatus === 'stopped'
@@ -738,18 +696,6 @@ const ListModeCard = React.memo(function ListModeCard({
           <Code2 className="size-3 text-muted-foreground/50" />
           <span className="text-xs text-muted-foreground capitalize">{bot.language}</span>
         </div>
-      </td>
-
-      {/* Port */}
-      <td className="py-3 px-4 hidden lg:table-cell">
-        {port ? (
-          <div className="flex items-center gap-1.5">
-            <Network className={cn('size-3', isBotRunning ? 'text-cyan-500' : 'text-muted-foreground/40')} />
-            <span className={cn('text-xs font-mono', isBotRunning ? 'text-cyan-600 dark:text-cyan-400' : 'text-muted-foreground/50')}>:{port}</span>
-          </div>
-        ) : (
-          <span className="text-xs text-muted-foreground/30">—</span>
-        )}
       </td>
 
       {/* Updated */}

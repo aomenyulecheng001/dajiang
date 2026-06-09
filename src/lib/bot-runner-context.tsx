@@ -17,7 +17,6 @@ export interface BotRunnerStatus {
   language: string
   status: 'stopped' | 'starting' | 'running' | 'error' | 'stopping'
   pid?: number
-  port?: number
   startedAt?: string
   stoppedAt?: string
   exitCode?: number | null
@@ -34,7 +33,6 @@ export interface ResourceData {
   pid?: number
   restartCount: number
   uptime?: number
-  port?: number
 }
 
 export interface DeployProgress {
@@ -408,13 +406,17 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
           }
         })
 
-        socket.on('bot:status', (data: { botId: string; status: string; pid?: number; error?: string; exitCode?: number; port?: number }) => {
+        socket.on('bot:status', (data: { botId: string; status: string; pid?: number; error?: string; exitCode?: number }) => {
           setBotStatuses(prev => {
             const next = new Map(prev)
             const existing = next.get(data.botId)
             // BUG FIX: Ignore stale 'stopping' events that arrive AFTER 'stopped'.
+            // This can happen if the process exits very quickly and the 'stopped' event
+            // from handleBotExit arrives before the 'stopping' event from stopBotProcess
+            // (due to network ordering). Without this, the UI would briefly show
+            // 'stopping' after already showing 'stopped', causing a visual glitch.
             if (data.status === 'stopping' && existing?.status === 'stopped') {
-              return prev
+              return prev // Ignore stale 'stopping' — bot is already stopped
             }
             next.set(data.botId, {
               id: data.botId,
@@ -422,7 +424,6 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
               language: existing?.language ?? '',
               status: data.status as BotRunnerStatus['status'],
               pid: data.status === 'stopping' ? existing?.pid : (data.pid ?? existing?.pid),
-              port: data.port ?? existing?.port,
               startedAt: existing?.startedAt,
               stoppedAt: data.status === 'stopped' ? new Date().toISOString() : existing?.stoppedAt,
               exitCode: data.exitCode ?? existing?.exitCode,
@@ -738,17 +739,7 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
             const next = new Map(prev)
             for (const [botId, rd] of Object.entries(data)) {
               const existing = prev.get(botId)
-              // CRITICAL: Include port in comparison so port detection updates are not
-              // silently dropped. Also include pid and restartCount for completeness.
-              if (!existing
-                || existing.cpuUsage !== rd.cpuUsage
-                || existing.memoryUsageMb !== rd.memoryUsageMb
-                || existing.status !== rd.status
-                || existing.uptime !== rd.uptime
-                || existing.port !== rd.port
-                || existing.pid !== rd.pid
-                || existing.restartCount !== rd.restartCount
-              ) {
+              if (!existing || existing.cpuUsage !== rd.cpuUsage || existing.memoryUsageMb !== rd.memoryUsageMb || existing.status !== rd.status || existing.uptime !== rd.uptime) {
                 next.set(botId, rd)
                 changed = true
               }

@@ -742,7 +742,6 @@ export const zh = {
     noData: '暂无资源数据',
     running: '运行中',
     mb: 'MB',
-    port: '监听端口',
     processInfo: '进程信息',
     processManager: '进程管理',
     processName: '进程',
