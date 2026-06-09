@@ -219,28 +219,10 @@ export async function rebuildNativeModules(botId: string, botDir: string): Promi
   } catch { /* non-critical */ }
 }
 
-// ─── Package Manager Detection ─────────────────────────────────────────────
-// Prefer pnpm (installs native modules like better-sqlite3 for real Node.js),
-// then bun, then npm as fallback.
+// ─── Package Manager ──────────────────────────────────────────────────────
+// Always use npm — it has prebuilt binaries for native modules (better-sqlite3)
+// avoiding the ELIFECYCLE issues that pnpm's strict mode causes.
 export async function getPackageManager(): Promise<{ cmd: string; installArgs: string[]; addArgs: string[] }> {
-  try {
-    await new Promise<void>((resolve, reject) => {
-      execFile('pnpm', ['--version'], { timeout: 3000 }, (err) => err ? reject(err) : resolve())
-    })
-    return { cmd: 'pnpm', installArgs: ['install', '--prod'], addArgs: ['add'] }
-  } catch { /* pnpm not found */ }
-
-  const pathEnv = process.env.PATH || ''
-  // Cross-platform PATH separator check
-  const pathSep = process.platform === 'win32' ? ';' : ':'
-  const hasBun = pathEnv.split(pathSep).some(p => p.includes('bun')) ||
-    process.env.BUN_INSTALL !== undefined
-
-  if (hasBun) {
-    return { cmd: 'bun', installArgs: ['install', '--production'], addArgs: ['add'] }
-  }
-
-  // FIX: On Windows, npm is npm.cmd — spawn() requires the full extension
   const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm'
   return { cmd: npmCmd, installArgs: ['install', '--omit=dev'], addArgs: ['install'] }
 }
