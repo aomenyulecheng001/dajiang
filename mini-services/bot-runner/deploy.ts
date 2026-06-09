@@ -1,6 +1,6 @@
 import { spawn } from 'child_process'
 // P2-BR-9 FIX: Removed sync fs imports, using only async fs/promises
-import { writeFile, mkdir, access, readFile, chmod } from 'fs/promises'
+import { writeFile, mkdir, access, readFile, chmod, rm } from 'fs/promises'
 import { join, dirname, resolve } from 'path'
 import type { BotProcess, BotConfig, InstallResult, DeployStage } from './types'
 import { patchTelegrafRedactToken, rebuildNativeModules, getPackageManager } from './native-modules'
@@ -492,6 +492,9 @@ export async function installDependencies(botId: string, language: string, optio
     // Only retry with npm if we weren't already using it
     if (command !== npmCmd && command !== 'npm') {
       appendDeployLog(botId, `⚠️ ${command} 安装失败，改用 npm 重试（预编译原生模块）...`)
+      // Clean up pnpm artifacts — its virtual store confuses npm
+      try { await rm(join(botDir, 'node_modules'), { recursive: true, force: true }) } catch { /* ignore */ }
+      try { await rm(join(botDir, 'pnpm-lock.yaml'), { force: true }) } catch { /* ignore */ }
       const result2 = await runInstall(npmCmd, npmArgs, 'npm-retry')
 
       if (!result2.success) {
