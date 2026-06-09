@@ -208,7 +208,7 @@ export async function getPackageManager(): Promise<{ cmd: string; installArgs: s
     await new Promise<void>((resolve, reject) => {
       execFile('pnpm', ['--version'], { timeout: 3000 }, (err) => err ? reject(err) : resolve())
     })
-    return { cmd: 'pnpm', installArgs: ['install', '--prod', '--ignore-scripts'], addArgs: ['add'] }
+    return { cmd: 'pnpm', installArgs: ['install', '--prod'], addArgs: ['add'] }
   } catch { /* pnpm not found */ }
 
   const pathEnv = process.env.PATH || ''
@@ -218,10 +218,10 @@ export async function getPackageManager(): Promise<{ cmd: string; installArgs: s
     process.env.BUN_INSTALL !== undefined
 
   if (hasBun) {
-    return { cmd: 'bun', installArgs: ['install', '--production', '--ignore-scripts'], addArgs: ['add'] }
+    return { cmd: 'bun', installArgs: ['install', '--production'], addArgs: ['add'] }
   }
 
   // FIX: On Windows, npm is npm.cmd — spawn() requires the full extension
   const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm'
-  return { cmd: npmCmd, installArgs: ['install', '--omit=dev', '--ignore-scripts'], addArgs: ['install'] }
+  return { cmd: npmCmd, installArgs: ['install', '--omit=dev'], addArgs: ['install'] }
 }

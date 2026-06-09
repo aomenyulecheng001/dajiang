@@ -426,9 +426,6 @@ export async function installDependencies(botId: string, language: string, optio
   let args: string[]
 
   if (language === 'python') {
-    // BUG FIX: Don't overwrite requirements.txt with template defaults during full install.
-    // generateBotFiles already wrote the correct requirements.txt with user's custom deps.
-    // Overwriting would lose custom dependencies.
     command = process.platform === 'win32' ? 'pip' : 'pip3'
     args = ['install', '-r', 'requirements.txt']
   } else {
@@ -437,76 +434,94 @@ export async function installDependencies(botId: string, language: string, optio
     args = pm.installArgs
   }
 
-  return new Promise<InstallResult>((resolve, reject) => {
-    // FIX: On Windows, spawn needs shell: true for .cmd/.bat files
-    const child = spawn(command, args, {
-      cwd: botDir,
-      timeout: 120000,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      shell: process.platform === 'win32',
-    })
+  /**
+   * Run a single install attempt. Returns true on success, false on failure.
+   */
+  const runInstall = (cmd: string, installArgs: string[], label: string): Promise<{ success: boolean; stderr: string }> => {
+    return new Promise((resolveInstall) => {
+      const child = spawn(cmd, installArgs, {
+        cwd: botDir,
+        timeout: 120000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        shell: process.platform === 'win32',
+      })
 
-    // OPT-5 FIX: Stream install output line-by-line in real-time instead of
-    // buffering until process exits. This gives users immediate feedback about
-    // which packages are being downloaded/installed during the deploy.
-    let stderr = ''
-    let stdoutBuffer = ''
-    child.stdout?.on('data', (data: Buffer) => {
-      const chunk = data.toString()
-      stdoutBuffer += chunk
-      // Emit each complete line as it arrives
-      let newlineIdx: number
-      while ((newlineIdx = stdoutBuffer.indexOf('\n')) !== -1) {
-        const line = stdoutBuffer.slice(0, newlineIdx).trim()
-        stdoutBuffer = stdoutBuffer.slice(newlineIdx + 1)
-        if (line) appendDeployLog(botId, line)
-      }
-    })
-    child.stderr?.on('data', (data: Buffer) => {
-      const chunk = data.toString()
-      stderr += chunk
-      // Also stream stderr lines for npm warnings/pip progress
-      let lines = chunk.split('\n')
-      for (const line of lines) {
-        if (line.trim()) appendDeployLog(botId, line.trim())
-      }
-    })
-    child.on('error', (err) => {
-      reject(new Error(`依赖安装失败: ${err.message}`))
-    })
-    child.on('close', async (code, signal) => {
-      // Flush any remaining stdout that didn't end with a newline
-      if (stdoutBuffer.trim()) {
-        appendDeployLog(botId, stdoutBuffer.trim())
-      }
-      // FIX: code=null means process was killed by signal (e.g., OOM SIGKILL).
-      // Old check `code !== 0 && code !== null` treated signal-killed as success.
-      if (code !== 0 || signal !== null) {
-        reject(new Error(`依赖安装失败: ${stderr || (signal ? `killed by ${signal}` : `exit code ${code}`)}`))
-      } else {
-        // Write deps hash after successful full install
-        // P2-BR-9 FIX: Use async fs operations
-        const hashBotDir = getBotDir(botId)
-        if (language === 'python') {
-          const reqPath = join(hashBotDir, 'requirements.txt')
-          try {
-            await access(reqPath)
-            const content = await readFile(reqPath, 'utf-8')
-            await writeDepsHashAsync(hashBotDir, hashRequirements(content), content)
-          } catch { /* ignore */ }
-        } else {
-          const pkgPath = join(hashBotDir, 'package.json')
-          try {
-            await access(pkgPath)
-            const pkgContent = await readFile(pkgPath, 'utf-8')
-            const pkg = JSON.parse(pkgContent)
-            await writeDepsHashAsync(hashBotDir, hashDependencies(pkg.dependencies || {}), pkg.dependencies || {})
-          } catch { /* ignore */ }
+      let stderr = ''
+      let stdoutBuffer = ''
+      child.stdout?.on('data', (data: Buffer) => {
+        const chunk = data.toString()
+        stdoutBuffer += chunk
+        let newlineIdx: number
+        while ((newlineIdx = stdoutBuffer.indexOf('\n')) !== -1) {
+          const line = stdoutBuffer.slice(0, newlineIdx).trim()
+          stdoutBuffer = stdoutBuffer.slice(newlineIdx + 1)
+          if (line) appendDeployLog(botId, line)
         }
-        resolve({ status: 'full' })
-      }
+      })
+      child.stderr?.on('data', (data: Buffer) => {
+        const chunk = data.toString()
+        stderr += chunk
+        for (const line of chunk.split('\n')) {
+          if (line.trim()) appendDeployLog(botId, line.trim())
+        }
+      })
+      child.on('error', (err) => {
+        resolveInstall({ success: false, stderr: err.message })
+      })
+      child.on('close', (code, signal) => {
+        if (stdoutBuffer.trim()) {
+          appendDeployLog(botId, stdoutBuffer.trim())
+        }
+        if (code !== 0 || signal !== null) {
+          resolveInstall({ success: false, stderr })
+        } else {
+          resolveInstall({ success: true, stderr })
+        }
+      })
     })
-  })
+  }
+
+  // ── Attempt 1: Normal install ────────────────────────────────────────
+  const result1 = await runInstall(command, args, 'normal')
+
+  if (!result1.success && language !== 'python') {
+    // Native module compilation (e.g., better-sqlite3) likely failed.
+    // Retry with --ignore-scripts, then rebuildNativeModules will handle
+    // compilation separately after install.
+    appendDeployLog(botId, '⚠️ 常规安装失败（可能是原生模块编译出错），尝试跳过编译重试...')
+    const retryArgs = [...args, '--ignore-scripts']
+    const result2 = await runInstall(command, retryArgs, 'retry')
+
+    if (!result2.success) {
+      throw new Error(`依赖安装失败: ${result2.stderr || `exit code 1`}`)
+    }
+    appendDeployLog(botId, '✅ 依赖安装完成（已跳过原生编译，将在后续步骤中重建）')
+  } else if (!result1.success) {
+    throw new Error(`依赖安装失败: ${result1.stderr || `exit code 1`}`)
+  } else {
+    appendDeployLog(botId, '✅ 依赖安装完成')
+  }
+
+  // Write deps hash after successful full install
+  const hashBotDir = getBotDir(botId)
+  if (language === 'python') {
+    const reqPath = join(hashBotDir, 'requirements.txt')
+    try {
+      await access(reqPath)
+      const content = await readFile(reqPath, 'utf-8')
+      await writeDepsHashAsync(hashBotDir, hashRequirements(content), content)
+    } catch { /* ignore */ }
+  } else {
+    const pkgPath = join(hashBotDir, 'package.json')
+    try {
+      await access(pkgPath)
+      const pkgContent = await readFile(pkgPath, 'utf-8')
+      const pkg = JSON.parse(pkgContent)
+      await writeDepsHashAsync(hashBotDir, hashDependencies(pkg.dependencies || {}), pkg.dependencies || {})
+    } catch { /* ignore */ }
+  }
+
+  return { status: 'full' }
 }
 
 // ─── Deploy Bot ───────────────────────────────────────────────────────────
