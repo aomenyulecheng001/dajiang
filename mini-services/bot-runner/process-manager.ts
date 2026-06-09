@@ -707,7 +707,6 @@ export function stopBotProcess(botId: string, botProcesses: Map<string, BotProce
         bot.pid = undefined
         bot.stoppedAt = new Date().toISOString()
         clearIntentionalStop(botId)
-        try { unlinkSync(`${CONFIG_DIR}/${botId}.running`) } catch { /* ignore */ }
         io.emit('bot:status', { botId, status: 'stopped', exitCode: null })
       }
     }
@@ -719,8 +718,9 @@ export function stopBotProcess(botId: string, botProcesses: Map<string, BotProce
   // before a manual startBotProcess.
   markIntentionalStop(botId)
 
-  // P1-19 FIX: Remove running marker and PID file so bot won't auto-start after shutdown
-  try { unlinkSync(`${CONFIG_DIR}/${botId}.running`) } catch { /* ignore */ }
+  // Clean up PID file (new process will get a new PID), but preserve .running
+  // marker so bots auto-recover after bot-runner restart (deploy/PM2 restart).
+  // .running is only cleaned by handleBotExit (process truly died) or /cleanup/
   try { cleanupPidFile(getBotDir(botId)) } catch { /* ignore */ }
 
   // BUG FIX: Cancel any pending auto-restart timer from a previous crash.
