@@ -87,19 +87,14 @@ export async function patchTelegrafRedactToken(botDir: string): Promise<void> {
 /**
  * Find the better-sqlite3 module directory (handles both npm and pnpm layouts).
  */
-function findSqlite3Dir(nmPath: string): string | null {
-  // npm: node_modules/better-sqlite3
+async function findSqlite3Dir(nmPath: string): Promise<string | null> {
   const npmPath = join(nmPath, 'better-sqlite3')
   try {
-    const s = statSync(nmPath + '/better-sqlite3')
+    const s = await stat(npmPath)
     if (s.isDirectory()) return npmPath
   } catch { /* not found */ }
-
   return null
 }
-
-// sync version for use in spawn callback
-import { statSync } from 'fs'
 
 /**
  * Compile better-sqlite3 using node-gyp rebuild.
@@ -140,7 +135,7 @@ export async function rebuildNativeModules(botId: string, botDir: string): Promi
   const nmPath = join(botDir, 'node_modules')
 
   // Check if better-sqlite3 is even a dependency
-  let sqlite3Dir = findSqlite3Dir(nmPath)
+  let sqlite3Dir = await findSqlite3Dir(nmPath)
   if (!sqlite3Dir) return // No native module, nothing to do
 
   // Test if module is already loadable
