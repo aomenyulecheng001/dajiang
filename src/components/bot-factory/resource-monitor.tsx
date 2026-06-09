@@ -5,6 +5,7 @@ import { Cpu, MemoryStick, RotateCcw, Clock, AlertTriangle, Activity, Network } 
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { useBotRunnerConnection, useBotStatus, useBotResourceData } from '@/lib/bot-runner-context'
+import { useBotStore } from '@/store/bot-store'
 import { useT } from '@/lib/i18n'
 import { cn, formatUptimeShort } from '@/lib/utils'
 import { DEFAULT_MAX_MEMORY_MB } from '@/lib/bot-constants'
@@ -19,6 +20,7 @@ export const ResourceMonitor = React.memo(function ResourceMonitor({ botId }: { 
   // entire Map, causing re-renders when ANY bot's status changed.
   const status = useBotStatus(botId)
   const resource = useBotResourceData(botId)
+  const botEnvVars = useBotStore(state => state.bots.find(b => b.id === botId)?.envVars)
   const [mounted, setMounted] = useState(false)
 
   useEffect(() => {
@@ -35,9 +37,20 @@ export const ResourceMonitor = React.memo(function ResourceMonitor({ botId }: { 
     const cpuAvailable = isRunning && hasCpuData
     const restartCount = resource?.restartCount ?? 0
     const uptimeSeconds = resource?.uptime || 0
-    const port = status?.port || resource?.port
+    // Port: runner detection > monitoring data > configured envVars
+    const port = status?.port || resource?.port || (() => {
+      const portKeys = ['PORT', 'HTTP_PORT', 'WEBHOOK_PORT', 'SERVER_PORT', 'LISTEN_PORT']
+      for (const key of portKeys) {
+        const v = botEnvVars?.find(ev => ev.key?.toUpperCase() === key.toUpperCase())
+        if (v?.value) {
+          const p = parseInt(v.value, 10)
+          if (Number.isFinite(p) && p > 0 && p < 65536) return p
+        }
+      }
+      return undefined
+    })()
     return { isRunning, memoryMb, maxMemoryMb, memoryPercent, cpuPercent, hasCpuData, cpuAvailable, restartCount, uptimeSeconds, port }
-  }, [status, resource])
+  }, [status, resource, botEnvVars])
 
   if (!mounted || !connected) return null
 
@@ -110,13 +123,16 @@ export const ResourceMonitor = React.memo(function ResourceMonitor({ botId }: { 
           </div>
         </div>
 
-        {derived.isRunning && derived.port && (
+        {derived.port && (
           <div className="rounded-md p-2 mt-2 bg-muted/30">
             <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
               <Network className="size-3" />
               {t('resourceMonitor.port')}
             </div>
-            <div className="text-sm font-mono font-semibold mt-0.5 text-cyan-600 dark:text-cyan-400">
+            <div className={cn(
+              'text-sm font-mono font-semibold mt-0.5',
+              derived.isRunning ? 'text-cyan-600 dark:text-cyan-400' : 'text-muted-foreground/60'
+            )}>
               :{derived.port}
             </div>
           </div>
