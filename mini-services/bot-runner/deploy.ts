@@ -721,11 +721,9 @@ export async function deployBot(
       } catch { /* non-critical, continue deploy */ }
     }
 
-    // Rebuild native modules (better-sqlite3, etc.) for the real Node.js runtime.
-    // pnpm installs packages but native .node files may not be compiled if:
-    //   - The install was intercepted by Bun (which can't compile native addons)
-    //   - Build tools weren't available during install
-    //   - Prebuilt binaries aren't available for the Node.js version
+    // Rebuild native modules (better-sqlite3, etc.) if prebuilt binary wasn't found.
+    // npm may succeed but better-sqlite3's install script can fail silently
+    // when no prebuilt binary exists and build tools are missing.
     if (config.language !== 'python') {
       try {
         await rebuildNativeModules(botId, botDir)

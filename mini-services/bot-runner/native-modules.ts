@@ -178,7 +178,7 @@ export async function rebuildNativeModules(botId: string, botDir: string): Promi
     // which can't find prebuild-install). node-gyp rebuild --release works
     // reliably because it invokes g++/make directly from the module directory.
     const nodeGypCmd = process.platform === 'win32' ? 'npx.cmd' : 'npx'
-    const nodeGypArgs = ['node-gyp', 'rebuild', '--release']
+    const nodeGypArgs = ['--yes', 'node-gyp', 'rebuild', '--release']
 
     await new Promise<void>((resolve) => {
       const child = spawn(nodeGypCmd, nodeGypArgs, {
