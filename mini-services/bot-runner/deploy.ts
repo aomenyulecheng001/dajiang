@@ -494,23 +494,18 @@ export async function installDependencies(botId: string, language: string, optio
     })
   }
 
-  // ── Attempt 1: Normal install ────────────────────────────────────────
-  const result1 = await runInstall(command, args, 'normal')
-
-  if (!result1.success && language !== 'python') {
-    // Native module compilation (e.g. better-sqlite3) may have failed.
-    // Retry with --ignore-scripts to skip native compilation.
-    appendDeployLog(botId, '⚠️ 安装失败，尝试跳过原生编译重试...')
-    const result2 = await runInstall(command, [...args, '--ignore-scripts'], 'retry')
-    if (!result2.success) {
-      throw new Error(`依赖安装失败: ${result2.stderr || 'exit code 1'}`)
-    }
-    appendDeployLog(botId, '✅ 依赖安装完成（已跳过原生编译，将在后续步骤中重建）')
-  } else if (!result1.success) {
-    throw new Error(`依赖安装失败: ${result1.stderr || 'exit code 1'}`)
-  } else {
-    appendDeployLog(botId, '✅ 依赖安装完成')
+  // Always skip native compilation during install — it's slow and unreliable.
+  // rebuildNativeModules will handle better-sqlite3 compilation separately
+  // using node-gyp rebuild which works correctly.
+  if (language !== 'python') {
+    args = [...args, '--ignore-scripts']
   }
+
+  const result = await runInstall(command, args, 'install')
+  if (!result.success) {
+    throw new Error(`依赖安装失败: ${result.stderr || 'exit code 1'}`)
+  }
+  appendDeployLog(botId, '✅ 依赖安装完成')
 
   // Write deps hash after successful full install
   const hashBotDir = getBotDir(botId)
