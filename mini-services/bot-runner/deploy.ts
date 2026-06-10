@@ -3,7 +3,7 @@ import { spawn } from 'child_process'
 import { writeFile, mkdir, access, readFile, chmod } from 'fs/promises'
 import { join, dirname, resolve } from 'path'
 import type { BotProcess, BotConfig, InstallResult, DeployStage } from './types'
-import { patchTelegrafRedactToken, rebuildNativeModules, getPackageManager } from './native-modules'
+import { patchTelegrafRedactToken, rebuildNativeModules, runPrismaGenerate, getPackageManager } from './native-modules'
 import {
   sanitizeBotId,
   getBotDir,
@@ -727,6 +727,22 @@ export async function deployBot(
         throw err
       }
     }
+
+    // Generate Prisma Client if project uses Prisma.
+    // npm install --ignore-scripts skips the postinstall hook that runs
+    // prisma generate, so we run it explicitly here. Without this,
+    // @prisma/client model methods won't exist and the bot will crash.
+    if (config.language !== 'python') {
+      try {
+        await runPrismaGenerate(botId, botDir)
+      } catch (err) {
+        // Prisma Client generation is critical for Prisma-based bots
+        throw err
+      }
+    }
+
+    // Update progress to show we're past dependency setup
+    updateStatus('prepare', 45)
 
     // Stage 3: Build (TypeScript only)
     if (config.language === 'typescript') {

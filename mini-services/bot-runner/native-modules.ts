@@ -165,9 +165,92 @@ export async function rebuildNativeModules(botId: string, botDir: string): Promi
   appendDeployLog(botId, '✅ 原生模块编译完成并验证通过')
 }
 
+// ─── Prisma Client Generation ─────────────────────────────────────────────
+
+/**
+ * Check if the project uses Prisma by looking for @prisma/client in
+ * package.json dependencies or a schema.prisma file.
+ */
+async function hasPrisma(botDir: string): Promise<boolean> {
+  try {
+    const pkgPath = join(botDir, 'package.json')
+    const pkgContent = await readFile(pkgPath, 'utf-8')
+    const pkg = JSON.parse(pkgContent)
+    const deps = { ...pkg.dependencies, ...pkg.devDependencies }
+    if (deps['@prisma/client'] || deps['prisma']) return true
+  } catch { /* package.json not found */ }
+  try {
+    await stat(join(botDir, 'prisma', 'schema.prisma'))
+    return true
+  } catch { /* no schema.prisma */ }
+  return false
+}
+
+/**
+ * Run `prisma generate` to generate the Prisma Client.
+ * Needed because npm install runs with --ignore-scripts which skips
+ * the postinstall script that normally runs prisma generate.
+ * Without this, @prisma/client model methods (e.g., db.botConfig.findUnique)
+ * won't exist at runtime and the bot will crash immediately on startup.
+ */
+export async function runPrismaGenerate(botId: string, botDir: string): Promise<void> {
+  // Quick check: does this project use Prisma?
+  if (!(await hasPrisma(botDir))) return
+
+  appendDeployLog(botId, '🔧 检测到 Prisma，正在生成客户端...')
+
+  const npxCmd = process.platform === 'win32' ? 'npx.cmd' : 'npx'
+
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(npxCmd, ['prisma', 'generate'], {
+      cwd: botDir,
+      timeout: 60000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      shell: process.platform === 'win32',
+    })
+
+    let stderr = ''
+    child.stdout?.on('data', (data: Buffer) => {
+      for (const line of data.toString().split('\n')) {
+        if (line.trim()) appendDeployLog(botId, line.trim())
+      }
+    })
+    child.stderr?.on('data', (data: Buffer) => {
+      const chunk = data.toString()
+      stderr += chunk
+      for (const line of chunk.split('\n')) {
+        if (line.trim()) appendDeployLog(botId, line.trim())
+      }
+    })
+    child.on('error', (err) => {
+      appendDeployLog(botId, `❌ prisma generate 启动失败: ${err.message}`)
+      reject(new Error(`prisma generate 启动失败: ${err.message}`))
+    })
+    child.on('close', (code) => {
+      if (code === 0) {
+        appendDeployLog(botId, '✅ Prisma Client 生成完成')
+        resolve()
+      } else {
+        const detail = stderr.slice(-500) || `exit code: ${code}`
+        reject(new Error(
+          `Prisma Client 生成失败。请检查 schema.prisma 是否正确。\n${detail}`
+        ))
+      }
+    })
+  })
+}
+
 // ─── Package Manager ──────────────────────────────────────────────────────
+
+// Shared npm flags for speed: skip scripts (handled separately),
+// prefer local cache, skip audit/funding noise.
+const NPM_SPEED_FLAGS = ['--prefer-offline', '--no-audit', '--no-fund']
 
 export async function getPackageManager(): Promise<{ cmd: string; installArgs: string[]; addArgs: string[] }> {
   const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm'
-  return { cmd: npmCmd, installArgs: ['install', '--omit=dev'], addArgs: ['install'] }
+  return {
+    cmd: npmCmd,
+    installArgs: ['install', '--omit=dev', ...NPM_SPEED_FLAGS],
+    addArgs: ['install', ...NPM_SPEED_FLAGS],
+  }
 }
