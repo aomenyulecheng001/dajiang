@@ -69,3 +69,4 @@ tsconfig.tsbuildinfo
 
 # Logs
 *.log
+temp_*
