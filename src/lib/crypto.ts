@@ -207,9 +207,15 @@ export async function encryptAsync(text: string): Promise<string> {
   // the deterministic salt derived from keySource. This prevents precomputation
   // attacks and ensures each ciphertext uses a unique derived key.
   const salt = randomBytes(PBKDF2_SALT_BYTES)
-  const keySource = _cachedKeySource
+  // Auto-initialize on first call — avoids "Key source not available" error
+  // when encryptAsync is called before an explicit initializeCrypto().
+  let keySource = _cachedKeySource
   if (!keySource) {
-    throw new Error('[crypto] Key source not available. Call getKeyAsync() first.')
+    await getKeyAsync()
+    keySource = _cachedKeySource
+    if (!keySource) {
+      throw new Error('[crypto] Key source not available after initialization. Check ENCRYPTION_KEY env var.')
+    }
   }
   const key = await deriveKeyWithSalt(keySource, salt)
   const cipher = createCipheriv(ALGORITHM, key, iv)

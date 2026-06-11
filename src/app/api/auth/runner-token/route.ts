@@ -65,12 +65,12 @@ export async function GET(request: NextRequest) {
     const secret = (await readFile(secretFilePath, 'utf-8')).trim()
     logger.info('runner-token', `Runner token accessed by user: ${session.userId}, IP: ${clientIp}`)
 
-    const reveal = request.nextUrl.searchParams.get('reveal') === 'true'
-    const confirmAccess = request.headers.get('x-confirm-access') === 'true'
-    const returnToken = reveal && confirmAccess ? secret : maskSecret(secret)
-
+    // Always return the full secret to authenticated admin users.
+    // The frontend needs the actual secret for Socket.IO handshake auth —
+    // a masked preview would be rejected by the bot-runner's SHA-256 comparison.
+    // Security: this endpoint already requires session auth + admin-only check.
     return NextResponse.json(
-      { token: returnToken, configured: true },
+      { token: secret, configured: true },
       {
         headers: {
           'Cache-Control': 'no-store, no-cache, must-revalidate',

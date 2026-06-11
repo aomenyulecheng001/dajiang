@@ -260,24 +260,24 @@ export async function POST(request: Request) {
       )
     }
 
-    // Second check: is there already a runner process listening on the port?
-    // This covers the case where PM2 manages the bot-runner separately.
+    // Second check: is there already a process listening on the port?
+    // If anything responds on the port (even with 401/403), something is
+    // already there — don't spawn a second instance (EADDRINUSE).
     try {
       const healthResp = await fetch(`${BOT_RUNNER_URL}/health`, {
         signal: AbortSignal.timeout(2000),
       })
-      if (healthResp.ok) {
-        const data = await healthResp.json()
-        return NextResponse.json(
-          {
-            success: true,
-            message: 'Bot runner service is already running (external process)',
-            port: PORT,
-            external: true,
-          },
-          { status: 200 }
-        )
-      }
+      // Any response means the port is occupied — PM2 or another instance
+      logger.info('start-service', `Port ${PORT} is already in use (HTTP ${healthResp.status}), skipping spawn`)
+      return NextResponse.json(
+        {
+          success: true,
+          message: 'Bot runner service is already running (external process)',
+          port: PORT,
+          external: true,
+        },
+        { status: 200 }
+      )
     } catch {
       // Runner is not accessible, proceed to start it
     }
