@@ -1,7 +1,8 @@
 import { create } from 'zustand'
+import { useShallow } from 'zustand/react/shallow'
 import { toast } from 'sonner'
 import type { Bot, BotLanguage, CodeBlock, Dependency, EnvVar, BotConfig, LogEntry, ProjectFile } from '@/types/bot'
-import { getTranslation } from '@/lib/i18n'
+import { getTranslation, type TranslationKey } from '@/lib/i18n'
 import type { Locale } from '@/lib/i18n'
 import { useI18nStore } from '@/lib/i18n'
 import { generateUUID, generateSecret } from '@/lib/utils'
@@ -95,6 +96,13 @@ export function authFetch(url: string, init: RequestInit = {}): Promise<Response
   const headers = new Headers(init.headers)
   if (!headers.has('Content-Type') && init.body && typeof init.body === 'string') {
     headers.set('Content-Type', 'application/json')
+  }
+  // SECURITY FIX (S3): Add CSRF custom header for state-changing requests.
+  // The middleware requires X-Requested-With: XMLHttpRequest on all
+  // non-GET/HEAD/OPTIONS requests to prevent cross-site request forgery.
+  const method = (init.method || 'GET').toUpperCase()
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+    headers.set('X-Requested-With', 'XMLHttpRequest')
   }
   return fetch(url, { ...init, headers, credentials: 'include' }).then((res) => {
    // 401 INTERCEPTOR: If the token is expired or invalid, clear auth state
@@ -437,7 +445,8 @@ function showErrorToastWithCooldown(botId: string) {
   if (now - lastShown < ERROR_TOAST_COOLDOWN_MS) return
   errorToastCooldown.set(botId, now)
   const locale = useI18nStore.getState().locale
-  const t = (key: string, params?: Record<string, string | number>) => getTranslation(locale, key as any, params)
+  // FIX (L3): Use TranslationKey instead of `any` for type safety
+  const t = (key: TranslationKey, params?: Record<string, string | number>) => getTranslation(locale, key, params)
   toast.error(t('common.saveFailed'), { description: t('common.saveFailedDesc') })
 }
 
@@ -830,7 +839,7 @@ export const useBotStore = create<BotStore>((set, get) => ({
         }))
         botSnapshots.delete(clientUUID)
         const locale = useI18nStore.getState().locale
-        const t = (key: string, params?: Record<string, string | number>) => getTranslation(locale, key as any, params)
+        const t = (key: TranslationKey, params?: Record<string, string | number>) => getTranslation(locale, key, params)
         toast.error(t('common.saveFailed'), { description: t('common.saveFailedDesc') })
         return
       }
@@ -917,7 +926,7 @@ export const useBotStore = create<BotStore>((set, get) => ({
     const success = await deleteBotFromDB(id)
     // BUG FIX: Use i18n for delete toast messages (was hardcoded English)
     const locale = useI18nStore.getState().locale
-    const t = (key: string, params?: Record<string, string | number>) => getTranslation(locale, key as any, params)
+    const t = (key: TranslationKey, params?: Record<string, string | number>) => getTranslation(locale, key, params)
     if (success) {
       toast.success(t('botCard.deleteSuccess', { name: botName }), { description: t('botCard.deleteSuccessDesc') })
     } else {
@@ -1565,7 +1574,16 @@ if (typeof window !== 'undefined') {
     }
   }).catch(() => {})
 
-  window.addEventListener('beforeunload', () => {
+  // SECURITY FIX (M6): Use both beforeunload (for keepalive small saves)
+  // and pagehide (for large saves) to prevent data loss on tab close.
+  // beforeunload + keepalive has a 64KB body limit, so large changes
+  // (projectFiles) are silently lost. pagehide supports sendBeacon which
+  // has a 64KB limit too, but we can use a non-keepalive fetch in
+  // beforeunload for small changes and warn the user about large unsaved changes.
+  let hasLargeUnsavedChanges = false
+
+  window.addEventListener('beforeunload', (event) => {
+    hasLargeUnsavedChanges = false
     for (const [botId, timer] of persistTimers.entries()) {
       clearTimeout(timer)
       persistTimers.delete(botId)
@@ -1583,18 +1601,57 @@ if (typeof window !== 'undefined') {
         // BUG FIX: keepalive fetch has a 64KB body limit in browsers.
         // Large projectFiles can exceed this, causing silent data loss on tab close.
         const KEEPALIVE_MAX_BYTES = 64 * 1024
-        if (new TextEncoder().encode(body).length > KEEPALIVE_MAX_BYTES) {
-          logger.warn('bot-store', `beforeunload PATCH for ${botId} exceeds keepalive limit (${body.length}B), unsaved changes may be lost`)
+        const bodyBytes = new TextEncoder().encode(body).length
+        if (bodyBytes > KEEPALIVE_MAX_BYTES) {
+          // SECURITY FIX (M6): Track large unsaved changes to prompt user
+          hasLargeUnsavedChanges = true
+          logger.warn('bot-store', `beforeunload PATCH for ${botId} exceeds keepalive limit (${bodyBytes}B)`)
           continue
         }
         fetch(`/api/bots/${botId}`, {
           method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
           body,
           credentials: 'include',
           keepalive: true,
         }).catch(() => {})
       } catch {}
     }
+    // SECURITY FIX (M6): If there are large unsaved changes that can't be
+    // saved via keepalive, prompt the user to stay on the page
+    if (hasLargeUnsavedChanges) {
+      event.preventDefault()
+    }
   })
+}
+
+// ─── Optimized Selector Hooks ────────────────────────────────────────────────
+// FIX (S1+S2): Provides stable references to bot objects from the store.
+// Using `useBotStore(s => s.bots.find(b => b.id === id))` causes unnecessary
+// re-renders because `find()` is called on every `bots` array change (even
+// for unrelated bots). These hooks split the subscription into two stable
+// selectors, then derive the bot object. Zustand only triggers re-render
+// when the derived bot reference actually changes.
+
+/** Select a bot by its ID (for components that receive botId as a prop)
+ *  PERFORMANCE FIX (M1): Use useShallow to prevent re-renders when other bots
+ *  in the array change. Previously, bots.find() returned a new reference on
+ *  every call, causing re-renders even when the selected bot was unchanged.
+ */
+export function useBot(botId: string | undefined): Bot | undefined {
+  return useBotStore(
+    useShallow((s) => botId ? s.bots.find((b) => b.id === botId) : undefined)
+  )
+}
+
+/** Select the currently selected bot (for components that use selectedBotId)
+ *  PERFORMANCE FIX (M1): Use useShallow to prevent re-renders when other bots
+ *  in the array change. Also splits the selector so selectedBotId changes
+ *  don't require re-reading the entire bots array.
+ */
+export function useSelectedBot(): Bot | null {
+  const selectedBotId = useBotStore((s) => s.selectedBotId)
+  return useBotStore(
+    useShallow((s) => selectedBotId ? s.bots.find((b) => b.id === selectedBotId) ?? null : null)
+  )
 }

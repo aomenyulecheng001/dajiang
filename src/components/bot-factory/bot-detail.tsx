@@ -11,22 +11,14 @@ import { Badge } from '@/components/ui/badge'
 import { cn, statusConfig, getStatusLabel, formatNumber } from '@/lib/utils'
 import { LANGUAGE_LABELS } from '@/lib/bot-constants'
 import { BotAvatar } from './bot-avatar'
-import { useBotStore } from '@/store/bot-store'
+import { useSelectedBot } from '@/store/bot-store'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { RuntimeControl } from './runtime-control'
 import { useT, useLocale } from '@/lib/i18n'
 import { TabErrorBoundary } from './tab-error-boundary'
 
 export function BotDetail() {
-  // PERF OPT: Single stable selector reads selectedBotId from store state
-  // FIX: Use two separate subscriptions with stable selectors to prevent
-  // over-renders. Previously, s.bots.find() returned a new object reference
-  // every time ANY bot in the array changed, causing BotDetail and all
-  // children to re-render unnecessarily. Now we subscribe to selectedBotId
-  // and bots array separately, and only find the bot when selectedBotId changes.
-  const selectedBotId = useBotStore((s) => s.selectedBotId)
-  const bots = useBotStore((s) => s.bots)
-  const bot = selectedBotId ? bots.find((b) => b.id === selectedBotId) ?? null : null
+  const bot = useSelectedBot()
   const [activeTab, setActiveTab] = useState('overview')
   const t = useT()
   const locale = useLocale()

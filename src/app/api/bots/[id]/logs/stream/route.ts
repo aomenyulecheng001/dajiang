@@ -104,33 +104,42 @@ export async function GET(
     })
   }
 
-  // SECURITY FIX: Enforce global SSE connection limit to prevent resource exhaustion.
-  if (activeSSEConnections >= MAX_GLOBAL_SSE_CONNECTIONS) {
-    return new Response(JSON.stringify({
-      error: `Too many active SSE connections (${activeSSEConnections}/${MAX_GLOBAL_SSE_CONNECTIONS}). Please try again later.`,
-    }), {
-      status: 429,
-      headers: { 'Content-Type': 'application/json', 'Retry-After': '30' },
-    })
-  }
-
+  // SECURITY FIX (S-4): Increment counters FIRST (synchronously) to prevent race
+  // condition. Previously, the check-then-increment pattern allowed concurrent
+  // requests to all pass the limit check before any counter was incremented,
+  // enabling up to N×limit connections. Now we increment immediately and rollback
+  // if over the limit, ensuring the counter is always accurate.
   // P2-11 FIX: Authenticate BEFORE any DB query to avoid wasting DB resources on unauthenticated requests.
   const userId = await getCurrentUserId(request)
   if (!userId) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
-  // Per-user connection limit check (before incrementing global counter)
-  const userConns = activeSSEConnectionsByUser.get(userId) || 0
-  if (userConns >= MAX_SSE_CONNECTIONS_PER_USER) {
+  // Increment both counters immediately (synchronously)
+  activeSSEConnections++
+  const userConns = (activeSSEConnectionsByUser.get(userId) || 0) + 1
+  activeSSEConnectionsByUser.set(userId, userConns)
+
+  // Rollback if over global limit
+  if (activeSSEConnections > MAX_GLOBAL_SSE_CONNECTIONS) {
+    activeSSEConnections--
+    activeSSEConnectionsByUser.set(userId, Math.max(0, userConns - 1))
+    return new Response(JSON.stringify({
+      error: `Too many active SSE connections. Please try again later.`,
+    }), {
+      status: 429,
+      headers: { 'Content-Type': 'application/json', 'Retry-After': '30' },
+    })
+  }
+
+  // Rollback if over per-user limit
+  if (userConns > MAX_SSE_CONNECTIONS_PER_USER) {
+    activeSSEConnections--
+    activeSSEConnectionsByUser.set(userId, Math.max(0, userConns - 1))
     return new Response(JSON.stringify({
       error: 'Too many SSE connections for this user',
     }), { status: 429, headers: { 'Content-Type': 'application/json', 'Retry-After': '30' } })
   }
-
-  // Now safe to increment both counters
-  activeSSEConnections++
-  activeSSEConnectionsByUser.set(userId, userConns + 1)
 
   // BUG FIX (BUG-103): Wrap DB queries in try/catch to ensure activeSSEConnections
   // is decremented if the DB is unreachable. Previously, if db.bot.findUnique

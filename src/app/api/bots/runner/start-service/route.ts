@@ -1,5 +1,5 @@
 import { spawn } from 'child_process'
-import { existsSync, realpathSync } from 'fs'
+import { existsSync, realpathSync, writeFileSync, readFileSync, unlinkSync } from 'fs'
 import { NextResponse } from 'next/server'
 import path from 'path'
 import { resolveFromProjectRoot } from '@/lib/project-root'
@@ -10,15 +10,67 @@ import { logger } from '@/lib/logger'
 // Track running service process
 let serviceProcess: ReturnType<typeof spawn> | null = null
 
-function isServiceRunning(): boolean {
-  if (!serviceProcess) return false
+// SECURITY FIX (S3): PID file for persistent process tracking across
+// hot-reloads and module re-instantiation. The in-memory serviceProcess
+// variable is lost on Next.js hot-reload, leading to orphan processes.
+function getRunnerPidPath(): string {
+  return resolveFromProjectRoot('mini-services', 'bot-runner', '.runner-pid')
+}
+
+function writeRunnerPid(pid: number): void {
   try {
-    // Check if the process is still alive
-    return !!(serviceProcess.pid && serviceProcess.kill(0))
+    const pidPath = getRunnerPidPath()
+    const pidDir = path.dirname(pidPath)
+    if (!existsSync(pidDir)) return
+    writeFileSync(pidPath, String(pid), 'utf-8')
   } catch {
-    serviceProcess = null
+    // Non-critical: PID file is a best-effort tracking mechanism
+  }
+}
+
+function readRunnerPid(): number | null {
+  try {
+    const pidPath = getRunnerPidPath()
+    if (!existsSync(pidPath)) return null
+    const pid = parseInt(readFileSync(pidPath, 'utf-8').trim(), 10)
+    if (isNaN(pid) || pid <= 0) return null
+    return pid
+  } catch {
+    return null
+  }
+}
+
+function removeRunnerPid(): void {
+  try { unlinkSync(getRunnerPidPath()) } catch { /* ignore */ }
+}
+
+function isPidAlive(pid: number): boolean {
+  try {
+    if (process.platform === 'win32') {
+      // On Windows, process.kill(pid, 0) throws if the process doesn't exist
+      process.kill(pid, 0)
+      return true
+    }
+    return !!process.kill(pid, 0)
+  } catch {
     return false
   }
+}
+
+function isServiceRunning(): boolean {
+  // Check in-memory reference first (fast path)
+  if (serviceProcess) {
+    try {
+      if (serviceProcess.pid && serviceProcess.kill(0)) return true
+    } catch { /* process dead */ }
+    serviceProcess = null
+  }
+  // SECURITY FIX (S3): Fallback to PID file for cross-reload tracking
+  const pid = readRunnerPid()
+  if (pid && isPidAlive(pid)) return true
+  // PID file is stale — clean it up
+  if (pid) removeRunnerPid()
+  return false
 }
 
 /**
@@ -282,11 +334,12 @@ export async function POST(request: Request) {
 
     // SECURITY FIX: Only pass whitelisted env vars to bot-runner child process.
     // Passing all of process.env would leak ENCRYPTION_KEY, HMAC_SECRET, etc.
+    // SECURITY FIX (M-15): Removed DATABASE_URL — the Bot Runner communicates
+    // via Socket.IO and doesn't need direct DB access.
     const safeEnvVars: Record<string, string> = {
       PORT: String(PORT),
       NODE_ENV: process.env.NODE_ENV || 'development',
     }
-    if (process.env.DATABASE_URL) safeEnvVars.DATABASE_URL = process.env.DATABASE_URL
     if (process.env.PATH) safeEnvVars.PATH = process.env.PATH
     if (process.env.HOME) safeEnvVars.HOME = process.env.HOME
     if (process.env.PROJECT_ROOT) safeEnvVars.PROJECT_ROOT = process.env.PROJECT_ROOT
@@ -342,7 +395,14 @@ export async function POST(request: Request) {
         logger.warn('start-service', `[bot-runner:${PORT}] exited with code ${code}`)
       }
       serviceProcess = null
+      // SECURITY FIX (S3): Clean up PID file on process exit
+      removeRunnerPid()
     })
+
+    // SECURITY FIX (S3): Persist PID to file for cross-reload tracking
+    if (serviceProcess.pid) {
+      writeRunnerPid(serviceProcess.pid)
+    }
 
     // Allow the parent process to exit independently
     serviceProcess.unref()

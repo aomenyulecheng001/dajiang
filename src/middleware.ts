@@ -13,9 +13,18 @@ const PUBLIC_ROUTES = [
   '/api/auth/login',
   '/api/auth/session',
   '/api/auth/token-version',
+  '/api/auth/revoke-check',
   '/api/health',
   '/api',
 ]
+
+// SECURITY FIX (S3): CSRF protection — state-changing requests must carry a
+// custom header that browsers cannot add automatically (e.g., from an HTML form).
+// This prevents cross-site request forgery attacks where a malicious site tricks
+// the user's browser into submitting authenticated requests.
+const CSRF_SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
+const CSRF_REQUIRED_HEADER = 'x-requested-with'
+const CSRF_EXPECTED_VALUE = 'XMLHttpRequest'
 
 const TRUSTED_PROXIES = new Set(
   (process.env.TRUSTED_PROXIES || '').split(',').map(s => s.trim()).filter(Boolean)
@@ -31,8 +40,12 @@ function extractClientIp(request: NextRequest): string {
     return 'shared-untrusted'
   }
 
+  // SECURITY FIX (M4): Validate IP format to prevent rate-limit bypass via
+  // spoofed x-forwarded-for headers and to avoid wasting memory on invalid strings.
+  const isValidIp = (ip: string) => /^[0-9a-fA-F.:]+$/.test(ip) && ip.length <= 45
+
   const rawDirectIp = request.headers.get('x-real-ip') || request.headers.get('x-client-ip')
-  const directIp = (rawDirectIp && /^[0-9a-fA-F.:]+$/.test(rawDirectIp) && rawDirectIp.length <= 45)
+  const directIp = (rawDirectIp && isValidIp(rawDirectIp))
     ? rawDirectIp
     : '127.0.0.1'
 
@@ -41,7 +54,7 @@ function extractClientIp(request: NextRequest): string {
     if (forwarded) {
       const ips = forwarded.split(',').map(s => s.trim())
       for (let i = ips.length - 1; i >= 0; i--) {
-        if (!isTrustedProxy(ips[i])) return ips[i]
+        if (!isTrustedProxy(ips[i]) && isValidIp(ips[i])) return ips[i]
       }
     }
   }
@@ -54,7 +67,10 @@ function isWebhookRoute(pathname: string): boolean {
 }
 
 function isPublicRoute(pathname: string): boolean {
-  return PUBLIC_ROUTES.some(r => pathname === r) || isWebhookRoute(pathname)
+  // SECURITY FIX (M5): Use prefix matching instead of exact matching.
+  // Previously, trailing slashes or sub-paths could bypass the public route
+  // check, causing unexpected auth failures or security gaps.
+  return PUBLIC_ROUTES.some(r => pathname === r || pathname.startsWith(r + '/')) || isWebhookRoute(pathname)
 }
 
 export const config = {
@@ -73,7 +89,7 @@ export async function middleware(request: NextRequest) {
   const method = request.method
   const normalizedPathname = pathname
     .replace(/\/api\/bots\/([a-zA-Z0-9._-]+)(?=\/|$)/g, '/api/bots/:id')
-  const config = getRateLimitConfig(method, normalizedPathname)
+  const rateLimitConfig = getRateLimitConfig(method, normalizedPathname)
 
   const normalizedPath = pathname
     .replace(/\/api\/bots\/([a-zA-Z0-9._-]+)(?=\/|$)/g, '/api/bots/:id')
@@ -81,7 +97,7 @@ export async function middleware(request: NextRequest) {
     .replace(/\/\d+/g, '/:num')
   const rateLimitKey = `${ip}:${method}:${normalizedPath}`
 
-  const result = rateLimit.check(rateLimitKey, config)
+  const result = rateLimit.check(rateLimitKey, rateLimitConfig)
 
   const headers = getRateLimitHeaders(result)
 
@@ -143,6 +159,21 @@ export async function middleware(request: NextRequest) {
       return NextResponse.json(
         { error: 'Invalid or expired session', code: 'AUTH_EXPIRED' },
         { status: 401 },
+      )
+    }
+  }
+
+  // SECURITY FIX (S3): CSRF protection for state-changing requests.
+  // Authenticated non-GET/HEAD/OPTIONS requests must carry the custom header.
+  // Browsers cannot add custom headers in simple HTML form submissions, so this
+  // blocks CSRF attacks. Only enforced for authenticated routes (public routes
+  // like webhooks are excluded above and don't reach this point).
+  if (!CSRF_SAFE_METHODS.has(request.method) && !isPublicRoute(pathname)) {
+    const headerValue = request.headers.get(CSRF_REQUIRED_HEADER)
+    if (headerValue !== CSRF_EXPECTED_VALUE) {
+      return NextResponse.json(
+        { error: 'CSRF protection: missing or invalid custom header', code: 'CSRF_REQUIRED' },
+        { status: 403 },
       )
     }
   }

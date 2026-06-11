@@ -23,7 +23,7 @@ const MAX_TOTAL_SESSIONS = 1000
  * In production, this should be loaded from an environment variable.
  * For single-instance dev/demo, a fixed secret is acceptable.
  */
-import { generateHmacSecret, logMissingHmacSecret, isBuildPhase } from '@/lib/hmac-secret'
+import { generateHmacSecret, logMissingHmacSecret, isBuildPhase, hmacSignData, hmacVerifyData } from '@/lib/hmac-secret'
 import { logger } from '@/lib/logger'
 
 // ...
@@ -44,6 +44,9 @@ function getHmacSecret(): string {
   logMissingHmacSecret('node')
   // BUG FIX (BUG-104): When HMAC_SECRET is not set, derive fallback from
   // .hmac-secret file so both Node.js and Edge runtimes share the same secret.
+  // SECURITY FIX (M4): Use atomic file creation (O_EXCL via 'wx' flag) to
+  // prevent race conditions when both Edge and Node.js runtimes start
+  // simultaneously and both try to create the .hmac-secret file.
   try {
     const fs = require('fs') as typeof import('fs')
     const path = require('path') as typeof import('path')
@@ -57,9 +60,18 @@ function getHmacSecret(): string {
     }
     const secret = generateHmacSecret()
     try {
-      fs.writeFileSync(secretFile, secret + '\n', { mode: 0o600 })
-    } catch {
-      // Write may fail — secret is still usable in memory
+      // O_EXCL: fails if file already exists, preventing race condition
+      const fd = fs.openSync(secretFile, 'wx', 0o600)
+      fs.writeFileSync(fd, secret + '\n')
+      fs.closeSync(fd)
+      return secret
+    } catch (e: unknown) {
+      // EEXIST: another runtime created the file — read its content
+      if (e instanceof Error && 'code' in e ? (e as NodeJS.ErrnoException).code === 'EEXIST' : false) {
+        const existing = fs.readFileSync(secretFile, 'utf-8').trim()
+        if (existing.length >= 32) return existing
+      }
+      // Other write errors — secret is still usable in memory
     }
     return secret
   } catch {
@@ -91,18 +103,34 @@ const revokedTokenSignatures = new Map<string, RevocationEntry>()
 
 let revocationsLoaded = false
 
-import { appendFile, readFile as fsReadFile, mkdir, writeFile } from 'fs/promises'
+import { appendFile, readFile as fsReadFile, mkdir, writeFile, rename } from 'fs/promises'
 import { existsSync } from 'fs'
 import { resolveFromProjectRoot } from '@/lib/project-root'
 
 const REVOCATION_FILE = resolveFromProjectRoot('.revoked-tokens')
 
+// SECURITY FIX (M2): Write queue to serialize file operations on .revoked-tokens.
+// Previously, concurrent logout requests could cause appendFile/writeFile races,
+// potentially losing revocation records. This queue ensures all file writes
+// happen sequentially.
+let _fileWriteQueue: Promise<void> = Promise.resolve()
+
 async function persistRevocation(tokenHash: string, expiresAt: number): Promise<void> {
-  try {
-    await appendFile(REVOCATION_FILE, `${tokenHash}:${expiresAt}\n`)
-  } catch (error) {
-    logger.error('session', 'CRITICAL: Failed to persist token revocation to disk. Revocation is in-memory only and will be lost on restart.', error instanceof Error ? error.message : 'unknown')
-  }
+  _fileWriteQueue = _fileWriteQueue.then(async () => {
+    try {
+      await appendFile(REVOCATION_FILE, `${tokenHash}:${expiresAt}\n`)
+    } catch (error) {
+      // SECURITY FIX (L-4): Retry once after 100ms on failure to handle transient
+      // disk errors (e.g., temporary ENOSPC, EBUSY on Windows).
+      try {
+        await new Promise(resolve => setTimeout(resolve, 100))
+        await appendFile(REVOCATION_FILE, `${tokenHash}:${expiresAt}\n`)
+      } catch (retryError) {
+        logger.error('session', 'CRITICAL: Failed to persist token revocation to disk after retry. Revocation is in-memory only and will be lost on restart.', retryError instanceof Error ? retryError.message : 'unknown')
+      }
+    }
+  })
+  await _fileWriteQueue
 }
 
 async function loadRevocations(): Promise<void> {
@@ -130,14 +158,24 @@ async function loadRevocations(): Promise<void> {
   }
 }
 
-loadRevocations().catch(() => { /* ignore */ })
+loadRevocations().catch((error) => {
+  // SECURITY FIX (M2): Log top-level failure instead of silently swallowing.
+  // The inner catch already handles fail-closed semantics (not setting revocationsLoaded=true),
+  // but if anything unexpected escapes the inner catch, we need visibility.
+  logger.error('session', 'CRITICAL: loadRevocations() top-level failure', error instanceof Error ? error.message : String(error))
+})
 
 const tokenVersionCache = new Map<string, { version: number; cachedAt: number }>()
-const TOKEN_VERSION_CACHE_TTL_MS = 10 * 1000
+// SECURITY FIX (S4): Reduced cache TTL from 10s to 3s to minimize the window
+// where a stale tokenVersion allows a revoked token to pass Edge Runtime
+// validation after password change. The trade-off is slightly more DB queries
+// (at most 1 per user per 3s), which is acceptable for a single-admin system.
+const TOKEN_VERSION_CACHE_TTL_MS = 3 * 1000
 
-// SECURITY FIX (SEC-89): Reduced cleanup interval from 60 minutes to 5 minutes.
-// Cache TTL is 30 seconds, so a 60-minute cleanup interval means expired entries
-// consume memory for up to 60 minutes unnecessarily.
+// M10 FIXED: Cleanup interval 10s matches 3s TTL (3.3× TTL).
+// Entries older than TTL are removed promptly to prevent memory accumulation
+// during high-frequency token validation (the single-admin system rarely exceeds
+// a few entries, but the cleanup is defensive against cache key collisions).
 const _tokenVersionCleanupInterval = setInterval(() => {
   const now = Date.now()
   for (const [key, entry] of tokenVersionCache) {
@@ -145,7 +183,7 @@ const _tokenVersionCleanupInterval = setInterval(() => {
       tokenVersionCache.delete(key)
     }
   }
-}, 30 * 1000)
+}, 10 * 1000)
 if (typeof (_tokenVersionCleanupInterval as ReturnType<typeof setInterval> & { unref?: () => void }).unref === 'function') {
   (_tokenVersionCleanupInterval as ReturnType<typeof setInterval> & { unref: () => void }).unref()
 }
@@ -174,17 +212,26 @@ const revocationCleanupInterval = setInterval(async () => {
     }
     logger.warn('session', 'Pruned revocation list (size exceeded 50000)')
   }
-  try {
-    const validEntries: string[] = []
-    for (const [hash, entry] of revokedTokenSignatures) {
-      if (entry.expiresAt > now) {
-        validEntries.push(`${hash}:${entry.expiresAt}`)
+  // SECURITY FIX (M2): Use write queue for compaction to avoid race with
+  // concurrent persistRevocation appendFile calls.
+  _fileWriteQueue = _fileWriteQueue.then(async () => {
+    try {
+      const validEntries: string[] = []
+      for (const [hash, entry] of revokedTokenSignatures) {
+        if (entry.expiresAt > now) {
+          validEntries.push(`${hash}:${entry.expiresAt}`)
+        }
       }
+      // SECURITY FIX (L-10): Write-then-rename pattern for atomic compaction.
+      // Write to a .tmp file first, then rename to the actual file.
+      // Rename is atomic on most filesystems, preventing partial/corrupt writes.
+      const tmpFile = REVOCATION_FILE + '.tmp'
+      await writeFile(tmpFile, validEntries.join('\n') + (validEntries.length > 0 ? '\n' : ''), 'utf-8')
+      await rename(tmpFile, REVOCATION_FILE)
+    } catch (error) {
+      logger.error('session', 'Failed to compact revocation file.', error instanceof Error ? error.message : 'unknown')
     }
-    await writeFile(REVOCATION_FILE, validEntries.join('\n') + (validEntries.length > 0 ? '\n' : ''), 'utf-8')
-  } catch (error) {
-    logger.error('session', 'Failed to compact revocation file.', error instanceof Error ? error.message : 'unknown')
-  }
+  })
 }, 60 * 60 * 1000)
 // Only call .unref() in Node.js runtime (not available in Edge Runtime)
 if (typeof (revocationCleanupInterval as ReturnType<typeof setInterval> & { unref?: () => void }).unref === 'function') {
@@ -202,32 +249,16 @@ async function hashSignature(sig: string): Promise<string> {
   return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('')
 }
 
-// ─── Crypto Helpers ─────────────────────────────────────────────────────
+// ─── Crypto Helpers (delegated to shared module) ────────────────────────
+// DRY FIX (L1): hmacSign/hmacVerify are now in hmac-secret.ts to avoid
+// duplication between session.ts and session-edge.ts.
 
 async function hmacSign(data: string): Promise<string> {
-  const encoder = new TextEncoder()
-  const key = await crypto.subtle.importKey(
-    'raw',
-    encoder.encode(HMAC_SECRET),
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign']
-  )
-  const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(data))
-  return Array.from(new Uint8Array(signature))
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('')
+  return hmacSignData(data, HMAC_SECRET)
 }
 
 async function hmacVerify(data: string, signature: string): Promise<boolean> {
-  const expected = await hmacSign(data)
-  // Timing-safe comparison
-  if (expected.length !== signature.length) return false
-  let result = 0
-  for (let i = 0; i < expected.length; i++) {
-    result |= expected.charCodeAt(i) ^ signature.charCodeAt(i)
-  }
-  return result === 0
+  return hmacVerifyData(data, signature, HMAC_SECRET)
 }
 
 function base64UrlEncode(str: string): string {
@@ -254,8 +285,14 @@ interface SessionPayload {
 /**
  * Create a new session and return the HMAC-signed token.
  * Only called from Node.js runtime (API route handlers).
+ *
+ * SECURITY FIX (M4): Changed from sync to async to use crypto.subtle (Web Crypto API),
+ * ensuring the HMAC signing implementation is identical to hmacVerify() used in
+ * both Node.js and Edge runtimes. Previously, createSession used Node.js crypto.createHmac
+ * while validation used crypto.subtle — though both produce identical HMAC-SHA-256 output,
+ * maintaining a single implementation reduces the risk of future divergence.
  */
-export function createSession(userId: string, username: string, tokenVersion: number = 0): string {
+export async function createSession(userId: string, username: string, tokenVersion: number = 0): Promise<string> {
   // Clean up old entries from recentSessions
   const now = Date.now()
   const cutoff = now - SESSION_TTL_MS
@@ -288,22 +325,11 @@ export function createSession(userId: string, username: string, tokenVersion: nu
   const payload: SessionPayload = { userId, username, createdAt: now, tokenVersion }
   recentSessions.push(payload)
 
-  // Create token synchronously using a sync-compatible approach
-  // We'll use a simpler sync HMAC for token creation since we're in Node.js
   const payloadStr = JSON.stringify(payload)
   const payloadB64 = base64UrlEncode(payloadStr)
 
-  // Sync HMAC using Node.js crypto (only in Node.js runtime)
-  let signature: string
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const nodeCrypto = require('crypto')
-    signature = nodeCrypto.createHmac('sha256', HMAC_SECRET).update(payloadB64).digest('hex')
-  } catch {
-    // Fallback — shouldn't happen in Node.js runtime, but fail loudly instead of
-    // silently producing a broken token that will never pass HMAC verification.
-    throw new Error('Failed to create session: crypto module unavailable')
-  }
+  // Use the same hmacSign function as validation for consistency
+  const signature = await hmacSign(payloadB64)
 
   return `${payloadB64}.${signature}`
 }
@@ -378,7 +404,15 @@ export async function validateSessionAsync(token: string): Promise<{ userId: str
     }
 
     return { userId: payload.userId, username: payload.username }
-  } catch {
+  } catch (e) {
+    // L11 FIXED: Distinguish between expected failures (JSON parse, invalid format)
+    // and unexpected errors (OOM, crypto failures). JSON parse errors are normal
+    // for malformed tokens; other errors indicate a system problem worth logging.
+    if (e instanceof SyntaxError) {
+      // Malformed payload — expected for invalid tokens
+    } else {
+      logger.error('session', 'Unexpected error in validateSessionAsync', e instanceof Error ? e.message : String(e))
+    }
     return null
   }
 }
@@ -445,6 +479,18 @@ export async function incrementTokenVersion(userId: string): Promise<number> {
     tokenVersionCache.delete(userId)
     throw error
   }
+}
+
+/**
+ * Check if a token signature has been revoked.
+ * Used by the internal revoke-check API endpoint for Edge Runtime.
+ * SECURITY FIX (S1): Previously, Edge Runtime had no way to check the
+ * revocation list, allowing revoked tokens to bypass middleware auth.
+ */
+export async function isTokenRevoked(signature: string): Promise<boolean> {
+  if (!revocationsLoaded) return true // fail-closed
+  const hashedSig = await hashSignature(signature)
+  return revokedTokenSignatures.has(hashedSig)
 }
 
 /**

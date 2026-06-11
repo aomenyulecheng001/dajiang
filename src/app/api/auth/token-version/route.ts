@@ -1,8 +1,25 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
+import { timingSafeCompare } from '@/lib/security-utils'
 import { logger } from '@/lib/logger'
 
 let _internalSecretChecked = false
+
+// SECURITY FIX (L-3): Shannon entropy check for INTERNAL_API_SECRET.
+// A secret with entropy < 3.0 bits/character is too predictable (e.g.,
+// "abcdefghijklmnop" has low entropy despite passing length/repeating checks).
+function shannonEntropy(str: string): number {
+  const freq = new Map<string, number>()
+  for (const ch of str) freq.set(ch, (freq.get(ch) || 0) + 1)
+  let entropy = 0
+  const len = str.length
+  for (const count of freq.values()) {
+    const p = count / len
+    entropy -= p * Math.log2(p)
+  }
+  return entropy
+}
+
 function ensureInternalApiSecret(): void {
   if (_internalSecretChecked) return
   _internalSecretChecked = true
@@ -44,18 +61,18 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
 
-  // SECURITY: Constant-time comparison that does NOT leak length information.
-  // Pad both strings to the same length before comparing, then check length
-  // match as part of the final result.
-  const maxLen = Math.max(internalSecret.length, provided.length)
-  const paddedSecret = internalSecret.padEnd(maxLen, '\0')
-  const paddedProvided = provided.padEnd(maxLen, '\0')
-
-  let secretMatch = 0
-  for (let i = 0; i < maxLen; i++) {
-    secretMatch |= paddedSecret.charCodeAt(i) ^ paddedProvided.charCodeAt(i)
+  // SECURITY FIX (L-3): Reject secrets with Shannon entropy < 3.0.
+  // Catches weak but non-repeating patterns like "abcdefghijklmnop".
+  if (shannonEntropy(internalSecret) < 3.0) {
+    logger.error('token-version', 'INTERNAL_API_SECRET has insufficient entropy. Use a cryptographically random secret.')
+    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
-  if (secretMatch !== 0 || internalSecret.length !== provided.length) {
+
+  // SECURITY FIX (M1): Use shared timingSafeCompare instead of manual
+  // constant-time comparison. The manual implementation had subtle issues
+  // (padEnd is not constant-time) and duplicated logic that must be kept
+  // in sync with security-utils.ts.
+  if (!timingSafeCompare(provided, internalSecret)) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
 

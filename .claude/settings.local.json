@@ -15,7 +15,29 @@
       "PowerShell(Get-Command *)",
       "PowerShell(npx tsc --noEmit 2>&1)",
       "Bash(ssh *)",
-      "Bash(git commit *)"
+      "Bash(git commit *)",
+      "Bash(Get-ChildItem \"mini-services/bot-runner/bots\" -Directory)",
+      "Bash(Sort-Object LastWriteTime -Descending)",
+      "Bash(Select-Object -First 5 Name, LastWriteTime)",
+      "Bash(Get-ChildItem \"mini-services/bot-runner/config\" -Filter \"*.json\")",
+      "Bash(Select-Object -First 10 Name, LastWriteTime)",
+      "PowerShell($bots = Get-ChildItem \"mini-services/bot-runner/bots\" -Directory -ErrorAction SilentlyContinue; foreach \\($bot in $bots\\) { $logDir = Join-Path $bot.FullName \"logs\"; if \\(Test-Path $logDir\\) { $logs = Get-ChildItem $logDir -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending; if \\($logs\\) { Write-Output \"=== Bot: $\\($bot.Name\\) ===\"; $logs | Select-Object -First 3 Name, Length, LastWriteTime | Format-Table -AutoSize } } })",
+      "PowerShell(Get-Process *)",
+      "PowerShell(Get-ChildItem \"mini-services/bot-runner/bots\" -Directory -ErrorAction SilentlyContinue | ForEach-Object { Write-Output \"Bot: $\\($_.Name\\) - $\\($_.LastWriteTime\\)\"; Get-ChildItem $_.FullName -Depth 0 -ErrorAction SilentlyContinue | Select-Object Name, LastWriteTime | Format-Table -AutoSize })",
+      "PowerShell(Get-ChildItem *)",
+      "PowerShell(sqlite3 *)",
+      "PowerShell(Set-Location \"C:\\\\Users\\\\ADMIN\\\\Desktop\\\\dajiang\\\\telegram-bots - 1\\\\TG_Riskbot\"; $result = npx tsc --noEmit 2>&1; $exitCode = $LASTEXITCODE; Write-Output \"Exit Code: $exitCode\"; if \\($result\\) { Write-Output $result } else { Write-Output \"No output \\(clean compilation\\)\" })",
+      "PowerShell(Get-ChildItem \"mini-services/bot-runner\" -Depth 0 | Select-Object Name, @{N='Type';E={if\\($_.PSIsContainer\\){'Dir'}else{'File'}}})",
+      "PowerShell(Set-Location \"C:\\\\Users\\\\ADMIN\\\\Desktop\\\\dajiang\\\\telegram-bots - 1\\\\TG_Riskbot\"; $env:NODE_OPTIONS = \"--dns-result-order=ipv4first\"; $proc = Start-Process -FilePath \"npx\" -ArgumentList \"tsx\", \"index.ts\" -NoNewWindow -RedirectStandardOutput \"C:\\\\Users\\\\ADMIN\\\\Desktop\\\\dajiang\\\\bot-factory\\\\temp_bot_output.txt\" -RedirectStandardError \"C:\\\\Users\\\\ADMIN\\\\Desktop\\\\dajiang\\\\bot-factory\\\\temp_bot_error.txt\" -PassThru; Start-Sleep -Seconds 8; if \\(!$proc.HasExited\\) { $proc.Kill\\(\\) }; Write-Output \"=== STDOUT ===\"; Get-Content \"C:\\\\Users\\\\ADMIN\\\\Desktop\\\\dajiang\\\\bot-factory\\\\temp_bot_output.txt\" -ErrorAction SilentlyContinue; Write-Output \"=== STDERR ===\"; Get-Content \"C:\\\\Users\\\\ADMIN\\\\Desktop\\\\dajiang\\\\bot-factory\\\\temp_bot_error.txt\" -ErrorAction SilentlyContinue)",
+      "PowerShell($content = Get-Content \"C:\\\\Users\\\\ADMIN\\\\Desktop\\\\dajiang\\\\bot-factory\\\\src\\\\lib\\\\bot-runner-context.tsx\" -Raw; $idx = $content.IndexOf\\('FIX \\(S1\\): Remove Map states'\\); if \\($idx -ge 0\\) { $sub = $content.Substring\\($idx, 1200\\); Write-Output \\($sub.Substring\\(0, [Math]::Min\\(1200, $sub.Length\\)\\).Replace\\(\"`t\", \"<TAB>\"\\)\\) } else { Write-Output \"NOT FOUND\" })",
+      "Bash(bun --version)",
+      "PowerShell(npx tsc --noEmit --project tsconfig.json 2>&1 | Select-Object -First 40)",
+      "PowerShell(npx tsc --noEmit --project mini-services/bot-runner/tsconfig.json 2>&1 | Select-Object -First 40)",
+      "Bash(npx next *)",
+      "PowerShell(node -e \"require\\('fs'\\).readdirSync\\('mini-services/bot-runner'\\).filter\\(f=>f.endsWith\\('.ts'\\)\\).forEach\\(f=>{try{require\\('fs'\\).readFileSync\\('mini-services/bot-runner/'+f,'utf8'\\)}catch\\(e\\){console.log\\('Error:',f,e.message\\)}}\\); console.log\\('All bot-runner files readable'\\)\")",
+      "Bash(Select-String '^\\\\?\\\\?')",
+      "Bash(Select-Object -First 10)",
+      "Bash(git reset *)"
     ]
   }
 }

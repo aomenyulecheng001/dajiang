@@ -27,6 +27,7 @@ export interface BotProcess {
   _stdinErrorHandler?: boolean  // P2-BR-12 FIX: Track if stdin error handler is attached
   _wasRunning?: boolean  // P1-19 FIX: Track if bot was running before shutdown for auto-restart
   _spawnError?: boolean  // FIX: Track permanent spawn errors (ENOENT, EACCES) to prevent auto-restart loop
+  _memoryRestartTimestamps?: number[]  // FIX (M1): Sliding window timestamps for memory watchdog restarts
 }
 
 export interface BotTemplate {

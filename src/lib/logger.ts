@@ -1,3 +1,5 @@
+import { redactSensitiveData } from './security-utils'
+
 type LogLevel = 'debug' | 'info' | 'warn' | 'error'
 
 const LOG_LEVELS: Record<LogLevel, number> = {
@@ -15,9 +17,11 @@ function shouldLog(level: LogLevel): boolean {
 
 function formatMessage(level: LogLevel, module: string, message: string, data?: unknown): string {
   const timestamp = new Date().toISOString()
-  const base = `${timestamp} [${level.toUpperCase()}] [${module}] ${message}`
+  const safeMessage = redactSensitiveData(message)
+  const base = `${timestamp} [${level.toUpperCase()}] [${module}] ${safeMessage}`
   if (data !== undefined) {
-    return `${base} ${typeof data === 'string' ? data : JSON.stringify(data)}`
+    const dataStr = typeof data === 'string' ? redactSensitiveData(data) : redactSensitiveData(JSON.stringify(data))
+    return `${base} ${dataStr}`
   }
   return base
 }

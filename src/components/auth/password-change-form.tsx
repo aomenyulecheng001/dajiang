@@ -78,6 +78,7 @@ export function PasswordChangeForm({ onSuccess, submitLabel }: PasswordChangeFor
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
         },
         credentials: 'include',
         body: JSON.stringify({ currentPassword, newPassword }),

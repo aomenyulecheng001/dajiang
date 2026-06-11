@@ -190,25 +190,32 @@ export function LogsTab({ isVisible = true }: LogsTabProps) {
   const isBotRunningRef = useRef(isBotRunning)
   useEffect(() => { isBotRunningRef.current = isBotRunning }, [isBotRunning])
 
+  // FIX (M3): Use ref for fetchBotLogs to avoid re-creating the interval
+  // when the function reference changes. Previously, fetchBotLogs in the
+  // dependency array caused the effect to re-run on every store update,
+  // creating/destroying intervals rapidly during bot status transitions.
+  const fetchBotLogsRef = useRef(fetchBotLogs)
+  useEffect(() => { fetchBotLogsRef.current = fetchBotLogs }, [fetchBotLogs])
+
   useEffect(() => {
     if (!bot?.id || !isVisible) return
 
     if (!isBotRunning) return
 
-    fetchBotLogs(bot.id)
+    fetchBotLogsRef.current(bot.id)
 
     const timer = setInterval(() => {
       if (!isBotRunningRef.current) {
         clearInterval(timer)
         return
       }
-      fetchBotLogs(bot.id)
+      fetchBotLogsRef.current(bot.id)
     }, LOG_POLL_INTERVAL)
 
     return () => {
       clearInterval(timer)
     }
-  }, [bot?.id, isVisible, fetchBotLogs, isBotRunning])
+  }, [bot?.id, isVisible, isBotRunning])
 
   const generateLog = useCallback(() => {
     if (!bot) return

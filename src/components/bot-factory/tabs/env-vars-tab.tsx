@@ -18,7 +18,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { useBotStore, authFetch } from '@/store/bot-store'
+import { useBotStore, useSelectedBot, authFetch } from '@/store/bot-store'
 import { useT } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
 import { SENSITIVE_KEY_PATTERNS } from '@/lib/bot-constants'
@@ -32,8 +32,9 @@ function isSensitiveKey(key: string): boolean {
 }
 
 export function EnvVarsTab() {
+  // FIX (S2): Use useSelectedBot hook instead of inline bots.find() selector
+  const bot = useSelectedBot()
   const selectedBotId = useBotStore((s) => s.selectedBotId)
-  const bot = useBotStore((s) => s.bots.find((b) => b.id === selectedBotId))
   const addEnvVar = useBotStore((s) => s.addEnvVar)
   const updateEnvVar = useBotStore((s) => s.updateEnvVar)
   const removeEnvVar = useBotStore((s) => s.removeEnvVar)

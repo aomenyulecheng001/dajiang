@@ -274,10 +274,15 @@ export async function POST(
         const signature = crypto.createHmac('sha256', storedSecret).update(body).digest('hex')
         headers['X-Webhook-Signature'] = `sha256=${signature}`
       }
+      // SECURITY FIX (S1): Forward the original raw body string instead of
+      // JSON.stringify(parsed). JSON.stringify may produce different whitespace,
+      // key order, or Unicode escaping than the original Telegram payload, which
+      // would cause: (1) signature mismatch if bot-runner verifies the body, and
+      // (2) potential data corruption (e.g., number precision, Unicode differences).
       const response = await fetch(runnerUrl, {
         method: 'POST',
         headers,
-        body: JSON.stringify(parsed),
+        body: body,
         signal: AbortSignal.timeout(10000),
       })
 
@@ -348,8 +353,10 @@ export async function GET(
     return NextResponse.json({ ok: false, description: 'Invalid request' }, { status: 400 })
   }
 
-  if (!botId || botId.length > 100 || !/^[a-zA-Z0-9._-]+$/.test(botId)) {
-    return NextResponse.json({ ok: false, description: 'Invalid bot ID' }, { status: 400 })
+  // M9 FIXED: Use validateBotId() for consistent validation with POST handler
+  const idErrors = validateBotId(botId)
+  if (idErrors.length > 0) {
+    return NextResponse.json({ ok: false, description: idErrors[0].message }, { status: 400 })
   }
 
   // SECURITY FIX: Require webhook secret for GET endpoint too.
@@ -357,6 +364,11 @@ export async function GET(
   const storedSecret = await getBotWebhookSecret(botId)
   const secretFromHeader = request.headers.get('x-telegram-bot-api-secret-token')
   if (!storedSecret) {
+    // SECURITY FIX (L-1): Perform a dummy timingSafeCompare to eliminate timing
+    // difference between "bot doesn't exist" and "bot exists but secret doesn't match".
+    if (secretFromHeader) {
+      timingSafeCompare(secretFromHeader, 'x'.repeat(32))
+    }
     return NextResponse.json({ ok: false, error: 'Authentication required' }, { status: 401 })
   }
   if (!secretFromHeader || !timingSafeCompare(secretFromHeader, storedSecret)) {

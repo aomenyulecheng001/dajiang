@@ -362,6 +362,33 @@ export function CreateBotDialog() {
   // keeps running and unexpectedly navigates the user away from the list view.
   const navPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
+  // FIX (M2): Extracted navigation polling logic to avoid duplication between
+  // handleCreate and handleImport. Both had identical 20-line polling blocks.
+  function navigateToNewBot(name: string, createdAt: string) {
+    let attempts = 0
+    const maxAttempts = 25 // 25 × 200ms = 5 seconds
+    if (navPollRef.current) clearInterval(navPollRef.current)
+    navPollRef.current = setInterval(() => {
+      attempts++
+      const store = useBotStore.getState()
+      const bot = store.bots.find(b =>
+        b.name === name && Math.abs(new Date(b.createdAt).getTime() - new Date(createdAt).getTime()) < 2000
+      )
+      if (bot && store.isBotPersisted(bot.id)) {
+        if (navPollRef.current) clearInterval(navPollRef.current)
+        navPollRef.current = null
+        store.setSelectedBotId(bot.id)
+        setTimeout(() => {
+          const runtimeEl = document.getElementById('runtime-control')
+          if (runtimeEl) runtimeEl.scrollIntoView({ behavior: 'smooth', block: 'center' })
+        }, 400)
+      } else if (attempts >= maxAttempts) {
+        if (navPollRef.current) clearInterval(navPollRef.current)
+        navPollRef.current = null
+      }
+    }, 200)
+  }
+
   // ── Git clone handlers (now safe — all referenced state is declared above) ──
   const isValidGitUrl = useCallback((url: string): boolean => {
     if (!url.trim()) return false
@@ -432,6 +459,7 @@ export function CreateBotDialog() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
         },
         credentials: 'include',
         body: JSON.stringify({
@@ -805,30 +833,7 @@ export function CreateBotDialog() {
     // BUG FIX: Also wait for the bot to be persisted to the server (dbBotIds check)
     // before navigating, to avoid 404 errors on the stats/details API calls.
     // BUG FIX: Store the interval ID in a ref so it can be cleared on dialog close.
-    let attempts = 0
-    const maxAttempts = 25 // 25 × 200ms = 5 seconds
-    // Clear any previous navigation poll
-    if (navPollRef.current) clearInterval(navPollRef.current)
-    navPollRef.current = setInterval(() => {
-      attempts++
-      const store = useBotStore.getState()
-      const bot = store.bots.find(b =>
-        b.name === botName && Math.abs(new Date(b.createdAt).getTime() - new Date(createdAt).getTime()) < 2000
-      )
-      // Only navigate once the bot exists AND its ID is known to be persisted on the server
-      if (bot && store.isBotPersisted(bot.id)) {
-        if (navPollRef.current) clearInterval(navPollRef.current)
-        navPollRef.current = null
-        useBotStore.getState().setSelectedBotId(bot.id)
-        setTimeout(() => {
-          const runtimeEl = document.getElementById('runtime-control')
-          if (runtimeEl) runtimeEl.scrollIntoView({ behavior: 'smooth', block: 'center' })
-        }, 400)
-      } else if (attempts >= maxAttempts) {
-        if (navPollRef.current) clearInterval(navPollRef.current)
-        navPollRef.current = null
-      }
-    }, 200)
+    navigateToNewBot(botName, createdAt)
   }
 
   // ── Import action ───────────────────────────────────────────────────────
@@ -923,29 +928,7 @@ export function CreateBotDialog() {
     resetAll()
 
     if (importedName) {
-      let attempts = 0
-      const maxAttempts = 25
-      // Clear any previous navigation poll
-      if (navPollRef.current) clearInterval(navPollRef.current)
-      navPollRef.current = setInterval(() => {
-        attempts++
-        const store = useBotStore.getState()
-        const bot = store.bots.find(b =>
-          b.name === importedName && Math.abs(new Date(b.createdAt).getTime() - new Date(importedAt).getTime()) < 2000
-        )
-        if (bot && store.isBotPersisted(bot.id)) {
-          if (navPollRef.current) clearInterval(navPollRef.current)
-          navPollRef.current = null
-          store.setSelectedBotId(bot.id)
-          setTimeout(() => {
-            const runtimeEl = document.getElementById('runtime-control')
-            if (runtimeEl) runtimeEl.scrollIntoView({ behavior: 'smooth', block: 'center' })
-          }, 400)
-        } else if (attempts >= maxAttempts) {
-          if (navPollRef.current) clearInterval(navPollRef.current)
-          navPollRef.current = null
-        }
-      }, 200)
+      navigateToNewBot(importedName, importedAt)
     }
   }
 

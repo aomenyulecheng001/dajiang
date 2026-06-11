@@ -20,6 +20,22 @@ export const CONFIG_DIR = resolve(__dirname, 'config')
 mkdirSync(BOTS_DIR, { recursive: true })
 mkdirSync(CONFIG_DIR, { recursive: true })
 
+// ─── Port Detection ────────────────────────────────────────────────────────
+
+/** Detect port from common environment variable keys */
+export function detectPortFromEnv(envVars: Record<string, string> | undefined): number | undefined {
+  if (!envVars) return undefined
+  const portKeys = ['PORT', 'HTTP_PORT', 'WEBHOOK_PORT', 'SERVER_PORT', 'LISTEN_PORT']
+  for (const key of portKeys) {
+    const val = envVars[key]
+    if (val) {
+      const parsed = parseInt(val, 10)
+      if (Number.isFinite(parsed) && parsed > 0 && parsed < 65536) return parsed
+    }
+  }
+  return undefined
+}
+
 // ─── Bot Helpers ──────────────────────────────────────────────────────────
 
 /** Sanitize botId to only allow safe characters (prevent shell injection)

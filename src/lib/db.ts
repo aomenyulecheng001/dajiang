@@ -3,18 +3,33 @@ import { logger } from '@/lib/logger'
 
 const globalForPrisma = globalThis as unknown as {
   prisma: PrismaClient | undefined
+  dbExtended: unknown
 }
 
-export const db =
+// P5 FIX: SQLite is a single-writer database. Multiple connections waste
+// file descriptors and increase "database is locked" contention without
+// any throughput benefit. connection_limit=1 serializes all writes through
+// one connection while WAL mode allows concurrent reads.
+const DATABASE_URL_WITH_LIMIT =
+  process.env.DATABASE_URL + (process.env.DATABASE_URL?.includes('?') ? '&' : '?') + 'connection_limit=1'
+
+// Raw PrismaClient — used ONLY for PRAGMA execution and internal cleanup.
+// Application code must use the exported `db` (the extended client below).
+const _rawDb =
   globalForPrisma.prisma ??
   new PrismaClient({
     log:
       process.env.NODE_ENV === 'development'
         ? ['query', 'error', 'warn']
         : ['error', 'warn'],
+    datasources: {
+      db: {
+        url: DATABASE_URL_WITH_LIMIT,
+      },
+    },
   })
 
-if (!globalForPrisma.prisma) globalForPrisma.prisma = db
+if (!globalForPrisma.prisma) globalForPrisma.prisma = _rawDb
 
 // SQLite performance and reliability PRAGMAs.
 // These must run AFTER the client is created but BEFORE any queries.
@@ -26,15 +41,15 @@ if (!globalForPrisma.prisma) globalForPrisma.prisma = db
 // - foreign_keys=ON: enable CASCADE deletes (SQLite defaults to OFF)
 let _pragmaPromise: Promise<void> | null = null
 
-export async function applySqlitePragmas(): Promise<void> {
+async function applySqlitePragmas(): Promise<void> {
   if (_pragmaPromise) return _pragmaPromise
   _pragmaPromise = (async () => {
     try {
-      await db.$queryRawUnsafe('PRAGMA journal_mode=WAL')
-      await db.$queryRawUnsafe('PRAGMA busy_timeout=5000')
-      await db.$queryRawUnsafe('PRAGMA journal_size_limit=67108864')
-      await db.$queryRawUnsafe('PRAGMA synchronous=NORMAL')
-      await db.$queryRawUnsafe('PRAGMA cache_size=-64000')
+      await _rawDb.$queryRawUnsafe('PRAGMA journal_mode=WAL')
+      await _rawDb.$queryRawUnsafe('PRAGMA busy_timeout=5000')
+      await _rawDb.$queryRawUnsafe('PRAGMA journal_size_limit=67108864')
+      await _rawDb.$queryRawUnsafe('PRAGMA synchronous=NORMAL')
+      await _rawDb.$queryRawUnsafe('PRAGMA cache_size=-64000')
     } catch (err) {
       logger.error('db', 'Performance PRAGMAs failed — SQLite will use defaults.', err instanceof Error ? err.message : err)
     }
@@ -43,7 +58,7 @@ export async function applySqlitePragmas(): Promise<void> {
     // foreign_keys was also skipped, silently disabling CASCADE deletes.
     // Without foreign_keys, deleting a Bot leaves orphaned BotLog/BotMessage rows.
     try {
-      await db.$queryRawUnsafe('PRAGMA foreign_keys=ON')
+      await _rawDb.$queryRawUnsafe('PRAGMA foreign_keys=ON')
     } catch (err) {
       _pragmaPromise = null
       logger.error('db', 'FATAL: Could not enable foreign_keys. CASCADE deletes will not work.', err instanceof Error ? err.message : err)
@@ -53,7 +68,29 @@ export async function applySqlitePragmas(): Promise<void> {
   return _pragmaPromise
 }
 
-// Auto-apply on first import (safe for both dev and production)
+// P1 FIX: Use Prisma $extends middleware to guarantee that every query waits
+// for PRAGMAs to complete before executing. Previously, applySqlitePragmas()
+// was called with .catch(() => {}) on module import — but nothing prevented
+// the first HTTP request from querying the DB before PRAGMAs finished.
+// Without this, foreign_keys=ON might not be active, silently disabling
+// CASCADE deletes and leaving orphaned rows.
+//
+// The extended client uses _rawDb internally (not itself), so the middleware
+// does not cause infinite recursion: middleware → applySqlitePragmas() →
+// _rawDb.$queryRawUnsafe (raw client, no middleware).
+const _extendedDb = _rawDb.$extends({
+  query: {
+    async $allOperations({ args, query }) {
+      await applySqlitePragmas()
+      return query(args)
+    },
+  },
+})
+
+// Export the extended client as `db` — all application code gets the pragma guard.
+export const db = _extendedDb as typeof _rawDb
+
+// Auto-apply PRAGMAs on first import (safe for both dev and production)
 applySqlitePragmas().catch(() => {})
 
 // Periodic cleanup of old BotLog and BotMessage records.
@@ -62,7 +99,15 @@ applySqlitePragmas().catch(() => {})
 const LOG_RETENTION_DAYS = 30
 const CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000
 
+// P2 FIX: Mutex flag to prevent concurrent cleanup executions.
+// Without this, if a cleanup takes longer than CLEANUP_INTERVAL_MS (e.g.,
+// very large tables), the next interval tick would start a second concurrent
+// cleanup, causing SQLite write-lock contention.
+let _cleanupRunning = false
+
 async function cleanupOldRecords(): Promise<void> {
+  if (_cleanupRunning) return
+  _cleanupRunning = true
   try {
     const cutoff = new Date(Date.now() - LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000)
     const BATCH_SIZE = 1000
@@ -72,7 +117,7 @@ async function cleanupOldRecords(): Promise<void> {
     // Batch delete BotLog records to avoid long write locks on large tables
     let deleted: number
     do {
-      const result = await db.$executeRaw`DELETE FROM BotLog WHERE rowid IN (SELECT rowid FROM BotLog WHERE timestamp < ${cutoff} LIMIT ${BATCH_SIZE})`
+      const result = await _rawDb.$executeRaw`DELETE FROM BotLog WHERE rowid IN (SELECT rowid FROM BotLog WHERE timestamp < ${cutoff} LIMIT ${BATCH_SIZE})`
       deleted = result
       totalLogs += deleted
       if (deleted > 0) await new Promise(r => setTimeout(r, 10))
@@ -80,7 +125,7 @@ async function cleanupOldRecords(): Promise<void> {
 
     // Batch delete BotMessage records
     do {
-      const result = await db.$executeRaw`DELETE FROM BotMessage WHERE rowid IN (SELECT rowid FROM BotMessage WHERE timestamp < ${cutoff} LIMIT ${BATCH_SIZE})`
+      const result = await _rawDb.$executeRaw`DELETE FROM BotMessage WHERE rowid IN (SELECT rowid FROM BotMessage WHERE timestamp < ${cutoff} LIMIT ${BATCH_SIZE})`
       deleted = result
       totalMsgs += deleted
       if (deleted > 0) await new Promise(r => setTimeout(r, 10))
@@ -89,12 +134,14 @@ async function cleanupOldRecords(): Promise<void> {
     if (totalLogs > 0 || totalMsgs > 0) {
       logger.info('db', `Deleted ${totalLogs} logs, ${totalMsgs} messages older than ${LOG_RETENTION_DAYS} days`)
       try {
-        await db.$queryRawUnsafe('PRAGMA wal_checkpoint(PASSIVE)')
+        await _rawDb.$queryRawUnsafe('PRAGMA wal_checkpoint(PASSIVE)')
       } catch { /* Non-fatal: checkpoint may fail with active readers */ }
     }
   } catch (err) {
     logger.warn('db', 'Log cleanup failed — will retry on next interval.',
       err instanceof Error ? err.message : String(err))
+  } finally {
+    _cleanupRunning = false
   }
 }
 
@@ -103,3 +150,22 @@ if (_cleanupTimer.unref) _cleanupTimer.unref()
 // Run first cleanup after 5 minutes (give server time to start)
 const _initialCleanupTimer = setTimeout(cleanupOldRecords, 5 * 60 * 1000)
 if (_initialCleanupTimer.unref) _initialCleanupTimer.unref()
+
+// P7 FIX: Graceful shutdown — call _rawDb.$disconnect() on SIGTERM/SIGINT.
+// Without this, killing the process during a write can leave the WAL file
+// in an inconsistent state. $disconnect() flushes pending writes and
+// releases the database connection cleanly.
+function gracefulShutdown(signal: string) {
+  _rawDb.$disconnect()
+    .then(() => {
+      logger.info('db', `Graceful shutdown on ${signal}`)
+      process.exit(0)
+    })
+    .catch((err) => {
+      logger.error('db', 'Error during graceful shutdown', err instanceof Error ? err.message : err)
+      process.exit(1)
+    })
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
+process.on('SIGINT', () => gracefulShutdown('SIGINT'))

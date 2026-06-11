@@ -4,7 +4,7 @@ import React, { useEffect } from 'react'
 import { BarChart3 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { formatNumber } from '@/lib/utils'
-import { useBotStore } from '@/store/bot-store'
+import { useBotStore, useSelectedBot } from '@/store/bot-store'
 import { useT, useLocale, type TranslationKey } from '@/lib/i18n'
 import { ResourceMonitor } from '@/components/bot-factory/resource-monitor'
 import { ProcessManager } from '@/components/bot-factory/process-manager'
@@ -76,7 +76,9 @@ const DailyTrend = React.memo(function DailyTrend({
   // BUG FIX: Always show 7 consecutive days, filling missing dates with 0
   const last7 = fillMissingDays(data)
   const hasData = last7.some(d => d.count > 0)
-  const maxVal = Math.max(...last7.map((d) => d.count), 1)
+  // FIX (M5): Use reduce instead of Math.max(...spread) to avoid potential
+  // RangeError if the array grows large (JS engines limit spread args to ~65536).
+  const maxVal = last7.reduce((max, d) => Math.max(max, d.count), 1)
 
   return (
     <Card className="shadow-none border-border/20 overflow-hidden">
@@ -138,7 +140,8 @@ const TopCommands = React.memo(function TopCommands({
   t: (_key: TranslationKey, _params?: Record<string, string | number>) => string
 }) {
   if (commands.length === 0) return null
-  const maxPct = Math.max(...commands.map((c) => c.percentage), 1)
+  // FIX (M5): Use reduce instead of Math.max(...spread)
+  const maxPct = commands.reduce((max, c) => Math.max(max, c.percentage), 1)
 
   return (
     <Card className="shadow-none border-border/20 overflow-hidden">
@@ -175,7 +178,8 @@ const TopCommands = React.memo(function TopCommands({
 
 export function MonitoringTab({ isVisible = true }: { isVisible?: boolean }) {
   const selectedBotId = useBotStore((s) => s.selectedBotId)
-  const bot = useBotStore((s) => s.bots.find((b) => b.id === selectedBotId))
+  // FIX (S2): Use useSelectedBot hook instead of inline bots.find() selector
+  const bot = useSelectedBot()
   const fetchBotStats = useBotStore((s) => s.fetchBotStats)
   const t = useT()
   const locale = useLocale()

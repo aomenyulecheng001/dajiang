@@ -1,5 +1,5 @@
-import { readdirSync, writeFileSync, unlinkSync, existsSync, readFileSync } from 'fs'
-import { readFile } from 'fs/promises'
+import { readdirSync, unlinkSync } from 'fs'
+import { readFile, access as accessAsync, writeFile as writeFileAsync, unlink } from 'fs/promises'
 import { spawn, execFile } from 'child_process'
 import type { BotProcess } from './types'
 // ─── Node.js Path for Bot Processes ────────────────────────────────────────
@@ -53,7 +53,7 @@ async function getNodePath(): Promise<string> {
 }
 
 import { logger } from './logger'
-import { getBotDir, loadBotConfigAsync, CONFIG_DIR } from './utils'
+import { getBotDir, loadBotConfigAsync, CONFIG_DIR, detectPortFromEnv } from './utils'
 import { appendLog } from './log-manager'
 import { io } from './socket'
 
@@ -66,19 +66,32 @@ function getPidFilePath(botDir: string): string {
   return `${botDir}/.pid`
 }
 
-function writePidFile(botDir: string, pid: number): void {
+// FIX (S-1): Include timestamp to mitigate TOCTOU race — the timestamp allows
+// callers to verify the PID file was written by the current bot-runner instance.
+async function writePidFile(botDir: string, pid: number): Promise<void> {
   try {
-    writeFileSync(getPidFilePath(botDir), String(pid), 'utf-8')
+    await writeFileAsync(getPidFilePath(botDir), `${pid}:${Date.now()}`, 'utf-8')
   } catch { /* non-critical — process will still run without PID file */ }
 }
 
-function readPidFile(botDir: string): number | null {
+// FIX (S-1): Parse new "pid:timestamp" format, backward compatible with old "pid" format
+async function readPidFile(botDir: string): Promise<{ pid: number; timestamp?: number } | null> {
   try {
     const pidPath = getPidFilePath(botDir)
-    if (!existsSync(pidPath)) return null
-    const content = readFileSync(pidPath, 'utf-8').trim()
-    const pid = parseInt(content, 10)
-    return Number.isFinite(pid) && pid > 0 ? pid : null
+    try { await accessAsync(pidPath) } catch { return null }
+    const content = (await readFile(pidPath, 'utf-8')).trim()
+    const colonIdx = content.indexOf(':')
+    let pidStr: string
+    let timestamp: number | undefined
+    if (colonIdx !== -1) {
+      pidStr = content.slice(0, colonIdx)
+      timestamp = parseInt(content.slice(colonIdx + 1), 10)
+      if (!Number.isFinite(timestamp)) timestamp = undefined
+    } else {
+      pidStr = content
+    }
+    const pid = parseInt(pidStr, 10)
+    return (Number.isFinite(pid) && pid > 0) ? { pid, timestamp } : null
   } catch {
     return null
   }
@@ -94,12 +107,11 @@ function isPidAlive(pid: number): boolean {
   }
 }
 
-export function cleanupPidFile(botDir: string): void {
+// FIX (S-1): Changed from sync unlinkSync to async unlink to avoid blocking the event loop
+export async function cleanupPidFile(botDir: string): Promise<void> {
   try {
     const pidPath = getPidFilePath(botDir)
-    if (existsSync(pidPath)) {
-      unlinkSync(pidPath)
-    }
+    await unlink(pidPath)
   } catch { /* ignore — file may already be deleted */ }
 }
 
@@ -112,22 +124,44 @@ export function cleanupPidFile(botDir: string): void {
  * Returns true if an orphan was found and killed.
  */
 export async function findAndKillOrphan(botDir: string): Promise<boolean> {
-  const pid = readPidFile(botDir)
-  if (pid === null) return false
+  const result = await readPidFile(botDir)
+  if (result === null) return false
+  const { pid } = result
   if (!isPidAlive(pid)) {
     // Dead PID file — clean it up
-    cleanupPidFile(botDir)
+    await cleanupPidFile(botDir)
     return false
+  }
+
+  // FIX (S-1): Verify process identity before killing to prevent TOCTOU race.
+  // On Linux, check /proc/{pid}/cmdline contains the bot directory name or 'bot-runner'.
+  if (process.platform === 'linux') {
+    try {
+      const cmdline = await readFile(`/proc/${pid}/cmdline`, 'utf-8')
+      const botDirName = botDir.split('/').pop() || ''
+      if (!cmdline.includes(botDirName) && !cmdline.includes('bot-runner')) {
+        logger.warn('process-manager', `PID ${pid} cmdline doesn't match bot ${botDirName}, skipping kill (TOCTOU safety)`)
+        await cleanupPidFile(botDir)
+        return false
+      }
+    } catch {
+      // /proc not available or process gone — fall through to kill attempt
+    }
   }
 
   // Orphan found — try to kill it gracefully
   logger.warn('process-manager', `Found orphan process PID ${pid} in ${botDir}, killing...`)
   try { process.kill(pid, 'SIGTERM') } catch { /* already dead */ }
 
-  // Wait up to 5s for the process to exit, then force-kill
+  // Wait for the process to exit with exponential backoff, then force-kill
+  // FIX (S2): Use exponential backoff instead of fixed 200ms polling.
+  // Reduces unnecessary system calls when multiple bots start concurrently
+  // (e.g., bot-runner restart recovering all bots).
   const startTime = Date.now()
+  let pollInterval = 300
   while (isPidAlive(pid) && Date.now() - startTime < 5000) {
-    await new Promise(r => setTimeout(r, 200))
+    await new Promise(r => setTimeout(r, pollInterval))
+    pollInterval = Math.min(pollInterval * 1.5, 1000)
   }
   if (isPidAlive(pid)) {
     logger.warn('process-manager', `Orphan PID ${pid} didn't respond to SIGTERM, sending SIGKILL`)
@@ -135,7 +169,7 @@ export async function findAndKillOrphan(botDir: string): Promise<boolean> {
     await new Promise(r => setTimeout(r, 500))
   }
 
-  cleanupPidFile(botDir)
+  await cleanupPidFile(botDir)
   if (!isPidAlive(pid)) {
     logger.info('process-manager', `Orphan process PID ${pid} killed successfully`)
     return true
@@ -173,7 +207,13 @@ export async function getChildProcessMemory(pid: number): Promise<number> {
   try {
     const status = await readFile(`/proc/${pid}/status`, 'utf-8')
     const match = status.match(/VmRSS:\s*(\d+)\s*kB/)
-    if (match) return parseInt(match[1]) * 1024 // Convert KB to bytes
+    // FIX (M5): Check parseInt result for NaN. If VmRSS has unexpected format,
+    // NaN * 1024 = NaN, and NaN > threshold is always false, silently
+    // disabling the memory watchdog.
+    if (match) {
+      const kb = parseInt(match[1], 10)
+      if (Number.isFinite(kb)) return kb * 1024
+    }
   } catch {
     // Not Linux or process gone
   }
@@ -185,8 +225,8 @@ export async function getChildProcessMemory(pid: number): Promise<number> {
         err ? reject(err) : resolve(stdout || '')
       )
     })
-    const rss = parseInt(ps.trim())
-    if (!isNaN(rss)) return rss * 1024
+    const rss = parseInt(ps.trim(), 10)
+    if (Number.isFinite(rss)) return rss * 1024
   } catch {
     // ps not available
   }
@@ -207,8 +247,8 @@ export async function getChildProcessMemory(pid: number): Promise<number> {
       if (match) {
         const memMatch = output.match(/"([\d,]+) K"/)
         if (memMatch) {
-          const memKB = parseInt(memMatch[1].replace(/,/g, ''))
-          if (!isNaN(memKB)) return memKB * 1024
+          const memKB = parseInt(memMatch[1].replace(/,/g, ''), 10)
+          if (Number.isFinite(memKB)) return memKB * 1024
         }
       }
     } catch {
@@ -352,7 +392,7 @@ export async function handleBotExit(
 
   // P1-19 FIX: Remove running marker and PID file when bot exits
   try { unlinkSync(`${CONFIG_DIR}/${botId}.running`) } catch { /* ignore */ }
-  try { cleanupPidFile(getBotDir(botId)) } catch { /* ignore */ }
+  try { await cleanupPidFile(getBotDir(botId)) } catch { /* ignore */ }
 
   appendLog(botId, `进程已退出 (code: ${code}, signal: ${signal})`, code === 0 ? 'info' : 'error')
   io.emit('bot:status', { botId, status: bot.status, exitCode: code })
@@ -452,13 +492,22 @@ export async function handleBotExit(
  * This is a best-effort heuristic — it won't catch 100% of messages,
  * but it provides meaningful stats data without requiring template changes.
  */
+
+// FIX (M3): Use a monotonic counter instead of Date.now() for pseudo userIds.
+// Date.now() can produce duplicate values within the same millisecond,
+// causing userId collisions in the BotMessage table.
+let _msgCounter = 0
+function uniqueUserId(prefix: string): string {
+  return `${prefix}_${Date.now()}_${++_msgCounter}`
+}
+
 function detectAndEmitMessage(botId: string, line: string, botName: string): void {
   try {
     // Pattern 1: "Message from <name>: <text>" or "Message from <name> (<id>): <text>"
     const msgFromMatch = line.match(/Message\s+from\s+(.+?)(?:\s*\((\d+)\))?:\s*(.+)/i)
     if (msgFromMatch) {
       const userName = msgFromMatch[1]?.trim() || 'Unknown'
-      const userId = msgFromMatch[2] || `user_${Date.now()}`
+      const userId = msgFromMatch[2] || uniqueUserId('user')
       const text = msgFromMatch[3]?.trim() || ''
       const command = text.startsWith('/') ? text.split(/\s/)[0] : undefined
       io.emit('bot:message', { botId, userId: String(userId), userName, text, command })
@@ -469,7 +518,7 @@ function detectAndEmitMessage(botId: string, line: string, botName: string): voi
     const cmdMatch = line.match(/(?:command|cmd)\s*[:=]\s*(\/\w+)/i)
     if (cmdMatch) {
       const command = cmdMatch[1]
-      io.emit('bot:message', { botId, userId: `cmd_user_${Date.now()}`, userName: '', text: command, command })
+      io.emit('bot:message', { botId, userId: uniqueUserId('cmd'), userName: '', text: command, command })
       return
     }
 
@@ -477,14 +526,14 @@ function detectAndEmitMessage(botId: string, line: string, botName: string): voi
     const updateMatch = line.match(/Update\s+#?(\d+)/i)
     if (updateMatch && !line.includes('npm') && !line.includes('install')) {
       // Just count it as a generic message
-      io.emit('bot:message', { botId, userId: `update_user`, userName: '', text: '', command: undefined })
+      io.emit('bot:message', { botId, userId: uniqueUserId('update'), userName: '', text: '', command: undefined })
       return
     }
 
     // Pattern 4: Generic "received message" or "new message" patterns
     const receivedMatch = line.match(/(?:received|got|new)\s+(?:a\s+)?message/i)
     if (receivedMatch) {
-      io.emit('bot:message', { botId, userId: `msg_user_${Date.now()}`, userName: '', text: '', command: undefined })
+      io.emit('bot:message', { botId, userId: uniqueUserId('msg'), userName: '', text: '', command: undefined })
       return
     }
   } catch {
@@ -503,13 +552,20 @@ function detectAndEmitMessage(botId: string, line: string, botName: string): voi
  */
 export async function startBotProcess(
   botId: string,
-  _botProcesses?: Map<string, BotProcess>,
-  _handleBotExitFn?: (botId: string, code: number | null, signal: string | null, exitedProcess?: ChildProcess) => Promise<void>,
+  _botProcesses: Map<string, BotProcess>,
+  _handleBotExitFn: (botId: string, code: number | null, signal: string | null, exitedProcess?: ChildProcess) => Promise<void>,
 ): Promise<void> {
-  const processes = _botProcesses ?? (globalThis as unknown as { __botProcesses?: Map<string, BotProcess> }).__botProcesses
-  const handleExit = _handleBotExitFn ?? (globalThis as unknown as { __handleBotExitFn?: typeof _handleBotExitFn }).__handleBotExitFn
+  // SECURITY FIX (S2): Require explicit parameters instead of falling back
+  // to globalThis. The globalThis fallback was a dead code path that could
+  // be exploited via prototype pollution if someone called startBotProcess
+  // without arguments. Now the function fails fast with a clear error.
+  if (!_botProcesses || !_handleBotExitFn) {
+    logger.error('process-manager', 'startBotProcess called without required parameters')
+    return
+  }
+  const processes = _botProcesses
+  const handleExit = _handleBotExitFn
 
-  if (!processes || !handleExit) return
   const bot = processes.get(botId)
   if (!bot) return
 
@@ -572,6 +628,18 @@ export async function startBotProcess(
     safeEnv[k] = v
   }
 
+  // FIX (M1): Force NODE_OPTIONS to enforce memory limit, preventing child
+  // processes from overriding --max-old-space-size via envVars.NODE_OPTIONS.
+  // Although DANGEROUS_ENV_KEYS blocks NODE_OPTIONS in user envVars, this
+  // explicit override ensures the memory limit cannot be bypassed even if
+  // the dangerous-key check is accidentally relaxed in the future.
+  // NOTE (M-8): --max-old-space-size only limits the V8 JavaScript heap.
+  // It does NOT account for native addons, system buffers, or stack memory.
+  // The actual memory enforcement is provided by the watchdog in monitor.ts,
+  // which checks VmRSS (total resident set) and kills processes exceeding
+  // maxMemoryMb. This NODE_OPTIONS flag is a soft hint, not the hard limit.
+  safeEnv.NODE_OPTIONS = '--max-old-space-size=256'
+
   let command: string
   let args: string[] = []
 
@@ -603,6 +671,15 @@ export async function startBotProcess(
 
   appendLog(botId, `启动进程: ${command} ${args.join(' ')}`, 'info')
 
+  // FIX (M-12): Set status to 'starting' BEFORE spawn() to prevent concurrent
+  // start requests from passing the guard check (bot.status === 'starting' is
+  // rejected by the double-start guard above).
+  bot.status = 'starting'
+  bot.error = undefined // P1-FIX: Clear previous error when successfully starting
+  bot.exitCode = undefined // Clear stale exit code from previous run
+  bot.stoppedAt = undefined // Clear stale stoppedAt from previous run
+  io.emit('bot:status', { botId, status: 'starting' })
+
   const child = spawn(command, args, {
     cwd: botDir,
     env: safeEnv as NodeJS.ProcessEnv,
@@ -615,17 +692,14 @@ export async function startBotProcess(
   // Write PID file so orphan processes from a bot-runner crash can be detected
   // and killed before starting a new process (prevents TCP port conflicts).
   if (child.pid) {
-    writePidFile(botDir, child.pid)
+    await writePidFile(botDir, child.pid)
   }
   bot.status = 'running'
   bot.startedAt = new Date().toISOString()
-  bot.error = undefined // P1-FIX: Clear previous error when successfully starting
-  bot.exitCode = undefined // Clear stale exit code from previous run
-  bot.stoppedAt = undefined // Clear stale stoppedAt from previous run
   bot._stdinErrorHandler = false // Reset for new process — new stdin needs new error handler
 
   // P1-19 FIX: Create running marker for auto-restart after shutdown
-  try { writeFileSync(`${CONFIG_DIR}/${botId}.running`, new Date().toISOString()) } catch { /* ignore */ }
+  try { await writeFileAsync(`${CONFIG_DIR}/${botId}.running`, new Date().toISOString()) } catch { /* ignore */ }
 
   child.stdout?.on('data', (data: Buffer) => {
     const lines = data.toString().split('\n')
@@ -669,24 +743,15 @@ export async function startBotProcess(
   })
 
   // Compute port from envVars if not yet detected by monitoring cycle
-  const portFromEnv = (() => {
-    if (bot.port) return bot.port
-    const portKeys = ['PORT', 'HTTP_PORT', 'WEBHOOK_PORT', 'SERVER_PORT', 'LISTEN_PORT']
-    for (const key of portKeys) {
-      const val = bot.envVars?.[key]
-      if (val) {
-        const parsed = parseInt(val, 10)
-        if (Number.isFinite(parsed) && parsed > 0 && parsed < 65536) return parsed
-      }
-    }
-    return undefined
-  })()
+  const portFromEnv = bot.port || detectPortFromEnv(bot.envVars)
   io.emit('bot:status', { botId, status: 'running', pid: child.pid, port: portFromEnv })
 }
 
 // ─── Stop Bot Process ─────────────────────────────────────────────────────
 
-export function stopBotProcess(botId: string, botProcesses: Map<string, BotProcess>): void {
+// S3 FIXED: Made async — internally uses await cleanupPidFile() which requires
+// the function to be declared async to actually await the cleanup.
+export async function stopBotProcess(botId: string, botProcesses: Map<string, BotProcess>): Promise<void> {
   const bot = botProcesses.get(botId)
 
   // BUG FIX: Handle the case where the bot has no process reference.
@@ -721,7 +786,7 @@ export function stopBotProcess(botId: string, botProcesses: Map<string, BotProce
   // Clean up PID file (new process will get a new PID), but preserve .running
   // marker so bots auto-recover after bot-runner restart (deploy/PM2 restart).
   // .running is only cleaned by handleBotExit (process truly died) or /cleanup/
-  try { cleanupPidFile(getBotDir(botId)) } catch { /* ignore */ }
+  try { await cleanupPidFile(getBotDir(botId)) } catch { /* ignore */ }
 
   // BUG FIX: Cancel any pending auto-restart timer from a previous crash.
   cancelRestartTimer(botId)

@@ -52,8 +52,14 @@ export function isValidFilename(filename: string): boolean {
  * Env var key name patterns that should never be exposed to clients.
  * Used when filtering bot env var keys in API responses and Socket.IO events.
  *
- * CANONICAL SOURCE: Keep in sync with mini-services/bot-runner/handlers.ts
- * SENSITIVE_ENV_PATTERNS. Any changes here should be mirrored there.
+ * ⚠️ CANONICAL SOURCE: src/lib/security-utils.ts
+ * ⚠️ SYNC REQUIRED: When updating patterns, also update:
+ *   - mini-services/bot-runner/handlers.ts (SENSITIVE_ENV_PATTERNS)
+ *   - mini-services/bot-runner/log-manager.ts (SENSITIVE_PATTERNS)
+ *
+ * SECURITY FIX (M3): Added explicit documentation about the relationship
+ * between this list and the bot-runner's copy, and added 'DATABASE_URL'
+ * which was previously only in the bot-runner copy.
  */
 export const SENSITIVE_ENV_KEY_PATTERNS = [
   'BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIKEY', 'API_KEY',
@@ -65,16 +71,28 @@ export const SENSITIVE_ENV_KEY_PATTERNS = [
 /**
  * Patterns for detecting sensitive data in strings.
  * Used for log sanitization and error message redaction.
+ *
+ * ⚠️ CANONICAL SOURCE: src/lib/security-utils.ts
+ * ⚠️ SYNC REQUIRED: When updating patterns, also update:
+ *   - mini-services/bot-runner/handlers.ts (SENSITIVE_ENV_PATTERNS)
+ *   - mini-services/bot-runner/log-manager.ts (SENSITIVE_PATTERNS)
  */
 export const SENSITIVE_DATA_PATTERNS = {
   BOT_TOKEN: /\d{9,}:[a-zA-Z0-9_-]{30,}/,
   API_KEY: /(?:api[_-]?key|apikey)["\s:=]+[a-zA-Z0-9_-]{20,}/i,
   PASSWORD: /(?:password|passwd|pwd)["\s:=]+[^\s]+/i,
-  SECRET: /(?:secret|token)["\s:=]+[a-zA-Z0-9_-]{10,}/i,
+  // SECURITY FIX (M7): Narrowed SECRET pattern to avoid false positives on
+  // generic "token" references (e.g., "tokenVersion", "token-based").
+  // Now requires "secret" or "token" followed by a separator and a value
+  // that looks like a real credential (20+ chars of hex/base64, or a
+  // Bearer/JWT prefix). Generic short token references are excluded.
+  SECRET: /(?:secret|signing[_-]?key|access[_-]?token|refresh[_-]?token)["\s:=]+[a-zA-Z0-9_-]{20,}/i,
   AUTH_HEADER: /authorization["\s:=]+bearer\s+[a-zA-Z0-9._-]+/i,
   JWT: /eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*/,
   CONNECTION_STRING: /:\/\/[^:]+:[^@]+@/,
-  PRIVATE_KEY: /-----BEGIN\s+(?:RSA\s+)?PRIVATE\s+KEY-----[\s\S]*?-----END\s+(?:RSA\s+)?PRIVATE\s+KEY-----/,
+  // L2 FIXED: Avoid [\s\S]*? which causes catastrophic backtracking on long input.
+  // Match content character by character, rejecting the end-marker sequence.
+  PRIVATE_KEY: /-----BEGIN\s+(?:RSA\s+)?PRIVATE\s+KEY-----(?:[^-]|-(?!-{4}))*-----END\s+(?:RSA\s+)?PRIVATE\s+KEY-----/,
 }
 
 /**
@@ -126,15 +144,19 @@ export function redactSensitiveData(text: string): string {
  * @returns true if strings are equal
  */
 export function timingSafeCompare(a: string, b: string): boolean {
-  // P1-13 FIX: Always hash before comparing to eliminate length-based timing leak.
-  // Previously, different-length strings took a different code path than same-length,
+  // SECURITY FIX (S3): Pad both inputs to a fixed length before hashing to
+  // eliminate timing variance from different-length inputs. Previously, different-
+  // length strings caused different amounts of data to be hashed, potentially
   // leaking length information through timing analysis.
   try {
-    const hashA = createHash('sha256').update(a).digest()
-    const hashB = createHash('sha256').update(b).digest()
-    // Only return true if BOTH the hash matches AND the lengths match
+    const FIXED_LEN = 256
+    const padStr = (s: string) => s.padEnd(FIXED_LEN, '\0').slice(0, FIXED_LEN)
+    const hashA = createHash('sha256').update(padStr(a)).digest()
+    const hashB = createHash('sha256').update(padStr(b)).digest()
+    // Only return true if BOTH the hash matches AND the lengths match.
     // The hash comparison is timing-safe; the length check is not, but it
-    // happens after the timing-safe comparison so it doesn't leak timing info.
+    // happens after the timing-safe comparison so it doesn't leak timing info
+    // about the content — only whether the lengths happen to match.
     return timingSafeEqual(hashA, hashB) && a.length === b.length
   } catch {
     return false
@@ -233,6 +255,9 @@ export function isValidBotIdFormat(botId: string): boolean {
   if (!/^[a-zA-Z0-9._-]+$/.test(botId)) return false
   // Block path traversal
   if (botId.includes('..')) return false
+  // SECURITY FIX (M3): Block IDs starting with '.' to prevent hidden file
+  // interactions (e.g., '.env', '.git'). Consistent with validateBotId() in validation.ts.
+  if (botId.startsWith('.')) return false
   return true
 }
 

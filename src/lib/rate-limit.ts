@@ -79,6 +79,12 @@ export const RATE_LIMIT_GIT_IMPORT: RateLimitConfig = { max: 3, window: 60 }
 /** Webhook incoming updates: 200 per minute (Telegram can send rapidly) */
 export const RATE_LIMIT_WEBHOOK: RateLimitConfig = { max: 200, window: 60 }
 
+/** SECURITY FIX (S3): Internal API endpoints (revoke-check, token-version) —
+ *  strict limit to prevent brute-force attacks on INTERNAL_API_SECRET.
+ *  These endpoints are on PUBLIC_ROUTES (no session auth) and only protected
+ *  by INTERNAL_API_SECRET, so a strict rate limit is critical. */
+export const RATE_LIMIT_INTERNAL_API: RateLimitConfig = { max: 10, window: 60 }
+
 // ─── Rate Limiter Class ──────────────────────────────────────────────────
 
 /**
@@ -152,8 +158,13 @@ class RateLimiter {
     }
 
     // Calculate sliding window count: weighted previous + current
+    // SECURITY FIX (M5): Use Math.round instead of Math.ceil to avoid
+    // over-counting. Math.ceil could cause users to be rate-limited slightly
+    // earlier than expected (e.g., prevCount=60, weight=0.01 → ceil(0.6)=1
+    // instead of the more accurate round(0.6)=1, but for larger weights the
+    // difference matters: ceil(0.3)=1 vs round(0.3)=0).
     const weight = 1 - (elapsed / config.window)
-    const effectiveCount = Math.ceil(record.prevCount * weight) + record.count
+    const effectiveCount = Math.round(record.prevCount * weight) + record.count
 
     // BUG FIX (BUG-4): Check if request would exceed limit BEFORE incrementing.
     // Previously, record.count++ was called before the limit check, meaning
@@ -210,7 +221,7 @@ class RateLimiter {
 
     // BUG FIX: Use sliding window calculation consistent with check()
     const weight = 1 - (elapsed / config.window)
-    const effectiveCount = Math.ceil(record.prevCount * weight) + record.count
+    const effectiveCount = Math.round(record.prevCount * weight) + record.count
     const remaining = Math.max(0, config.max - effectiveCount)
     return {
       success: remaining > 0,
@@ -232,9 +243,12 @@ class RateLimiter {
    */
   private cleanup(): void {
     const now = Math.floor(Date.now() / 1000)
+    // SECURITY FIX (L5): Use dynamic threshold based on max window size (60s * 2 = 120s)
+    // instead of hardcoded 600s. The maximum configured window is 60 seconds,
+    // so entries older than 120 seconds are guaranteed to be expired.
+    const maxAge = 120
     for (const [key, record] of this.store.entries()) {
-      // Remove entries older than 10 minutes
-      if (now - record.windowStart > 600) {
+      if (now - record.windowStart > maxAge) {
         this.store.delete(key)
       }
     }
@@ -288,6 +302,13 @@ export function getRateLimitConfig(method: string, pathname: string): RateLimitC
   // Auth login attempts — strict rate limit (brute-force protection)
   if (pathname.match(/\/api\/auth\/login$/)) {
     return RATE_LIMIT_AUTH
+  }
+
+  // SECURITY FIX (S3): Internal API endpoints — strict limit to prevent
+  // brute-force attacks on INTERNAL_API_SECRET. These are public routes
+  // protected only by the internal secret header.
+  if (pathname === '/api/auth/token-version' || pathname === '/api/auth/revoke-check') {
+    return RATE_LIMIT_INTERNAL_API
   }
 
   // Auth mutation endpoints (password reset, account update) — stricter than general POST

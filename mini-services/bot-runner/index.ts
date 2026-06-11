@@ -16,7 +16,7 @@ import { readdir, access, rm } from 'fs/promises'
 import { randomBytes, timingSafeEqual, createHash, createHmac } from 'crypto'
 import type { IncomingMessage, ServerResponse } from 'http'
 import type { BotProcess, DeployStage } from './types'
-import { PORT, CONFIG_DIR, loadBotConfigAsync, BOTS_DIR, sanitizeBotId, getBotDir } from './utils'
+import { PORT, CONFIG_DIR, loadBotConfigAsync, BOTS_DIR, sanitizeBotId, getBotDir, detectPortFromEnv } from './utils'
 import { MAX_LOG_LINES, setLogState, cleanupOldLogs, startLogCleanup, stopLogCleanup, LOGS_DIR } from './log-manager'
 
 import { httpServer, io } from './socket'
@@ -69,14 +69,41 @@ async function boundHandleBotExit(botId: string, code: number | null, signal: st
   await handleBotExit(botId, code, signal, botProcesses, boundStartBotProcess, exitedProcess)
 }
 
-function boundStopBotProcess(botId: string): void {
-  stopBotProcess(botId, botProcesses)
+// S3 FIXED: Made async — stopBotProcess is now async due to await cleanupPidFile()
+async function boundStopBotProcess(botId: string): Promise<void> {
+  await stopBotProcess(botId, botProcesses)
 }
 
 // ─── Cleanup Old Logs ────────────────────────────────────────────────────
 
 cleanupOldLogs().catch(() => {})
 startLogCleanup()
+
+// ─── Webhook Rate Limiting ────────────────────────────────────────────────
+// SECURITY FIX (S1): Prevent DDoS amplification via webhook endpoint.
+// Without rate limiting, attackers can flood /webhook/{botId} to trigger
+// HMAC computation + file reads + stdin writes for each request.
+const webhookRateMap = new Map<string, { count: number; resetAt: number }>()
+const WEBHOOK_RATE_LIMIT = { max: 30, windowMs: 1000 } // 30 req/s per botId
+const WEBHOOK_RATE_MAX_ENTRIES = 10000
+
+function checkWebhookRate(botId: string): boolean {
+  const now = Date.now()
+  const entry = webhookRateMap.get(botId)
+  if (!entry || now > entry.resetAt) {
+    if (webhookRateMap.size >= WEBHOOK_RATE_MAX_ENTRIES) {
+      // Prune expired entries
+      for (const [k, v] of webhookRateMap) {
+        if (now > v.resetAt) webhookRateMap.delete(k)
+      }
+    }
+    webhookRateMap.set(botId, { count: 1, resetAt: now + WEBHOOK_RATE_LIMIT.windowMs })
+    return true
+  }
+  if (entry.count >= WEBHOOK_RATE_LIMIT.max) return false
+  entry.count++
+  return true
+}
 
 // ─── Webhook HTTP Endpoint ───────────────────────────────────────────────
 
@@ -129,6 +156,23 @@ httpServer.on('request', async (req: IncomingMessage, res: ServerResponse) => {
     return
   }
 
+  // SECURITY FIX (M8): Global request body size limit for all non-webhook
+  // endpoints. Webhook endpoints have their own 1MB limit. Other endpoints
+  // (cleanup, health) don't need request bodies, but an attacker could
+  // still send large bodies to consume memory.
+  const MAX_GLOBAL_BODY_SIZE = 2 * 1024 * 1024 // 2MB
+  if (!req.url?.startsWith('/webhook/')) {
+    let totalSize = 0
+    req.on('data', (chunk: Buffer) => {
+      totalSize += chunk.length
+      if (totalSize > MAX_GLOBAL_BODY_SIZE) {
+        res.writeHead(413, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: false, error: 'Request body too large' }))
+        req.destroy()
+      }
+    })
+  }
+
   if (req.method === 'POST' && req.url?.startsWith('/webhook/')) {
     const rawBotId = req.url.replace('/webhook/', '').split('?')[0]
     const botId = sanitizeBotId(rawBotId)
@@ -136,6 +180,13 @@ httpServer.on('request', async (req: IncomingMessage, res: ServerResponse) => {
     if (!botId || botId !== rawBotId) {
       res.writeHead(400, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ ok: false, error: 'Invalid bot ID' }))
+      return
+    }
+
+    // SECURITY FIX (S1): Rate limit webhook requests per botId
+    if (!checkWebhookRate(botId)) {
+      res.writeHead(429, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ ok: false, error: 'Rate limit exceeded' }))
       return
     }
 
@@ -230,6 +281,9 @@ httpServer.on('request', async (req: IncomingMessage, res: ServerResponse) => {
     // The actual cleanup continues in the background.
     const CLEANUP_TIMEOUT_MS = 15_000
     let responded = false
+    // FIX (S-3): Abort flag so the cleanup promise can stop file deletion
+    // after the timeout has already responded to the client.
+    let cleanupAborted = false
 
     const cleanupPromise = (async (): Promise<{ processKilled: boolean; filesDeleted: boolean; reDeployed: boolean }> => {
       let processKilled = false
@@ -244,7 +298,7 @@ httpServer.on('request', async (req: IncomingMessage, res: ServerResponse) => {
       } catch { /* non-critical */ }
 
       // 3. Stop the tracked process (if any)
-      boundStopBotProcess(botId)
+      await boundStopBotProcess(botId)
 
       // 4. Wait for tracked process to exit
       const bot = botProcesses.get(botId)
@@ -266,7 +320,12 @@ httpServer.on('request', async (req: IncomingMessage, res: ServerResponse) => {
       }
 
       // 6. Clean up PID file explicitly (handleBotExit may not have fired)
-      try { cleanupPidFile(botDir) } catch { /* ignore */ }
+      // FIX (S-3): Check abort flag before destructive operations
+      if (cleanupAborted) {
+        logger.info('cleanup', `Cleanup aborted for ${botId}, skipping file deletion`)
+        return { processKilled, filesDeleted: false, reDeployed: false }
+      }
+      try { await cleanupPidFile(botDir) } catch { /* ignore */ }
 
       // 7. Delete all bot files
       let filesDeleted = false
@@ -303,6 +362,7 @@ httpServer.on('request', async (req: IncomingMessage, res: ServerResponse) => {
       responded = true
 
       if (result === 'timeout') {
+        cleanupAborted = true // FIX (S-3): Signal cleanup promise to stop file deletion
         logger.warn('cleanup', `Cleanup timed out for bot ${botId} after ${CLEANUP_TIMEOUT_MS}ms`)
         res.writeHead(504, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ ok: false, error: 'Cleanup timeout — process may not have been fully stopped', processKilled: false, filesDeleted: false }))
@@ -404,17 +464,10 @@ async function recoverBotConfigs() {
           maxMemoryMb: 256,
         })
         // Extract port from env vars as fallback (before process detection runs)
-        const portKeys = ['PORT', 'HTTP_PORT', 'WEBHOOK_PORT', 'SERVER_PORT', 'LISTEN_PORT']
-        for (const key of portKeys) {
-          const val = config.envVars?.[key]
-          if (val) {
-            const parsed = parseInt(val, 10)
-            if (Number.isFinite(parsed) && parsed > 0 && parsed < 65536) {
-              const entry = botProcesses.get(botId)!
-              entry.port = parsed
-              break
-            }
-          }
+        const detectedPort = detectPortFromEnv(config.envVars)
+        if (detectedPort) {
+          const entry = botProcesses.get(botId)!
+          entry.port = detectedPort
         }
         const runningMarker = `${CONFIG_DIR}/${botId}.running`
         if (existsSync(runningMarker)) {
@@ -425,8 +478,8 @@ async function recoverBotConfigs() {
       }
     }
     logger.info('startup', `Loaded ${loaded} bot configs from disk`)
-  } catch (err: any) {
-    logger.error('startup', `Failed to load bot configs: ${err.message}`)
+  } catch (err: unknown) {
+    logger.error('startup', `Failed to load bot configs: ${err instanceof Error ? err.message : String(err)}`)
   }
 }
 
@@ -444,8 +497,11 @@ httpServer.listen(PORT, async () => {
   }
   if (autoStartBots.length > 0) {
     logger.info('startup', `Auto-starting ${autoStartBots.length} previously running bot(s): ${autoStartBots.join(', ')}`)
-    const BATCH_SIZE = parseInt(process.env.AUTO_START_BATCH_SIZE || '3', 10) || 3
-    const BATCH_DELAY_MS = parseInt(process.env.AUTO_START_BATCH_DELAY_MS || '2000', 10) || 2000
+    // SECURITY FIX (L4): Use Math.max to ensure batch size >= 1.
+    // Previously, AUTO_START_BATCH_SIZE=0 would cause || 3 fallback (ignoring
+    // user intent), and NaN from non-numeric values would also fall through.
+    const BATCH_SIZE = Math.max(1, parseInt(process.env.AUTO_START_BATCH_SIZE || '3', 10) || 3)
+    const BATCH_DELAY_MS = Math.max(0, parseInt(process.env.AUTO_START_BATCH_DELAY_MS || '2000', 10) || 2000)
     for (let i = 0; i < autoStartBots.length; i += BATCH_SIZE) {
       const batch = autoStartBots.slice(i, i + BATCH_SIZE)
       if (i > 0) {
@@ -466,7 +522,7 @@ httpServer.listen(PORT, async () => {
 
 // ─── Graceful Shutdown ──────────────────────────────────────────────────
 
-function gracefulShutdown(signal: string) {
+async function gracefulShutdown(signal: string) {
   logger.info('shutdown', `Received ${signal}, shutting down gracefully...`)
   stopMonitoring()
   stopLogCleanup()
@@ -475,7 +531,7 @@ function gracefulShutdown(signal: string) {
   const runningBots: string[] = []
   for (const [id, bot] of botProcesses.entries()) {
     if (bot.status === 'running' || bot.status === 'starting') {
-      boundStopBotProcess(id)
+      await boundStopBotProcess(id)
       runningBots.push(id)
     }
   }

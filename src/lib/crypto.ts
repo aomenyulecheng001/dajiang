@@ -8,16 +8,36 @@ import { logger } from '@/lib/logger'
 const ALGORITHM = 'aes-256-gcm'
 
 let _cachedKey: Buffer | null = null
+let _cachedKeySource: string | null = null
 let _keyPromise: Promise<Buffer> | null = null
 let _keyInitLock = false
 let _keyInitWaiters: Array<() => void> = []
 let _keyVersion: 1 | 2 = 1
 
-const PBKDF2_ITERATIONS = 100000
+const PBKDF2_ITERATIONS = 600000
+const PBKDF2_SALT_BYTES = 16
 
-function getPBKDF2Salt(keySource: string): string {
+/**
+ * SECURITY FIX (S2): Derive key with a random salt stored alongside the ciphertext.
+ * Previously, the salt was deterministically derived from the key source
+ * (SHA256('bot-factory-salt:' + keySource)), which means the same ENCRYPTION_KEY
+ * always produces the same derived key — weakening PBKDF2's resistance to
+ * precomputation attacks. Now each encryption uses a fresh random salt.
+ *
+ * The legacy deterministic salt is still used for ENC1 format decryption.
+ */
+function getLegacyPBKDF2Salt(keySource: string): string {
   const hash = createHash('sha256').update('bot-factory-salt:' + keySource).digest('hex')
   return hash.slice(0, 32)
+}
+
+async function deriveKeyWithSalt(keySource: string, salt: Buffer): Promise<Buffer> {
+  return new Promise<Buffer>((resolve, reject) => {
+    pbkdf2(keySource, salt, PBKDF2_ITERATIONS, 32, 'sha256', (err, key) => {
+      if (err) reject(err)
+      else resolve(key)
+    })
+  })
 }
 
 const LEGACY_KEY_SUFFIX = '0'.repeat(22)
@@ -85,8 +105,9 @@ async function getKeyAsync(): Promise<Buffer> {
               const fd = await open(keyFile, 'wx', 0o600)
               await fd.writeFile(keySource, 'utf-8')
               await fd.close()
-            } catch (e: any) {
-              if (e.code === 'EEXIST') {
+            } catch (e: unknown) {
+              const errCode = e instanceof Error && 'code' in e ? (e as NodeJS.ErrnoException).code : undefined
+              if (errCode === 'EEXIST') {
                 keySource = (await readFile(keyFile, 'utf-8')).trim()
               } else {
                 throw e
@@ -114,15 +135,19 @@ async function getKeyAsync(): Promise<Buffer> {
         }
       }
 
-      const salt = getPBKDF2Salt(keySource)
+      const salt = getLegacyPBKDF2Salt(keySource)
       const derivedKey = await new Promise<Buffer>((resolve, reject) => {
         pbkdf2(keySource, salt, PBKDF2_ITERATIONS, 32, 'sha256', (err, key) => {
           if (err) reject(err)
           else resolve(key)
         })
       })
+      // SECURITY FIX (S2): Cache the keySource so that encryptAsync can derive
+      // per-salt keys for new ENC2 format encryptions. The cached derivedKey
+      // is still used for backward-compatible ENC1 decryption.
       _keyVersion = 2
       _cachedKey = derivedKey
+      _cachedKeySource = keySource
       return _cachedKey
     })()
     _keyPromise!.catch(() => { _keyPromise = null })
@@ -156,10 +181,15 @@ function getKey(): Buffer {
     )
   }
 
-  const salt = getPBKDF2Salt(keySource)
+  const salt = getLegacyPBKDF2Salt(keySource)
   const { pbkdf2Sync } = require('crypto')
-  const derivedKey: Buffer = pbkdf2Sync(keySource, salt, PBKDF2_ITERATIONS, 32, 'sha256')
+  // SECURITY FIX (L2): Use fewer iterations in development to reduce event loop
+  // blocking. 600000 iterations of PBKDF2 can block for 600-1200ms. In production,
+  // getKey() throws an error — only getKeyAsync() should be used.
+  const devIterations = 60000
+  const derivedKey: Buffer = pbkdf2Sync(keySource, salt, devIterations, 32, 'sha256')
   _cachedKey = derivedKey
+  _cachedKeySource = keySource
   _keyVersion = 2
   return derivedKey
 }
@@ -173,12 +203,21 @@ export function encrypt(_text: string): never {
 
 export async function encryptAsync(text: string): Promise<string> {
   const iv = randomBytes(16)
-  const key = await getKeyAsync()
+  // SECURITY FIX (S2): Use a random salt for each encryption instead of
+  // the deterministic salt derived from keySource. This prevents precomputation
+  // attacks and ensures each ciphertext uses a unique derived key.
+  const salt = randomBytes(PBKDF2_SALT_BYTES)
+  const keySource = _cachedKeySource
+  if (!keySource) {
+    throw new Error('[crypto] Key source not available. Call getKeyAsync() first.')
+  }
+  const key = await deriveKeyWithSalt(keySource, salt)
   const cipher = createCipheriv(ALGORITHM, key, iv)
   let encrypted = cipher.update(text, 'utf8', 'hex')
   encrypted += cipher.final('hex')
   const authTag = cipher.getAuthTag().toString('hex')
-  return `${ENC_PREFIX}${iv.toString('hex')}:${authTag}:${encrypted}`
+  // ENC2 format: ENC2:<iv>:<salt>:<authTag>:<encrypted>
+  return `${ENC2_PREFIX}${iv.toString('hex')}:${salt.toString('hex')}:${authTag}:${encrypted}`
 }
 
 function parseEncryptedText(encryptedText: string): [string, string, string] {
@@ -198,6 +237,42 @@ export function decrypt(_encryptedText: string): never {
 }
 
 export async function decryptAsync(encryptedText: string): Promise<string> {
+  // SECURITY FIX (S2): Support both ENC1 (legacy, deterministic salt) and
+  // ENC2 (random salt) formats for backward compatibility.
+  if (encryptedText.startsWith(ENC2_PREFIX)) {
+    // ENC2 format: ENC2:<iv>:<salt>:<authTag>:<encrypted>
+    const raw = encryptedText.slice(ENC2_PREFIX.length)
+    const parts = raw.split(':')
+    if (parts.length !== 4) {
+      throw new Error('Invalid ENC2 encrypted text format: expected 4 colon-separated parts')
+    }
+    const [ivHex, saltHex, authTagHex, encrypted] = parts
+    const iv = Buffer.from(ivHex, 'hex')
+    const salt = Buffer.from(saltHex, 'hex')
+    const authTag = Buffer.from(authTagHex, 'hex')
+
+    const keySource = _cachedKeySource
+    if (!keySource) {
+      // Fallback: ensure key is initialized
+      await getKeyAsync()
+      const ks = _cachedKeySource
+      if (!ks) throw new Error('[crypto] Key source not available for ENC2 decryption')
+      const key = await deriveKeyWithSalt(ks, salt)
+      const decipher = createDecipheriv(ALGORITHM, key, iv)
+      decipher.setAuthTag(authTag)
+      let decrypted = decipher.update(encrypted, 'hex', 'utf8')
+      decrypted += decipher.final('utf8')
+      return decrypted
+    }
+    const key = await deriveKeyWithSalt(keySource, salt)
+    const decipher = createDecipheriv(ALGORITHM, key, iv)
+    decipher.setAuthTag(authTag)
+    let decrypted = decipher.update(encrypted, 'hex', 'utf8')
+    decrypted += decipher.final('utf8')
+    return decrypted
+  }
+
+  // ENC1 format (legacy): ENC1:<iv>:<authTag>:<encrypted>
   const [ivHex, authTagHex, encrypted] = parseEncryptedText(encryptedText)
   const iv = Buffer.from(ivHex, 'hex')
   const authTag = Buffer.from(authTagHex, 'hex')
@@ -242,16 +317,32 @@ async function tryLegacyKeyAsync(iv: Buffer, authTag: Buffer, encrypted: string,
 }
 
 const ENC_PREFIX = 'ENC1:'
+const ENC2_PREFIX = 'ENC2:'
 
+// L4 FIXED: Removed heuristic detection of hex-only values that look like encrypted
+// ciphertext. Previously, any string with 3-4 colon-separated hex parts where the
+// first part was 32 chars would be treated as encrypted, causing false positives
+// for legitimate hex values (e.g., HMAC secrets, API keys).
+// Now only the explicit ENC1:/ENC2: prefixes trigger encrypted detection.
 export function isEncrypted(value: string): boolean {
-  if (value.startsWith(ENC_PREFIX)) return true
-  const parts = value.split(':')
-  return parts.length === 3 && parts.every(p => /^[0-9a-f]+$/.test(p)) && parts[0].length === 32 && parts[1].length === 32
+  return value.startsWith(ENC_PREFIX) || value.startsWith(ENC2_PREFIX)
 }
 
+// M1 FIXED: Use word-boundary matching to avoid overly broad matches.
+// Previously, 'AUTH' would match 'OAUTH_CALLBACK_URL' via simple includes().
+// Now the pattern must appear at a word boundary (underscore-delimited).
 export function isSensitiveKey(key: string): boolean {
   const lower = key.toLowerCase()
-  return SENSITIVE_KEY_PATTERNS.some(pattern => lower.includes(pattern))
+  return SENSITIVE_KEY_PATTERNS.some(pattern => {
+    const idx = lower.indexOf(pattern)
+    if (idx === -1) return false
+    // Character before match must be start-of-string or underscore
+    if (idx > 0 && lower[idx - 1] !== '_') return false
+    // Character after match must be end-of-string or underscore
+    const afterIdx = idx + pattern.length
+    if (afterIdx < lower.length && lower[afterIdx] !== '_') return false
+    return true
+  })
 }
 
 export function encryptEnvVars<T extends { key: string; value: string; isEncrypted?: boolean }>(

@@ -15,6 +15,13 @@ export const EMOJI_OPTIONS = [
  *
  * IMPORTANT: Keep this list in sync between client and server.
  * If you add a pattern here, it will be applied on both sides automatically.
+ *
+ * NOTE (L5): This is a CLIENT-SAFE subset of the server-side
+ * SENSITIVE_ENV_KEY_PATTERNS in security-utils.ts. Differences:
+ * - This list uses lowercase patterns (for case-insensitive matching on client)
+ * - Server list uses uppercase patterns (for uppercase .includes() matching)
+ * - Server list includes DATABASE_URL (not auto-encrypted, but filtered from logs)
+ * - Both lists cover the same semantic categories (token, secret, password, etc.)
  */
 export const SENSITIVE_KEY_PATTERNS = [
   'token',

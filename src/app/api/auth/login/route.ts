@@ -97,16 +97,42 @@ export async function POST(request: NextRequest) {
       failedLoginAttempts.delete(lockoutKey)
     }
 
+    // SECURITY FIX (S-5): Global username lockout to prevent IP rotation bypass.
+    // An attacker using multiple IPs can bypass the per-IP lockout. A global
+    // username counter with a higher threshold (50) blocks sustained attacks.
+    const globalLockoutKey = `global:${normalizedUsername}`
+    const globalLockout = failedLoginAttempts.get(globalLockoutKey)
+    if (globalLockout && globalLockout.count >= 50) {
+      if (Date.now() < globalLockout.lockedUntil) {
+        return NextResponse.json(
+          { error: 'Account temporarily locked. Try again later.' },
+          { status: 423 }
+        )
+      }
+      failedLoginAttempts.delete(globalLockoutKey)
+    }
+
     const result = await authenticateUser(normalizedUsername, password)
     if (!result) {
       const maskedUsername = username.length > 2 ? username.slice(0, 2) + '***' : '***'
       logger.warn('auth-login', `Failed login attempt for user: ${maskedUsername}, IP: ${clientIp}`)
-      const existing = failedLoginAttempts.get(lockoutKey) || { count: 0, lockedUntil: 0, createdAt: Date.now() }
+      // SECURITY FIX (M-3): Re-read current value from Map after async call
+      // to prevent race condition where concurrent requests read the same stale count.
+      const currentEntry = failedLoginAttempts.get(lockoutKey)
+      const existing = currentEntry || { count: 0, lockedUntil: 0, createdAt: Date.now() }
       existing.count++
       if (existing.count >= MAX_FAILED_ATTEMPTS) {
         existing.lockedUntil = Date.now() + LOCKOUT_DURATION_MS
       }
       failedLoginAttempts.set(lockoutKey, existing)
+      // SECURITY FIX (S-5): Update global username counter on failed login
+      const currentGlobal = failedLoginAttempts.get(globalLockoutKey)
+      const globalEntry = currentGlobal || { count: 0, lockedUntil: 0, createdAt: Date.now() }
+      globalEntry.count++
+      if (globalEntry.count >= 50) {
+        globalEntry.lockedUntil = Date.now() + LOCKOUT_DURATION_MS
+      }
+      failedLoginAttempts.set(globalLockoutKey, globalEntry)
       return NextResponse.json(
         { error: 'Invalid username or password' },
         { status: 401 }

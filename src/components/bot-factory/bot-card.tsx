@@ -141,8 +141,11 @@ export const BotCard = React.memo(function BotCard({ bot, viewMode }: BotCardPro
   })()
 
   // Get token from envVars — support both BOT_TOKEN and TELEGRAM_BOT_TOKEN
-  const tokenEntry = bot.envVars.filter((v) => (v.key === 'BOT_TOKEN' || v.key === 'TELEGRAM_BOT_TOKEN') && v.value.trim()).slice(-1)[0]
-    || bot.envVars.find((v) => v.key === 'BOT_TOKEN' || v.key === 'TELEGRAM_BOT_TOKEN')
+  // FIX (L3): Simplified token lookup — prefer entry with non-empty value,
+  // fall back to any matching entry. Consistent with runtime-control.tsx.
+  const tokenKeys = ['BOT_TOKEN', 'TELEGRAM_BOT_TOKEN'] as const
+  const tokenEntry = bot.envVars.find((v) => tokenKeys.includes(v.key as typeof tokenKeys[number]) && v.value.trim())
+    ?? bot.envVars.find((v) => tokenKeys.includes(v.key as typeof tokenKeys[number]))
   const botToken = tokenEntry?.value || ''
   // Use server-side validated token status (accurate even when token is encrypted/masked)
   // Fall back to client-side validation for newly created bots not yet persisted

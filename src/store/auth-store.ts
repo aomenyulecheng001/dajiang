@@ -30,17 +30,27 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     await fetch('/api/auth/logout', {
       method: 'POST',
       credentials: 'include',
+      headers: { 'X-Requested-With': 'XMLHttpRequest' },
     }).catch(() => {})
 
-    set({ isAuthenticated: false, username: null, token: null, isLoading: false })
-    import('@/store/bot-store').then(({ useBotStore, resetHydration }) => {
+    // FIX (M1): Clear bot-store BEFORE setting isAuthenticated=false.
+    // Previously, isAuthenticated was set to false first, which triggered
+    // bot-runner-context to disconnect Socket.IO, but bot-store cleanup
+    // was async and might not complete before the UI re-rendered — causing
+    // a brief state where the UI showed an empty bot list but still had
+    // a connected Socket status. Now we clean up bot-store synchronously
+    // first, then update auth state.
+    try {
+      const { useBotStore, resetHydration } = await import('@/store/bot-store')
       useBotStore.setState({ bots: [], selectedBotId: null })
       resetHydration()
-    }).catch(() => {})
+    } catch { /* non-critical */ }
+
+    set({ isAuthenticated: false, username: null, token: null, isLoading: false })
   },
 }))
 
-export async function verifySession(_token?: string, signal?: AbortSignal): Promise<{ valid: boolean; username?: string }> {
+export async function verifySession(signal?: AbortSignal): Promise<{ valid: boolean; username?: string }> {
   try {
     const res = await fetch('/api/auth/session', {
       credentials: 'include',

@@ -4,6 +4,7 @@ import type { BotProcess } from './types'
 import { getChildProcessMemory, intentionalStopSet, cancelRestartTimer, memoryKilledSet } from './process-manager'
 import { appendLog } from './log-manager'
 import { io } from './socket'
+import { detectPortFromEnv } from './utils'
 
 // ─── CPU Usage Tracking ─────────────────────────────────────────────────
 
@@ -138,7 +139,7 @@ async function getListeningPortsLinux(pid: number): Promise<number[]> {
       if (colonIdx === -1) continue
       const hexPort = localAddr.slice(colonIdx + 1)
       const port = parseInt(hexPort, 16)
-      if (port > 0 && port < 65536 && !ports.includes(port)) {
+      if (Number.isFinite(port) && port > 0 && port < 65536 && !ports.includes(port)) {
         ports.push(port)
       }
     }
@@ -157,7 +158,7 @@ async function getListeningPortsLinux(pid: number): Promise<number[]> {
         if (colonIdx === -1) continue
         const hexPort = localAddr.slice(colonIdx + 1)
         const port = parseInt(hexPort, 16)
-        if (port > 0 && port < 65536 && !ports.includes(port)) {
+        if (Number.isFinite(port) && port > 0 && port < 65536 && !ports.includes(port)) {
           ports.push(port)
         }
       }
@@ -191,7 +192,7 @@ async function getListeningPortsFallback(pid: number): Promise<number[]> {
         const portMatch = line.match(/:(\d{1,5})\s/)
         if (portMatch) {
           const port = parseInt(portMatch[1], 10)
-          if (port > 0 && port < 65536 && !ports.includes(port)) {
+          if (Number.isFinite(port) && port > 0 && port < 65536 && !ports.includes(port)) {
             ports.push(port)
           }
         }
@@ -250,32 +251,40 @@ export function startMonitoring(botProcesses: Map<string, BotProcess>): void {
       // Fallback: if process detection failed, check bot's env vars for PORT
       // This covers bots where port detection can't work (permission issues, non-Linux)
       if (!bot.port) {
-        const portKeys = ['PORT', 'HTTP_PORT', 'WEBHOOK_PORT', 'SERVER_PORT', 'LISTEN_PORT']
-        for (const key of portKeys) {
-          const val = bot.envVars?.[key]
-          if (val) {
-            const parsed = parseInt(val, 10)
-            if (Number.isFinite(parsed) && parsed > 0 && parsed < 65536) {
-              bot.port = parsed
-              break
-            }
-          }
-        }
+        bot.port = detectPortFromEnv(bot.envVars)
       }
 
       // Memory watchdog — auto-restart if exceeding limit
       // Only act if not already in memoryKilledSet (prevent re-triggering every 3s)
       if (bot.memoryUsage > bot.maxMemoryMb * 1024 * 1024 && bot.memoryUsage > 0 && !memoryKilledSet.has(botId)) {
+        // FIX (M1): Use sliding window for memory restart counting.
+        // The old approach used restartCount (shared with crash restarts, max 5 total),
+        // which was too strict for memory leaks that take hours to trigger.
+        // Now we track memory-specific restarts within a 1-hour sliding window.
+        if (!bot._memoryRestartTimestamps) bot._memoryRestartTimestamps = []
+        const oneHourAgo = Date.now() - 3600_000
+        bot._memoryRestartTimestamps = bot._memoryRestartTimestamps.filter(t => t > oneHourAgo)
+        const MEMORY_RESTART_MAX_PER_HOUR = 5
+        if (bot._memoryRestartTimestamps.length >= MEMORY_RESTART_MAX_PER_HOUR) {
+          if (bot.status !== 'error') {
+            bot.status = 'error'
+            bot.error = `Memory limit exceeded: restart count too high (${MEMORY_RESTART_MAX_PER_HOUR}/hour), auto-restart stopped. Please check and fix memory leaks.`
+            appendLog(botId, bot.error, 'error')
+            io.emit('bot:status', { botId, status: 'error', error: bot.error })
+          }
+          memoryKilledSet.add(botId) // Prevent re-triggering
+          continue
+        }
+
         const memMb = Math.round(bot.memoryUsage / 1024 / 1024)
-        appendLog(botId, `内存超限: ${memMb}MB > ${bot.maxMemoryMb}MB，正在重启...`, 'warn')
+        appendLog(botId, `Memory limit exceeded: ${memMb}MB > ${bot.maxMemoryMb}MB, restarting... (${bot._memoryRestartTimestamps.length + 1}/${MEMORY_RESTART_MAX_PER_HOUR}/hour)`, 'warn')
+        bot._memoryRestartTimestamps.push(Date.now())
         // Mark as memory-killed so handleBotExit knows this is NOT an intentional stop
         // even though we use SIGTERM to kill the process.
         // Also prevents the watchdog from re-triggering on the next monitoring cycle.
         memoryKilledSet.add(botId)
         intentionalStopSet.delete(botId)
         cancelRestartTimer(botId)
-        // Don't reset restartCount — respect maxRestarts limit to prevent infinite restart loops
-        // for bots with persistent memory leaks. The user must manually restart after maxRestarts.
         if (bot.process && bot.process.pid) {
           const procRef = bot.process
           try { procRef.kill('SIGTERM') } catch { /* ignore */ }
@@ -286,7 +295,7 @@ export function startMonitoring(botProcesses: Map<string, BotProcess>): void {
             // Node.js sets killed=true immediately after SIGTERM, not when
             // the process actually exits (same bug as in stopBotProcess).
             if (procRef.exitCode === null && bot.process === procRef) {
-              appendLog(botId, '内存超限进程未响应 SIGTERM，强制终止...', 'warn')
+              appendLog(botId, 'Memory limit: process unresponsive to SIGTERM, force killing...', 'warn')
               try { procRef.kill('SIGKILL') } catch { /* ignore */ }
             }
           }, 10000)

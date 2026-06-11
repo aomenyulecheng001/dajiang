@@ -32,7 +32,7 @@ export function LoginForm() {
     try {
       const res = await fetch('/api/auth/login', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
         credentials: 'include',
         body: JSON.stringify({ username: username.trim(), password }),
       })
@@ -55,6 +55,7 @@ export function LoginForm() {
       fetch('/api/bots/runner/start-service', {
         method: 'POST',
         credentials: 'include',
+        headers: { 'X-Requested-With': 'XMLHttpRequest' },
       }).catch(() => {})
 
       toast.success(t('auth.loginWelcome', { username: data.username || username.trim() }))

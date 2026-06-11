@@ -10,6 +10,11 @@ function getSecretFilePath(): string {
   return resolveFromProjectRoot('mini-services', 'bot-runner', 'config', 'runner-secret')
 }
 
+function maskSecret(secret: string): string {
+  if (secret.length <= 12) return '***'
+  return secret.slice(0, 8) + '...' + secret.slice(-4)
+}
+
 export async function GET(request: NextRequest) {
   try {
     const clientIp = getSecureClientIp(request)
@@ -51,13 +56,21 @@ export async function GET(request: NextRequest) {
     try {
       await access(secretFilePath)
     } catch {
-      return NextResponse.json({ token: '' })
+      // SECURITY FIX (S2): Return explicit response indicating the runner secret
+      // is not configured, instead of returning { token: '' } which misleads the
+      // frontend into treating an empty string as a valid token.
+      return NextResponse.json({ token: null, configured: false })
     }
 
     const secret = (await readFile(secretFilePath, 'utf-8')).trim()
     logger.info('runner-token', `Runner token accessed by user: ${session.userId}, IP: ${clientIp}`)
+
+    const reveal = request.nextUrl.searchParams.get('reveal') === 'true'
+    const confirmAccess = request.headers.get('x-confirm-access') === 'true'
+    const returnToken = reveal && confirmAccess ? secret : maskSecret(secret)
+
     return NextResponse.json(
-      { token: secret },
+      { token: returnToken, configured: true },
       {
         headers: {
           'Cache-Control': 'no-store, no-cache, must-revalidate',
@@ -67,6 +80,8 @@ export async function GET(request: NextRequest) {
     )
   } catch (error) {
     logger.error('runner-token', 'Failed to read runner secret', error instanceof Error ? error.message : String(error))
-    return NextResponse.json({ token: '' })
+    // SECURITY FIX (S2): Return error response instead of empty token.
+    // Returning { token: '' } masks the failure and misleads the frontend.
+    return NextResponse.json({ error: 'Failed to read runner configuration' }, { status: 500 })
   }
 }

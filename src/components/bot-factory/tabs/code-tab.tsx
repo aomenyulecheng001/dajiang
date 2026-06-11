@@ -22,7 +22,7 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select'
 import { cn, formatDate } from '@/lib/utils'
-import { useBotStore } from '@/store/bot-store'
+import { useBotStore, useSelectedBot } from '@/store/bot-store'
 import { useT, useLocale } from '@/lib/i18n'
 import { ConfirmDialog } from '@/components/bot-factory/confirm-dialog'
 import { DependenciesTab } from './dependencies-tab'
@@ -56,7 +56,9 @@ const languageMap: Record<string, string> = {
   json: 'json',
 }
 
-const typeBadgeColors: Record<string, string> = {
+// FIX (M4): Use CodeBlock['type'] as key type so TypeScript will error
+// if a new type is added to CodeBlock but missing from these maps.
+const typeBadgeColors: Record<CodeBlock['type'], string> = {
   handler: 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-500/20',
   middleware: 'bg-sky-500/10 text-sky-700 dark:text-sky-400 border-sky-500/20',
   command: 'bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-500/20',
@@ -66,7 +68,7 @@ const typeBadgeColors: Record<string, string> = {
 }
 
 // i18n label map for type filter badge display
-const typeFilterLabelMap: Record<string, string> = {
+const typeFilterLabelMap: Record<CodeBlock['type'], string> = {
   handler: 'Handler',
   middleware: 'Middleware',
   command: 'Command',
@@ -75,7 +77,7 @@ const typeFilterLabelMap: Record<string, string> = {
   cron: 'Cron',
 }
 
-const typeFlowColors: Record<string, string> = {
+const typeFlowColors: Record<CodeBlock['type'], string> = {
   middleware: 'bg-sky-100 dark:bg-sky-500/15 border-sky-300 dark:border-sky-500/30 text-sky-700 dark:text-sky-300',
   handler: 'bg-emerald-100 dark:bg-emerald-500/15 border-emerald-300 dark:border-emerald-500/30 text-emerald-700 dark:text-emerald-300',
   command: 'bg-amber-100 dark:bg-amber-500/15 border-amber-300 dark:border-amber-500/30 text-amber-700 dark:text-amber-300',
@@ -86,7 +88,7 @@ const typeFlowColors: Record<string, string> = {
 
 // typeBorderColors and typeTopColors removed — colored borders and top bars no longer used
 
-const typeFlowBadgeColors: Record<string, string> = {
+const typeFlowBadgeColors: Record<CodeBlock['type'], string> = {
   middleware: 'bg-sky-200/50 dark:bg-sky-500/20 text-sky-700 dark:text-sky-300',
   handler: 'bg-emerald-200/50 dark:bg-emerald-500/20 text-emerald-700 dark:text-emerald-300',
   command: 'bg-amber-200/50 dark:bg-amber-500/20 text-amber-700 dark:text-amber-300',
@@ -459,13 +461,13 @@ function ExecutionFlow({
     )
   }
 
-  const flowNodes: { type: string; label: string; count: number }[] = [
-    { type: 'middleware', label: t('codeTab.flowMiddleware'), count: counts.middleware },
-    { type: 'handler', label: t('codeTab.flowHandlers'), count: counts.handler },
-    { type: 'command', label: t('codeTab.flowCommand'), count: counts.command },
-    { type: 'callback', label: t('codeTab.flowCallback'), count: counts.callback },
-    { type: 'action', label: t('codeTab.flowActions'), count: counts.action },
-  ].filter((n) => n.count > 0)
+  const flowNodes: { type: CodeBlock['type']; label: string; count: number }[] = ([
+    { type: 'middleware' as const, label: t('codeTab.flowMiddleware'), count: counts.middleware },
+    { type: 'handler' as const, label: t('codeTab.flowHandlers'), count: counts.handler },
+    { type: 'command' as const, label: t('codeTab.flowCommand'), count: counts.command },
+    { type: 'callback' as const, label: t('codeTab.flowCallback'), count: counts.callback },
+    { type: 'action' as const, label: t('codeTab.flowActions'), count: counts.action },
+  ] as { type: CodeBlock['type']; label: string; count: number }[]).filter((n) => n.count > 0)
 
   return (
     <div className="space-y-3 p-3 rounded-lg border border-border/40">
@@ -876,7 +878,8 @@ function AddBlockDialog({ botId, botLanguage, open, onOpenChange }: {
 
 export function CodeTab() {
   const selectedBotId = useBotStore((s) => s.selectedBotId)
-  const bot = useBotStore((s) => s.bots.find((b) => b.id === selectedBotId))
+  // FIX (S2): Use useSelectedBot hook instead of inline bots.find() selector
+  const bot = useSelectedBot()
   const t = useT()
   const [searchQuery, setSearchQuery] = useState('')
   const [typeFilter, setTypeFilter] = useState<string>('all')
@@ -998,10 +1001,10 @@ export function CodeTab() {
             {typeFilter !== 'all' && (
               <Badge
                 variant="outline"
-                className={cn('text-[13px] gap-1.5 cursor-pointer', typeBadgeColors[typeFilter] || '')}
+                className={cn('text-[13px] gap-1.5 cursor-pointer', typeBadgeColors[typeFilter as CodeBlock['type']] || '')}
                 onClick={() => setTypeFilter('all')}
               >
-                {typeFilterLabelMap[typeFilter] || typeFilter}
+                {typeFilterLabelMap[typeFilter as CodeBlock['type']] || typeFilter}
                 <X className="size-3" />
               </Badge>
             )}

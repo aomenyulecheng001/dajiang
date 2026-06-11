@@ -133,7 +133,8 @@ export async function PUT(
     }
 
     // Parse request body with size limit protection (shared utility)
-    const parsed = await parseJsonBody(request)
+    // SECURITY FIX (S5): Explicit 5MB limit for bot updates (projectFiles can be large)
+    const parsed = await parseJsonBody(request, 5_000_000)
     if (parsed instanceof NextResponse) return parsed
     const bot = parsed
 
@@ -153,6 +154,20 @@ export async function PUT(
     const incomingEnvVars = (bot.envVars as { key: string; value: string; isEncrypted?: boolean; id?: string; description?: string }[]) || []
 
     const updated = await db.$transaction(async (tx) => {
+      // P3 FIX: Acquire write lock immediately (BEGIN IMMEDIATE) to prevent
+      // concurrent read-modify-write races on envVars. Without this, two
+      // concurrent PATCH requests can both read the same envVars state,
+      // merge independently, and the second write overwrites the first.
+      // This lightweight UPDATE forces SQLite to acquire the write lock
+      // before any SELECT, serializing the entire transaction.
+      // NOTE (M7): This is the standard pattern for SQLite write lock
+      // acquisition in Prisma. In WAL mode, reads don't block writes, but
+      // BEGIN IMMEDIATE ensures the transaction holds the write lock from
+      // the start, preventing concurrent transactions from interleaving.
+      // The transaction isolation guarantees that if two transactions
+      // conflict, one will receive a BUSY error and retry.
+      await tx.$executeRaw`UPDATE Bot SET updatedAt = updatedAt WHERE id = ${id}`
+
       const existingBot = await tx.bot.findUnique({
         where: { id },
         select: { envVars: true, config: true, webhookSecret: true },
@@ -234,7 +249,8 @@ export async function PATCH(
     }
 
     // Parse request body with size limit protection (shared utility)
-    const parsed = await parseJsonBody(request)
+    // SECURITY FIX (S5): Explicit 5MB limit for bot patches (projectFiles can be large)
+    const parsed = await parseJsonBody(request, 5_000_000)
     if (parsed instanceof NextResponse) return parsed
     const body = parsed
 
@@ -248,6 +264,10 @@ export async function PATCH(
     }
 
     const updated = await db.$transaction(async (tx) => {
+      // P3 FIX: Acquire write lock immediately (BEGIN IMMEDIATE) to prevent
+      // concurrent read-modify-write races on envVars/config.
+      await tx.$executeRaw`UPDATE Bot SET updatedAt = updatedAt WHERE id = ${id}`
+
       const existing = await tx.bot.findUnique({
         where: { id },
         select: {
@@ -349,9 +369,79 @@ export async function DELETE(
       return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
 
+    // SECURITY FIX (M-14): Call Runner cleanup FIRST, then delete from DB.
+    // Previously, DB deletion happened first, which meant if Runner cleanup failed,
+    // the bot record was already gone and the runner process/files were orphaned.
+    // Now we try to clean up the runner first; if it fails, we still delete from
+    // DB but log a warning and attempt local file cleanup as fallback.
+
+    // ── Stop bot process and clean up files via bot-runner ──────────
+    const runnerSecret = await getRunnerSecret()
+    const runnerUrl = `${BOT_RUNNER_URL}/cleanup/${encodeURIComponent(id)}`
+    const runnerHeaders: Record<string, string> = {}
+    if (runnerSecret) {
+      runnerHeaders['X-Runner-Secret'] = runnerSecret
+    }
+
+    let runnerCleanupSucceeded = false
+    try {
+      const resp = await fetch(runnerUrl, {
+        method: 'DELETE',
+        headers: runnerHeaders,
+        signal: AbortSignal.timeout(18000), // 18s — must exceed the bot-runner's 15s cleanup timeout
+      })
+      if (resp.ok) {
+        const result = await resp.json().catch(() => ({ ok: false }))
+        if (result.filesDeleted) {
+          runnerCleanupSucceeded = true
+          logger.info('bot-api', `Bot ${id} cleanup completed by runner: processKilled=${result.processKilled}, filesDeleted=${result.filesDeleted}`)
+        } else if (result.skipped) {
+          logger.info('bot-api', `Bot ${id} cleanup skipped by runner: ${result.skipped}`)
+        } else {
+          logger.warn('bot-api', `Runner cleanup for bot ${id} returned ok but filesDeleted=false`)
+        }
+      } else {
+        logger.warn('bot-api', `Runner cleanup returned ${resp.status} for bot ${id}`)
+      }
+    } catch (err) {
+      logger.warn('bot-api', `Runner cleanup request failed for bot ${id} — will attempt local cleanup`, err instanceof Error ? err.message : String(err))
+    }
+
+    // Fallback: local file cleanup if bot-runner was unreachable or failed to delete files.
+    if (!runnerCleanupSucceeded) {
+      try {
+        const botDir = resolveFromProjectRoot('mini-services', 'bot-runner', 'bots', id)
+        const logFile = resolveFromProjectRoot('mini-services', 'bot-runner', 'logs', `${id}.log`)
+        const configFile = resolveFromProjectRoot('mini-services', 'bot-runner', 'config', `${id}.json`)
+        const runningFile = resolveFromProjectRoot('mini-services', 'bot-runner', 'config', `${id}.running`)
+        const pidFile = resolveFromProjectRoot('mini-services', 'bot-runner', 'bots', id, '.pid')
+        const expectedBotsDir = resolveFromProjectRoot('mini-services', 'bot-runner', 'bots')
+        const expectedLogsDir = resolveFromProjectRoot('mini-services', 'bot-runner', 'logs')
+        const expectedConfigDir = resolveFromProjectRoot('mini-services', 'bot-runner', 'config')
+        if (!botDir.startsWith(expectedBotsDir) || !logFile.startsWith(expectedLogsDir) || !configFile.startsWith(expectedConfigDir)) {
+          logger.error('bot-api', `SECURITY: Path traversal detected in bot delete — skipping file cleanup. id=${id}`)
+        } else {
+          await Promise.all([
+            rm(botDir, { recursive: true, force: true }),
+            rm(logFile, { force: true }),
+            rm(configFile, { force: true }),
+            rm(runningFile, { force: true }),
+            rm(pidFile, { force: true }),
+          ])
+        }
+      } catch (err) {
+        logger.warn('bot-api', `Local file cleanup warning for bot ${id}`, err instanceof Error ? err.message : String(err))
+      }
+    }
+
+    // Now delete from DB — even if Runner cleanup failed, we still delete the record
     let deletedBot: { id: string; ownerId: string | null } | null = null
     try {
       deletedBot = await db.$transaction(async (tx) => {
+        // P3 FIX: Acquire write lock immediately (BEGIN IMMEDIATE) to prevent
+        // race between delete and concurrent update on the same bot.
+        await tx.$executeRaw`UPDATE Bot SET updatedAt = updatedAt WHERE id = ${id}`
+
         const bot = await tx.bot.findUnique({ where: { id }, select: { ownerId: true } })
         if (!bot || !isBotOwner(bot.ownerId, deleteUserId)) {
           throw new Error('BOT_NOT_FOUND')
@@ -374,73 +464,6 @@ export async function DELETE(
 
     // P1 OPT: Emit deleted event so SSE clients disconnect gracefully
     eventBus.emit(`bot:${id}`, 'deleted', { botId: id })
-
-    // ── Stop bot process and clean up files via bot-runner ──────────
-    // The bot-runner's /cleanup/ endpoint handles: (1) killing orphan processes,
-    // (2) stopping tracked processes, (3) waiting for exit, (4) deleting all files.
-    // We let the bot-runner handle everything; local file deletion is only a
-    // fallback when the bot-runner is unreachable.
-    const runnerSecret = await getRunnerSecret()
-    const runnerUrl = `${BOT_RUNNER_URL}/cleanup/${encodeURIComponent(id)}`
-    const runnerHeaders: Record<string, string> = {}
-    if (runnerSecret) {
-      runnerHeaders['X-Runner-Secret'] = runnerSecret
-    }
-
-    let runnerCleanupSucceeded = false
-    try {
-      const resp = await fetch(runnerUrl, {
-        method: 'DELETE',
-        headers: runnerHeaders,
-        signal: AbortSignal.timeout(18000), // 18s — must exceed the bot-runner's 15s cleanup timeout
-      })
-      if (resp.ok) {
-        const result = await resp.json().catch(() => ({ ok: false }))
-        if (result.filesDeleted) {
-          // Bot-runner handled everything — no local cleanup needed
-          runnerCleanupSucceeded = true
-          logger.info('bot-api', `Bot ${id} cleanup completed by runner: processKilled=${result.processKilled}, filesDeleted=${result.filesDeleted}`)
-        } else if (result.skipped) {
-          logger.info('bot-api', `Bot ${id} cleanup skipped by runner: ${result.skipped}`)
-        } else {
-          logger.warn('bot-api', `Runner cleanup for bot ${id} returned ok but filesDeleted=false`)
-        }
-      } else {
-        logger.warn('bot-api', `Runner cleanup returned ${resp.status} for bot ${id}`)
-      }
-    } catch (err) {
-      logger.warn('bot-api', `Runner cleanup request failed for bot ${id} — will attempt local cleanup`, err instanceof Error ? err.message : String(err))
-    }
-
-    // Fallback: local file cleanup if bot-runner was unreachable or failed to delete files.
-    // On Windows, files may be locked if the process is still running, so we try but
-    // don't fail the request if cleanup is incomplete.
-    if (!runnerCleanupSucceeded) {
-      try {
-        const botDir = resolveFromProjectRoot('mini-services', 'bot-runner', 'bots', id)
-        const logFile = resolveFromProjectRoot('mini-services', 'bot-runner', 'logs', `${id}.log`)
-        const configFile = resolveFromProjectRoot('mini-services', 'bot-runner', 'config', `${id}.json`)
-        const runningFile = resolveFromProjectRoot('mini-services', 'bot-runner', 'config', `${id}.running`)
-        const pidFile = resolveFromProjectRoot('mini-services', 'bot-runner', 'bots', id, '.pid')
-        // SECURITY FIX (SEC-77): Verify resolved paths stay within expected directories.
-        const expectedBotsDir = resolveFromProjectRoot('mini-services', 'bot-runner', 'bots')
-        const expectedLogsDir = resolveFromProjectRoot('mini-services', 'bot-runner', 'logs')
-        const expectedConfigDir = resolveFromProjectRoot('mini-services', 'bot-runner', 'config')
-        if (!botDir.startsWith(expectedBotsDir) || !logFile.startsWith(expectedLogsDir) || !configFile.startsWith(expectedConfigDir)) {
-          logger.error('bot-api', `Path traversal detected in bot delete: id=${id}, botDir=${botDir}`)
-        } else {
-          await Promise.all([
-            rm(botDir, { recursive: true, force: true }),
-            rm(logFile, { force: true }),
-            rm(configFile, { force: true }),
-            rm(runningFile, { force: true }),
-            rm(pidFile, { force: true }),
-          ])
-        }
-      } catch (err) {
-        logger.warn('bot-api', `Local file cleanup warning for bot ${id}`, err instanceof Error ? err.message : String(err))
-      }
-    }
 
     return NextResponse.json({ success: true })
   } catch (error) {

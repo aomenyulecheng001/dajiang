@@ -190,7 +190,15 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
   // This timer auto-resolves 'stopping' to 'stopped' after STOPPING_STATE_TIMEOUT_MS.
   const stoppingTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
   const logSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const recentLogKeysRef = useRef<Set<string>>(new Set())
+  // FIX (M2): Replace Set-based dedup with ring buffer to avoid GC pressure.
+  // Previously, when the Set exceeded 2000 entries, it was spread into an array
+  // and a new Set of 1000 entries was created — causing frequent GC spikes
+  // during high-frequency logging. The ring buffer approach deletes entries
+  // individually without creating new collections.
+  const RECENT_LOG_KEYS_MAX = 2000
+  const RECENT_LOG_KEYS_TRIM = 1000
+  const recentLogKeysArr = useRef<string[]>([])
+  const recentLogKeysSet = useRef<Set<string>>(new Set())
   // FIX: Track deleted bot IDs to ignore late-arriving bot:log events
   const deletedBotIdsRef = useRef<Set<string>>(new Set())
   const messageBatchRef = useRef<Array<{ botId: string; userId: string; userName: string; text: string; command?: string }>>([])
@@ -541,7 +549,12 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
                 method: 'POST',
                 headers,
                 body: JSON.stringify({ logs }),
-              }).catch(() => {})
+              }).catch(err => {
+                // FIX (M4): Log warning instead of silently discarding.
+                // Previously, failed log persistence was completely silent,
+                // making it impossible to diagnose data loss.
+                logger.warn('bot-runner', `Failed to persist ${logs.length} logs for bot ${botId}`, err instanceof Error ? err.message : String(err))
+              })
             }
           } catch {
             // Ignore
@@ -553,11 +566,13 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
           // FIX: Skip logs for deleted bots to prevent recreating state and 404 errors
           if (deletedBotIdsRef.current.has(data.botId)) return
           const dedupKey = `${data.botId}:${data.timestamp}:${data.message}`
-          if (recentLogKeysRef.current.has(dedupKey)) return
-          recentLogKeysRef.current.add(dedupKey)
-          if (recentLogKeysRef.current.size > 2000) {
-            const entries = [...recentLogKeysRef.current]
-            recentLogKeysRef.current = new Set(entries.slice(-1000))
+          // FIX (M2): Ring buffer dedup — avoids creating new Set on trim.
+          if (recentLogKeysSet.current.has(dedupKey)) return
+          recentLogKeysSet.current.add(dedupKey)
+          recentLogKeysArr.current.push(dedupKey)
+          if (recentLogKeysArr.current.length > RECENT_LOG_KEYS_MAX) {
+            const removed = recentLogKeysArr.current.splice(0, recentLogKeysArr.current.length - RECENT_LOG_KEYS_TRIM)
+            for (const k of removed) recentLogKeysSet.current.delete(k)
           }
 
           const arr = botLogsRef.current.get(data.botId) || []
@@ -807,7 +822,8 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
         clearTimeout(logSyncTimerRef.current)
         logSyncTimerRef.current = null
       }
-      recentLogKeysRef.current = new Set()
+      recentLogKeysArr.current = []
+      recentLogKeysSet.current = new Set()
       if (statsRefreshTimerRef.current) {
         clearTimeout(statsRefreshTimerRef.current)
         statsRefreshTimerRef.current = null
@@ -851,7 +867,8 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
         clearTimeout(logSyncTimerRef.current)
         logSyncTimerRef.current = null
       }
-      recentLogKeysRef.current = new Set()
+      recentLogKeysArr.current = []
+      recentLogKeysSet.current = new Set()
       botLogsRef.current = new Map()
       setBotLogs(new Map())
       if (messageBatchTimerRef.current) {
@@ -997,6 +1014,11 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
     reconnect,
   }), [connected, reconnecting, reconnectAttempt, connectionError, reconnect])
 
+  // S1 FIXED: Include all Map states in the dependency array to prevent stale references.
+  // Previously, botStatuses, deployProgresses, botLogs, and resourceData were MISSING
+  // from the dependency array, causing dataValue to hold stale Map references forever.
+  // For best performance, consumers should use the individual fine-grained context hooks
+  // (useBotStatuses, useBotLogs, etc.) instead of useBotRunnerData().
   const dataValue = useMemo<BotRunnerDataContextType>(() => ({
     botStatuses,
     deployProgresses,
@@ -1013,9 +1035,9 @@ export function BotRunnerProvider({ children }: { children: React.ReactNode }) {
     getBotLogs,
     getResourceData,
     subscribe,
-  }), [botStatuses, deployProgresses, botLogs, resourceData,
-    deployBot, stopBot, startBot, restartBot, deleteBot, requestLogs,
-    getBotStatus, getDeployProgress, getBotLogs, getResourceData, subscribe])
+  }), [botStatuses, deployProgresses, botLogs, resourceData, deployBot, stopBot,
+    startBot, restartBot, deleteBot, requestLogs, getBotStatus,
+    getDeployProgress, getBotLogs, getResourceData, subscribe])
 
   const combinedValue = useMemo<BotRunnerContextType>(() => ({
     ...connectionValue,

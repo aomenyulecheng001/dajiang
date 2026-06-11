@@ -48,7 +48,7 @@ export async function ensureDefaultAccount(): Promise<void> {
         // Previously hardcoded 'dajiang888' was predictable and made brute-force attacks easier.
         const envUsername = process.env.ADMIN_INITIAL_USERNAME
         const defaultUsername = (envUsername && envUsername.length >= 3) ? envUsername : 'dajiang888'
-        
+
         if (envPassword && envPassword.length >= 6) {
           password = envPassword
           logger.warn('auth', 'Using ADMIN_INITIAL_PASSWORD from environment variable. Change this password after first login!')
@@ -56,14 +56,23 @@ export async function ensureDefaultAccount(): Promise<void> {
           // Generate a random 16-character password using Web Crypto API
           password = Array.from(crypto.getRandomValues(new Uint8Array(12)))
             .map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 16)
-          const credFile = resolveFromProjectRoot('.admin-credentials')
-          try {
-            await writeFile(credFile,
-              `Username: ${defaultUsername}\nPassword: ${password}\n\n⚠️ CHANGE THIS PASSWORD AFTER FIRST LOGIN!\n`,
-              'utf-8')
-            logger.warn('auth', 'Initial admin credentials written to .admin-credentials file. Delete after first login.')
-          } catch {
-            logger.warn('auth', 'Could not write .admin-credentials file. Check server logs for credentials.')
+          // L14 FIXED: Only write credentials file in development — in production,
+          // the password would be logged to file/console and potentially leaked
+          // via log aggregation systems. Production deployments must use
+          // ADMIN_INITIAL_PASSWORD env var.
+          if (process.env.NODE_ENV !== 'production') {
+            const credFile = resolveFromProjectRoot('.admin-credentials')
+            try {
+              await writeFile(credFile,
+                `Username: ${defaultUsername}\nPassword: ${password}\n\n⚠️ CHANGE THIS PASSWORD AFTER FIRST LOGIN!\n`,
+                'utf-8')
+              logger.warn('auth', 'Initial admin credentials written to .admin-credentials file. Delete after first login.')
+            } catch {
+              logger.warn('auth', 'Could not write .admin-credentials file. Check server logs for credentials.')
+            }
+          } else {
+            logger.warn('auth', 'Production detected: ADMIN_INITIAL_PASSWORD not set. A random password was generated but NOT written to disk. Set ADMIN_INITIAL_PASSWORD env var for production deployments.')
+            logger.warn('auth', 'Initial admin username: ' + defaultUsername)
           }
         }
 
@@ -75,15 +84,27 @@ export async function ensureDefaultAccount(): Promise<void> {
               password: hashedPassword,
             },
           })
-        } catch (error: any) {
+        } catch (error: unknown) {
           // Handle race: another request may have created the account concurrently (P2002 = unique constraint)
-          if (error?.code !== 'P2002') throw error
+          const errCode = error instanceof Error && 'code' in error ? (error as NodeJS.ErrnoException).code : undefined
+          if (errCode !== 'P2002') throw error
         }
       }
-      // H1 FIX: Only set _accountCheckTime AFTER the successful DB check/create,
-      // not before the DB write. Previously set early which meant a
-      // failed DB write would permanently prevent account creation retries.
+      // SECURITY FIX (S4): Only set _accountCheckTime on success.
+      // Previously, _accountCheckTime was set inside the try block before the
+      // finally block cleared _accountInitPromise. If the DB write failed with
+      // a non-P2002 error, _accountCheckTime would still be set, preventing
+      // retries for 60 seconds. Now we only set it after successful completion.
       _accountCheckTime = Date.now()
+    } catch (error: unknown) {
+      // SECURITY FIX (S4): If account creation failed due to P2002 (race condition
+      // with another instance), still set the check time since the account now exists.
+      const errCode = error instanceof Error && 'code' in error ? (error as NodeJS.ErrnoException).code : undefined
+      if (errCode === 'P2002') {
+        _accountCheckTime = Date.now()
+      }
+      // For other errors, don't set _accountCheckTime — allow retry on next call
+      throw error
     } finally {
       _accountInitPromise = null
     }
@@ -117,12 +138,28 @@ export async function authenticateUser(
   if (!account || !isValid) return null
 
   try {
-    const { unlink } = await import('fs/promises')
+    const { unlink, writeFile } = await import('fs/promises')
+    const { randomBytes } = await import('crypto')
     const credPath = resolveFromProjectRoot('.admin-credentials')
-    await unlink(credPath)
-  } catch { /* File may not exist or already deleted */ }
+    try {
+      await unlink(credPath)
+    } catch {
+      // SECURITY FIX (M-2): If unlink fails, overwrite with random data first,
+      // then try to delete again. This ensures the plaintext password is not
+      // left on disk even if the file is locked or permissions prevent deletion.
+      try {
+        const randomData = randomBytes(4096).toString('hex')
+        await writeFile(credPath, randomData, 'utf-8')
+        await unlink(credPath)
+      } catch {
+        logger.error('auth', 'CRITICAL: Failed to securely delete .admin-credentials file. The file may contain plaintext credentials. Manual cleanup is REQUIRED immediately.')
+      }
+    }
+  } catch {
+    // Ignore errors from importing fs/promises or crypto
+  }
 
-  const token = createSession(account.id, account.username, account.tokenVersion)
+  const token = await createSession(account.id, account.username, account.tokenVersion)
 
   return { token, username: account.username }
 }
@@ -200,7 +237,7 @@ export async function resetPassword(
     await deleteSession(currentToken)
     // Get the updated tokenVersion from the atomic update result
     if (updatedAccount) {
-      newToken = createSession(userId, updatedAccount.username, updatedAccount.tokenVersion)
+      newToken = await createSession(userId, updatedAccount.username, updatedAccount.tokenVersion)
     }
   }
 
@@ -268,8 +305,9 @@ export async function updateUsername(
       select: { tokenVersion: true },
     })
     updatedTokenVersion = updatedAccount.tokenVersion
-  } catch (error: any) {
-    if (error?.code === 'P2002') {
+  } catch (error: unknown) {
+    const errCode = error instanceof Error && 'code' in error ? (error as NodeJS.ErrnoException).code : undefined
+    if (errCode === 'P2002') {
       return { success: false, message: 'Username is already taken' }
     }
     throw error
@@ -281,7 +319,7 @@ export async function updateUsername(
   let newToken: string | undefined
   if (currentToken) {
     await deleteSession(currentToken)
-    newToken = createSession(account.id, newUsername, updatedTokenVersion)
+    newToken = await createSession(account.id, newUsername, updatedTokenVersion)
   }
 
   return { success: true, message: 'Username updated successfully', username: newUsername, newToken }

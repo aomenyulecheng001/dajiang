@@ -62,26 +62,48 @@ export async function POST(
         return NextResponse.json({ error: 'Batch size exceeds 100 messages' }, { status: 400 })
       }
 
-      const data = msgs
-        .filter(m => typeof m.userId === 'string' && m.userId.trim())
-        .map(m => ({
+      // SECURITY FIX (M5): Validate message text length in batch path
+      // instead of silently truncating. The single-message path returns
+      // a 400 error for oversized text; the batch path should be consistent
+      // to prevent abuse via oversized payloads.
+      const data: Array<{ botId: string; userId: string; userName: string; text: string; command: string | null }> = []
+      for (let i = 0; i < msgs.length; i++) {
+        const m = msgs[i]
+        if (typeof m.userId !== 'string' || !m.userId.trim()) continue
+        if (typeof m.text === 'string' && m.text.length > MAX_TEXT_LENGTH) {
+          return NextResponse.json(
+            { error: `Message text too long at index ${i} (max ${MAX_TEXT_LENGTH} characters)` },
+            { status: 400 }
+          )
+        }
+        data.push({
           botId: id,
           userId: (m.userId as string).slice(0, MAX_USER_ID_LENGTH),
           userName: typeof m.userName === 'string' ? m.userName.slice(0, MAX_USER_NAME_LENGTH) : '',
-          text: typeof m.text === 'string' ? m.text.slice(0, MAX_TEXT_LENGTH) : '',
+          text: typeof m.text === 'string' ? m.text : '',
           command: typeof m.command === 'string' && m.command.trim() ? m.command.slice(0, MAX_COMMAND_LENGTH) : null,
-        }))
-
-      // P1-5 FIX: Apply same rate limit to batch path
-      const recentBatchCount = await db.botMessage.count({
-        where: { botId: id, timestamp: { gte: new Date(Date.now() - 60 * 60 * 1000) } },
-      })
-      if (recentBatchCount + data.length > MAX_MESSAGES_PER_HOUR) {
-        return NextResponse.json({ error: 'Rate limit exceeded' }, { status: 429 })
+        })
       }
 
-      const result = await db.botMessage.createMany({ data })
-      return NextResponse.json({ created: result.count }, { status: 201 })
+      // P1-5 FIX: Apply same rate limit to batch path
+      // SECURITY FIX (M-10): Wrap count check + createMany in a transaction with
+      // BEGIN IMMEDIATE to prevent TOCTOU race. Without this, concurrent requests
+      // can both read the same count and bypass the limit.
+      const batchResult = await db.$transaction(async (tx) => {
+        await tx.$executeRaw`UPDATE Bot SET updatedAt = updatedAt WHERE id = ${id}`
+        const recentBatchCount = await tx.botMessage.count({
+          where: { botId: id, timestamp: { gte: new Date(Date.now() - 60 * 60 * 1000) } },
+        })
+        if (recentBatchCount + data.length > MAX_MESSAGES_PER_HOUR) {
+          return { rateLimited: true as const, count: 0 }
+        }
+        const result = await tx.botMessage.createMany({ data })
+        return { rateLimited: false as const, count: result.count }
+      })
+      if (batchResult.rateLimited) {
+        return NextResponse.json({ error: 'Rate limit exceeded' }, { status: 429 })
+      }
+      return NextResponse.json({ created: batchResult.count }, { status: 201 })
     }
 
     if (!body.userId || typeof body.userId !== 'string') {
@@ -99,25 +121,33 @@ export async function POST(
       )
     }
     const messageText = typeof body.text === 'string' ? body.text : ''
-    const recentCount = await db.botMessage.count({
-      where: { botId: id, timestamp: { gte: new Date(Date.now() - 60 * 60 * 1000) } },
+    // SECURITY FIX (M-10): Wrap count check + create in a transaction with
+    // BEGIN IMMEDIATE to prevent TOCTOU race on the rate limit check.
+    const message = await db.$transaction(async (tx) => {
+      await tx.$executeRaw`UPDATE Bot SET updatedAt = updatedAt WHERE id = ${id}`
+      const recentCount = await tx.botMessage.count({
+        where: { botId: id, timestamp: { gte: new Date(Date.now() - 60 * 60 * 1000) } },
+      })
+      if (recentCount >= MAX_MESSAGES_PER_HOUR) {
+        return null
+      }
+      return tx.botMessage.create({
+        data: {
+          botId: id,
+          userId: msgUserId,
+          userName,
+          text: messageText,
+          command,
+        },
+      })
     })
-    if (recentCount >= MAX_MESSAGES_PER_HOUR) {
+
+    if (!message) {
       return NextResponse.json(
         { error: 'Rate limit: too many messages in the last hour' },
         { status: 429 }
       )
     }
-
-    const message = await db.botMessage.create({
-      data: {
-        botId: id,
-        userId: msgUserId,
-        userName,
-        text: messageText,
-        command,
-      },
-    })
 
     return NextResponse.json({
       id: message.id,

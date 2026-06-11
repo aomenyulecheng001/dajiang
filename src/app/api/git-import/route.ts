@@ -4,7 +4,8 @@ import { readdir, stat, readFile, rm, mkdir } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { lookup } from 'dns/promises'
-import { getCurrentUserId } from '@/lib/api-helpers'
+import { getCurrentUserId, getSecureClientIp } from '@/lib/api-helpers'
+import { rateLimit, RATE_LIMIT_GIT_IMPORT, getRateLimitHeaders } from '@/lib/rate-limit'
 import { logger } from '@/lib/logger'
 
 // ─── Configuration ──────────────────────────────────────────────────────────
@@ -50,12 +51,18 @@ const MAX_GIT_OUTPUT_SIZE = 1 * 1024 * 1024  // 1MB
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 function isValidGitUrl(url: string): boolean {
+  // SECURITY FIX (L-5): Only allow HTTPS URLs from whitelisted domains.
+  // SSH URLs (git@... or ssh://...) are rejected entirely because they bypass
+  // the domain whitelist and can reference internal servers not reachable via HTTPS.
   // HTTPS URLs: https://github.com/user/repo, https://gitlab.com/user/repo
   const httpsPattern = /^https:\/\/(github\.com|gitlab\.com|bitbucket\.org)\/[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+\.git\/?$/
   // HTTPS URLs without .git: https://github.com/user/repo
   const httpsShortPattern = /^https:\/\/(github\.com|gitlab\.com|bitbucket\.org)\/[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+\/?$/
-  // SSH URLs: git@github.com:user/repo.git
-  const sshPattern = /^git@(github\.com|gitlab\.com|bitbucket\.org):[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+\.git$/
+
+  // Reject SSH URLs entirely
+  if (/^git@/i.test(url) || /^ssh:\/\//i.test(url)) {
+    return false
+  }
 
   // SSRF FIX (Enhanced): Block private/internal IP ranges and cloud metadata endpoints.
   try {
@@ -64,11 +71,6 @@ function isValidGitUrl(url: string): boolean {
     const httpsMatch = url.match(/^https:\/\/([^\/]+)/)
     if (httpsMatch) {
       hostname = httpsMatch[1].toLowerCase().replace(/^\[(.*)\]$/, '$1')
-    }
-
-    const sshMatch = url.match(/^git@([^:]+):/)
-    if (sshMatch) {
-      hostname = sshMatch[1].toLowerCase()
     }
 
     if (hostname) {
@@ -113,7 +115,7 @@ function isValidGitUrl(url: string): boolean {
     return false
   }
 
-  return httpsPattern.test(url) || httpsShortPattern.test(url) || sshPattern.test(url)
+  return httpsPattern.test(url) || httpsShortPattern.test(url)
 }
 
 /** Check if an IPv4 address is in a private/reserved range */
@@ -305,6 +307,19 @@ async function getRemoteBranches(url: string, workDir: string): Promise<string[]
 // ─── GET Handler: Fetch available branches ──────────────────────────────────
 
 export async function GET(request: NextRequest) {
+  // SECURITY FIX (M4): Defense-in-depth rate limiting at route level.
+  // git clone is resource-intensive (30s timeout, filesystem I/O, DNS resolution).
+  // While middleware applies RATE_LIMIT_GIT_IMPORT, this explicit check ensures
+  // protection even if middleware is misconfigured or bypassed.
+  const clientIp = getSecureClientIp(request)
+  const rateResult = rateLimit.check(clientIp, RATE_LIMIT_GIT_IMPORT)
+  if (!rateResult.success) {
+    return NextResponse.json(
+      { success: false, error: 'Too many requests. Please try again later.' },
+      { status: 429, headers: getRateLimitHeaders(rateResult) }
+    )
+  }
+
   // SECURITY FIX (SEC-105): Defense-in-depth auth check independent of middleware.
   // git clone is resource-intensive; if middleware is ever misconfigured, this
   // prevents unauthenticated users from triggering git operations.
@@ -363,6 +378,16 @@ export async function GET(request: NextRequest) {
 // ─── POST Handler: Clone and read repo ──────────────────────────────────────
 
 export async function POST(request: NextRequest) {
+  // SECURITY FIX (M4): Defense-in-depth rate limiting at route level.
+  const postClientIp = getSecureClientIp(request)
+  const postRateResult = rateLimit.check(postClientIp, RATE_LIMIT_GIT_IMPORT)
+  if (!postRateResult.success) {
+    return NextResponse.json(
+      { success: false, error: 'Too many requests. Please try again later.' },
+      { status: 429, headers: getRateLimitHeaders(postRateResult) }
+    )
+  }
+
   // SECURITY FIX (SEC-105): Defense-in-depth auth check independent of middleware.
   const postUserId = await getCurrentUserId(request as unknown as Request)
   if (!postUserId) {
@@ -399,7 +424,7 @@ export async function POST(request: NextRequest) {
 
     if (!isValidGitUrl(url)) {
       return NextResponse.json(
-        { success: false, error: 'Invalid Git repository URL. Supported formats: https://github.com/user/repo, https://gitlab.com/user/repo, git@github.com:user/repo.git' },
+        { success: false, error: 'Invalid Git repository URL. Only HTTPS URLs from github.com, gitlab.com, or bitbucket.org are supported.' },
         { status: 400 },
       )
     }
@@ -520,8 +545,9 @@ export async function POST(request: NextRequest) {
     }
 
     if (message.includes('Permission denied') || message.includes('could not read from remote repository') || message.includes('Host key verification failed')) {
+      // SECURITY FIX (L-12): Generic error message — don't reveal SSH-specific details.
       return NextResponse.json(
-        { success: false, error: 'SSH authentication failed. The server may not have the required SSH key configured. Please use HTTPS URL instead.' },
+        { success: false, error: 'Could not access the repository. It may be private or the URL may be incorrect.' },
         { status: 403 },
       )
     }

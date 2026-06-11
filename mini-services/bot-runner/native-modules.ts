@@ -1,7 +1,6 @@
 import { logger } from './logger'
 import { spawn, execFile } from 'child_process'
 import { readFile, writeFile, stat, readdir } from 'fs/promises'
-import { readFileSync } from 'fs'
 import { join } from 'path'
 import { appendDeployLog } from './log-manager'
 
@@ -16,7 +15,11 @@ export async function testNativeModuleLoad(botDir: string): Promise<boolean> {
       const child = execFile(
         process.execPath || 'node',
         ['-e', `try { const D=require('better-sqlite3'); new D(':memory:').close(); process.exit(0) } catch(e) { process.exit(1) }`],
-        { cwd: botDir, timeout: 10000 },
+        // FIX (M4): Increase maxBuffer to 1MB. Default 200KB can overflow if
+        // better-sqlite3 outputs compilation warnings during load, causing
+        // testNativeModuleLoad to incorrectly return false and trigger
+        // unnecessary recompilation.
+        { cwd: botDir, timeout: 10000, maxBuffer: 1024 * 1024 },
       )
       child.on('exit', (code) => code === 0 ? resolve() : reject(new Error('load failed')))
       child.on('error', reject)
@@ -27,9 +30,11 @@ export async function testNativeModuleLoad(botDir: string): Promise<boolean> {
   }
 }
 
-export function getBuildToolsInstallCommand(): string {
+// M11 FIXED: Changed from sync readFileSync to async readFile to avoid
+// blocking the event loop during native module compilation.
+export async function getBuildToolsInstallCommand(): Promise<string> {
   try {
-    const osRelease = readFileSync('/etc/os-release', 'utf8')
+    const osRelease = await readFile('/etc/os-release', 'utf8')
     if (/ID=(?:ubuntu|debian)/.test(osRelease))
       return 'Ubuntu/Debian: sudo apt update && sudo apt install -y build-essential python3'
     if (/ID=(?:centos|rhel|rocky|alinux)/.test(osRelease))
@@ -102,10 +107,12 @@ async function findSqlite3Dir(nmPath: string): Promise<string | null> {
  */
 function compileSqlite3(sqlite3Dir: string, botId: string, timeout: number): Promise<boolean> {
   return new Promise((resolve) => {
-    const child = spawn('npx', ['--yes', 'node-gyp', 'rebuild', '--release'], {
+    const npxCmd = process.platform === 'win32' ? 'npx.cmd' : 'npx'
+    const child = spawn(npxCmd, ['--yes', 'node-gyp', 'rebuild', '--release'], {
       cwd: sqlite3Dir,
       timeout,
       stdio: ['pipe', 'pipe', 'pipe'],
+      shell: false,
     })
 
     let stderr = ''
@@ -144,7 +151,7 @@ export async function rebuildNativeModules(botId: string, botDir: string): Promi
 
   appendDeployLog(botId, '🔧 检测到原生模块 better-sqlite3 需要编译...')
 
-  const buildHint = getBuildToolsInstallCommand()
+  const buildHint = await getBuildToolsInstallCommand()
 
   // Compile using node-gyp directly
   const ok = await compileSqlite3(sqlite3Dir, botId, 120000)
@@ -206,7 +213,7 @@ export async function runPrismaGenerate(botId: string, botDir: string): Promise<
       cwd: botDir,
       timeout: 60000,
       stdio: ['pipe', 'pipe', 'pipe'],
-      shell: process.platform === 'win32',
+      shell: false,
     })
 
     let stderr = ''

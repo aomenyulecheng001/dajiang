@@ -8,8 +8,8 @@ import { Badge } from '@/components/ui/badge'
 import { Card, CardContent } from '@/components/ui/card'
 import { cn, isValidBotToken, formatUptimeShort } from '@/lib/utils'
 import { useBotRunnerConnection, useBotRunnerActions } from '@/lib/bot-runner-context'
-import { useBotStore } from '@/store/bot-store'
-import { useT, useI18nStore } from '@/lib/i18n'
+import { useBotStore, useBot } from '@/store/bot-store'
+import { useT, useI18nStore, type TranslationKey } from '@/lib/i18n'
 import { toast } from 'sonner'
 import { fetchRevealEnvVars, hasMaskedEnvVars, buildEnvVarsFallback, buildDeployConfig } from '@/lib/deploy-utils'
 import { authFetch } from '@/store/bot-store'
@@ -33,7 +33,9 @@ export function RuntimeControl({ botId, botName, botLanguage, botTemplate }: { b
     restartBot,
   } = useBotRunnerActions()
 
-  const bot = useBotStore((s) => s.bots.find((b) => b.id === botId))
+  // FIX (S1): Use useBot hook instead of inline bots.find() selector to avoid
+  // unnecessary re-renders when unrelated bots change.
+  const bot = useBot(botId)
   const [mounted, setMounted] = useState(false)
   const [isExpanded, setIsExpanded] = useState(false)
   const [isStartingService, setIsStartingService] = useState(false)
@@ -50,9 +52,12 @@ export function RuntimeControl({ botId, botName, botLanguage, botTemplate }: { b
     }
   }, [localPending])
 
-  // Read bot token from envVars — support both BOT_TOKEN and TELEGRAM_BOT_TOKEN
-  const tokenEntry = bot?.envVars.filter((v) => (v.key === 'BOT_TOKEN' || v.key === 'TELEGRAM_BOT_TOKEN') && v.value.trim()).slice(-1)[0]
-    || bot?.envVars.find((v) => v.key === 'BOT_TOKEN' || v.key === 'TELEGRAM_BOT_TOKEN')
+  // FIX (L3): Simplified token lookup — prefer entry with non-empty value,
+  // fall back to any matching entry. Previous version used filter+slice+find
+  // which was hard to read and inconsistent with bot-card.tsx.
+  const tokenKeys = ['BOT_TOKEN', 'TELEGRAM_BOT_TOKEN'] as const
+  const tokenEntry = bot?.envVars.find((v) => tokenKeys.includes(v.key as typeof tokenKeys[number]) && v.value.trim())
+    ?? bot?.envVars.find((v) => tokenKeys.includes(v.key as typeof tokenKeys[number]))
   const botToken = tokenEntry?.value || ''
 
   const serverTokenStatus = bot?.tokenStatus
@@ -526,7 +531,7 @@ export function RuntimeControl({ botId, botName, botLanguage, botTemplate }: { b
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function renderTokenBadge(serverTokenStatus: string | undefined, botToken: string, t: (key: any) => string) {
+function renderTokenBadge(serverTokenStatus: string | undefined, botToken: string, t: (key: TranslationKey) => string) {
   if (serverTokenStatus === 'valid') {
     return <Badge variant="outline" className="text-[10px] h-5 bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/20">{t('runtime.tokenValid')}</Badge>
   }

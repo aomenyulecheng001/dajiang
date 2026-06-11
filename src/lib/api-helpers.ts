@@ -17,7 +17,11 @@ const SESSION_COOKIE_NAME = 'session_token'
  */
 export async function parseJsonBody(
   request: Request,
-  maxSize = 25_000_000,
+  // SECURITY FIX (S5): Reduced default max size from 25MB to 1MB.
+  // 25MB was excessive for API payloads and could be exploited for DoS.
+  // Bot creation/update routes that need larger payloads (projectFiles)
+  // should explicitly pass a larger maxSize.
+  maxSize = 1_000_000,
 ): Promise<Record<string, unknown> | NextResponse> {
   let text: string
   try {
@@ -173,7 +177,7 @@ export async function getCurrentUserId(request: Request): Promise<string | null>
  */
 export function serializeBotListResponse(bot: Record<string, unknown>): Record<string, unknown> {
   // SECURITY FIX: Parse config but strip webhookSecret — it should never appear in API responses
-  const configObj = safeJsonParse(bot.config as string, {}) as Record<string, unknown>
+  const configObj = safeJsonParse(ensureString(bot.config), {}) as Record<string, unknown>
   delete configObj.webhookSecret
 
   // SECURITY FIX: Exclude webhookSecret and envVars from top-level response
@@ -181,16 +185,16 @@ export function serializeBotListResponse(bot: Record<string, unknown>): Record<s
 
   return {
     ...safeBot,
-    codeBlocks: safeJsonParse(bot.codeBlocks as string, []),
-    dependencies: safeJsonParse(bot.dependencies as string, []),
+    codeBlocks: safeJsonParse(ensureString(bot.codeBlocks), []),
+    dependencies: safeJsonParse(ensureString(bot.dependencies), []),
     // envVars excluded from list query — fetched in detail view
     config: configObj,
-    stats: safeJsonParse(bot.stats as string, {}),
+    stats: safeJsonParse(ensureString(bot.stats), {}),
     // projectFiles excluded from list query — fetched in detail view
-    entryPoint: (bot.entryPoint as string) || undefined,
+    entryPoint: ensureString(bot.entryPoint) || undefined,
     // BUG FIX: Include lastDeployedAt so bot cards can show "needs restart" badge
     lastDeployedAt: bot.lastDeployedAt instanceof Date ? bot.lastDeployedAt.toISOString() : (bot.lastDeployedAt as string || undefined),
-    lastRunnerStatus: (bot.lastRunnerStatus as string) || undefined,
+    lastRunnerStatus: ensureString(bot.lastRunnerStatus) || undefined,
     // Token status not computed for list view
     tokenStatus: 'not_set' as const,
     tokenPreview: undefined,
@@ -205,7 +209,13 @@ export function serializeBotListResponse(bot: Record<string, unknown>): Record<s
  *  SECURITY FIX: Redacts sensitive data (tokens, secrets, keys) from the
  *  error preview before logging. Previously the raw first 100 characters
  *  of failed JSON were logged, which could include plaintext BOT_TOKEN values
- *  when envVars or config JSON parsing failed. */
+ *  when envVars or config JSON parsing failed.
+ *  SECURITY FIX (L3): Added ensureString helper to avoid unsafe `as string`
+ *  type assertions on values that may not actually be strings. */
+function ensureString(value: unknown, fallback: string = ''): string {
+  return typeof value === 'string' ? value : fallback
+}
+
 export function safeJsonParse<T>(str: string | null | undefined, fallback: T, fieldName?: string): T {
   if (!str) return fallback
   try {
@@ -285,7 +295,7 @@ export async function serializeBotResponse(
   decryptEnvVarsMaskedAsync: (envVars: { key: string; value: string; isEncrypted?: boolean }[]) => Promise<unknown[]>,
   decryptEnvVarsAsync?: (envVars: { key: string; value: string; isEncrypted?: boolean }[]) => Promise<unknown[]>,
 ): Promise<Record<string, unknown>> {
-  const envVars = safeJsonParse(bot.envVars as string, [])
+  const envVars = safeJsonParse(ensureString(bot.envVars), [])
 
   // Server-side token validation: decrypt the real token, validate, generate preview
   let tokenStatus: 'valid' | 'invalid' | 'not_set' = 'not_set'
@@ -309,7 +319,7 @@ export async function serializeBotResponse(
   }
 
   // SECURITY FIX: Parse config but strip webhookSecret — it should never appear in API responses
-  const configObj = safeJsonParse(bot.config as string, {}) as Record<string, unknown>
+  const configObj = safeJsonParse(ensureString(bot.config), {}) as Record<string, unknown>
   delete configObj.webhookSecret
 
   // SECURITY FIX: Exclude webhookSecret from top-level response
@@ -317,16 +327,16 @@ export async function serializeBotResponse(
 
   return {
     ...safeBot,
-    codeBlocks: safeJsonParse(bot.codeBlocks as string, []),
-    dependencies: safeJsonParse(bot.dependencies as string, []),
+    codeBlocks: safeJsonParse(ensureString(bot.codeBlocks), []),
+    dependencies: safeJsonParse(ensureString(bot.dependencies), []),
     envVars: await decryptEnvVarsMaskedAsync(envVars),
     config: configObj,
-    stats: safeJsonParse(bot.stats as string, {}),
-    projectFiles: safeJsonParse(bot.projectFiles as string, []),
-    entryPoint: (bot.entryPoint as string) || undefined,
+    stats: safeJsonParse(ensureString(bot.stats), {}),
+    projectFiles: safeJsonParse(ensureString(bot.projectFiles), []),
+    entryPoint: ensureString(bot.entryPoint) || undefined,
     // BUG FIX: Convert empty strings to undefined to match frontend type contract
     lastDeployedAt: bot.lastDeployedAt instanceof Date ? bot.lastDeployedAt.toISOString() : (bot.lastDeployedAt as string || undefined),
-    lastRunnerStatus: (bot.lastRunnerStatus as string) || undefined,
+    lastRunnerStatus: ensureString(bot.lastRunnerStatus) || undefined,
     tokenStatus,
     tokenPreview,
   }

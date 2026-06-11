@@ -1,12 +1,48 @@
 import { rm } from 'fs/promises'
-import { join } from 'path'
+import { join, resolve } from 'path'
 import { Server } from 'socket.io'
 import type { BotProcess, BotConfig, DeployStage } from './types'
-import { getBotDir, loadBotConfigAsync, sanitizeBotId, CONFIG_DIR } from './utils'
-import { MAX_LOG_LINES, LOGS_DIR } from './log-manager'
+import { getBotDir, loadBotConfigAsync, sanitizeBotId, CONFIG_DIR, detectPortFromEnv } from './utils'
+import { MAX_LOG_LINES, LOGS_DIR, cleanupBotLogState } from './log-manager'
 import { deployBot } from './deploy'
 import { cancelRestartTimer, markIntentionalStop, clearIntentionalStop, intentionalStopSet, memoryKilledSet, cleanupPidFile } from './process-manager'
 import { logger } from './logger'
+
+// ⚠️ CANONICAL SOURCE: src/lib/security-utils.ts
+// ⚠️ SYNC REQUIRED: When updating patterns, also update:
+//   - mini-services/bot-runner/handlers.ts (SENSITIVE_ENV_PATTERNS)
+//   - mini-services/bot-runner/log-manager.ts (SENSITIVE_PATTERNS)
+const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIKEY', 'API_KEY', 'ACCESS_KEY', 'PRIVATE', 'CREDENTIAL', 'DATABASE_URL'] as const
+
+// FIX (M6): Validate that paths constructed from botId stay within expected
+// directories before deleting. This prevents accidental file deletion if
+// sanitizeBotId's rules are ever relaxed or bypassed.
+function safeDeletePath(baseDir: string, botId: string, suffix: string): string | null {
+  const filePath = join(baseDir, `${botId}${suffix}`)
+  const resolvedPath = resolve(filePath)
+  const resolvedBase = resolve(baseDir)
+  if (!resolvedPath.startsWith(resolvedBase + '/') && !resolvedPath.startsWith(resolvedBase + '\\') && resolvedPath !== resolvedBase) {
+    logger.error('handlers', `Path traversal blocked in delete: ${filePath} escapes ${baseDir}`)
+    return null
+  }
+  return resolvedPath
+}
+
+// ─── Socket.IO Rate Limiting ──────────────────────────────────────────────
+const socketRateLimits = new Map<string, { count: number; windowStart: number }>()
+const SOCKET_RATE_MAX = 10
+const SOCKET_RATE_WINDOW_MS = 1000
+
+function checkSocketRate(socketId: string): boolean {
+  const now = Date.now()
+  const entry = socketRateLimits.get(socketId)
+  if (!entry || now - entry.windowStart >= SOCKET_RATE_WINDOW_MS) {
+    socketRateLimits.set(socketId, { count: 1, windowStart: now })
+    return true
+  }
+  entry.count++
+  return entry.count <= SOCKET_RATE_MAX
+}
 
 // ─── Deploy Concurrency Control ──────────────────────────────────────────────
 // BUG FIX: Use Map with abort flag instead of Set, so we can cancel in-progress
@@ -94,32 +130,38 @@ export function registerHandlers(
   botProcesses: Map<string, BotProcess>,
   deployStatus: Map<string, { stage: DeployStage; progress: number; error?: string; logs: string[] }>,
   startBotProcess: (botId: string) => Promise<void>,
-  stopBotProcess: (botId: string) => void,
+  // S3 FIXED: Signature updated — stopBotProcess is now async (Promise<void>)
+  stopBotProcess: (botId: string) => Promise<void>,
 ): void {
 
   io.on('connection', (socket) => {
     logger.info('socket', `Client connected: ${socket.id}`)
 
     // Send current state (filter out sensitive env var keys from client)
-    // CANONICAL SOURCE: Keep in sync with src/lib/security-utils.ts SENSITIVE_ENV_KEY_PATTERNS.
+    // ⚠️ CANONICAL SOURCE: Keep in sync with src/lib/security-utils.ts SENSITIVE_ENV_KEY_PATTERNS.
     // Any changes here should be mirrored there and vice versa.
-const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIKEY', 'API_KEY', 'ACCESS_KEY', 'PRIVATE', 'CREDENTIAL', 'DATABASE_URL']
+
+    // M1 FIXED: More precise sensitive key detection. Previously used sub-string
+    // matching (includes) which could miss patterns. Now checks if the key
+    // contains a sensitive pattern as a full word or compound segment.
+    const isSensitiveKey = (key: string): boolean => {
+      const upper = key.toUpperCase()
+      return SENSITIVE_ENV_PATTERNS.some(p => {
+        const idx = upper.indexOf(p)
+        if (idx === -1) return false
+        // Check character before match: must be start-of-string or underscore
+        if (idx > 0 && upper[idx - 1] !== '_') return false
+        // Check character after match: must be end-of-string or underscore
+        const afterIdx = idx + p.length
+        if (afterIdx < upper.length && upper[afterIdx] !== '_') return false
+        return true
+      })
+    }
 
     // Helper: get port from bot (detected or config fallback)
     const getBotPort = (bot: BotProcess): number | undefined => {
       if (bot.port) return bot.port
-      // Fallback: check env vars for PORT-like keys
-      const portKeys = ['PORT', 'HTTP_PORT', 'WEBHOOK_PORT', 'SERVER_PORT', 'LISTEN_PORT']
-      for (const key of portKeys) {
-        const val = bot.envVars?.[key]
-        if (val) {
-          const parsed = parseInt(val, 10)
-          if (Number.isFinite(parsed) && parsed > 0 && parsed < 65536) {
-            return parsed
-          }
-        }
-      }
-      return undefined
+      return detectPortFromEnv(bot.envVars)
     }
 
     socket.emit('init', {
@@ -134,14 +176,13 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
         stoppedAt: bot.stoppedAt,
         exitCode: bot.exitCode,
         error: bot.error,
-        envVars: Object.keys(bot.envVars).filter(k =>
-          !SENSITIVE_ENV_PATTERNS.some(p => k.toUpperCase().includes(p))
-        ),
+        envVars: Object.keys(bot.envVars).filter(k => !isSensitiveKey(k)),
       })),
     })
 
     // Deploy a bot
     socket.on('bot:deploy', async (data: { botId: string; config: BotConfig }) => {
+      if (!checkSocketRate(socket.id)) { socket.emit('error', { message: 'Rate limit exceeded' }); return }
       // P1-4 FIX: Validate botId
       if (!isValidBotId(data.botId)) {
         socket.emit('bot:status', { botId: data.botId, status: 'error', error: 'Invalid bot ID format' })
@@ -174,7 +215,7 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
         const message = err instanceof Error ? err.message : String(err)
         logger.error('deploy', `${data.config.name} (${botId}) failed`, message)
         io.emit('bot:status', { botId, status: 'error', error: message })
-        io.emit('deploy:progress', { botId, stage: 'error' as DeployStage, progress: 0, logs: [`❌ 部署失败: ${message}`] })
+        io.emit('deploy:progress', { botId, stage: 'error' as DeployStage, progress: 0, logs: [`❌ Deploy failed: ${message}`] })
       } finally {
         // Only clean up if we're still the active deploy (not replaced by a newer one)
         if (activeDeploys.get(botId) === abortCtrl) {
@@ -185,6 +226,7 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
 
     // Stop a bot
     socket.on('bot:stop', (data: { botId: string }) => {
+      if (!checkSocketRate(socket.id)) { socket.emit('error', { message: 'Rate limit exceeded' }); return }
       if (!isValidBotId(data.botId)) return
       const botId = safeSanitizeBotId(data.botId)
       if (!botId) return
@@ -197,11 +239,12 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
 
       // BUG FIX: Cancel auto-restart timer and mark intentional stop on manual stop
       cancelRestartTimer(botId)
-      stopBotProcess(botId)
+      stopBotProcess(botId).catch(e => logger.error('bot:stop', `stopBotProcess error for ${botId}`, e instanceof Error ? e.message : String(e)))
     })
 
     // Start a bot (if already deployed)
     socket.on('bot:start', async (data: { botId: string }) => {
+      if (!checkSocketRate(socket.id)) { socket.emit('error', { message: 'Rate limit exceeded' }); return }
       if (!isValidBotId(data.botId)) {
         socket.emit('bot:status', { botId: data.botId, status: 'error', error: 'Invalid bot ID format' })
         return
@@ -211,6 +254,8 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
         socket.emit('bot:status', { botId: data.botId, status: 'error', error: 'Invalid bot ID' })
         return
       }
+      // FIX (S-6): Wrap async handler body in try/catch to prevent unhandled rejection
+      try {
       logger.info('start', botId)
 
       // BUG FIX: Cancel any pending auto-restart timer before manual start.
@@ -231,10 +276,16 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
       } else {
         socket.emit('bot:status', { botId, status: 'error', error: 'Bot not found. Please deploy first.' })
       }
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err)
+        logger.error('start', `Error starting bot ${botId}: ${message}`)
+        socket.emit('bot:status', { botId, status: 'error', error: message })
+      }
     })
 
     // Restart a bot
     socket.on('bot:restart', async (data: { botId: string }) => {
+      if (!checkSocketRate(socket.id)) { socket.emit('error', { message: 'Rate limit exceeded' }); return }
       if (!isValidBotId(data.botId)) {
         socket.emit('bot:status', { botId: data.botId, status: 'error', error: 'Invalid bot ID format' })
         return
@@ -244,6 +295,8 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
         socket.emit('bot:status', { botId: data.botId, status: 'error', error: 'Invalid bot ID' })
         return
       }
+      // FIX (S-6): Wrap async handler body in try/catch to prevent unhandled rejection
+      try {
       logger.info('restart', botId)
 
       // BUG FIX: Cancel any pending auto-restart timer to prevent double-start
@@ -259,7 +312,7 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
       const bot = botProcesses.get(botId)
       const hadProcess = !!bot?.process
 
-      stopBotProcess(botId)
+      await stopBotProcess(botId)
 
       // BUG FIX: Use event-driven restart instead of fixed 3s timer.
       // The old approach had a race condition: if the process exited quickly
@@ -301,19 +354,27 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
           await startBotProcess(botId)
         }
       }
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err)
+        logger.error('restart', `Error restarting bot ${botId}: ${message}`)
+        socket.emit('bot:status', { botId, status: 'error', error: message })
+      }
     })
 
     // Delete a bot
     socket.on('bot:delete', (data: { botId: string }) => {
+      if (!checkSocketRate(socket.id)) { socket.emit('error', { message: 'Rate limit exceeded' }); return }
       if (!isValidBotId(data.botId)) return
       const botId = safeSanitizeBotId(data.botId)
       if (!botId) return
+      // FIX (S-6): Wrap handler body in try/catch to prevent unhandled rejection
+      try {
       logger.info('delete', botId)
       // BUG FIX: Cancel auto-restart timer before stopping for delete
       cancelRestartTimer(botId)
       // Also cancel any in-progress deploy
       cancelActiveDeploy(botId)
-      stopBotProcess(botId)
+      stopBotProcess(botId).catch(e => logger.error('bot:delete', `stopBotProcess error for ${botId}`, e instanceof Error ? e.message : String(e)))
 
       // P2-BR-11 FIX: Wait for process to exit, then check it wasn't re-deployed before deleting files
       let deleteCalled = false
@@ -327,30 +388,39 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
         }
         const botDir = getBotDir(botId)
         // Clean up PID file first (prevents ghost port conflicts on restart)
-        try { cleanupPidFile(botDir) } catch { /* ignore */ }
+        try { await cleanupPidFile(botDir) } catch { /* ignore */ }
         await rm(botDir, { recursive: true, force: true }).catch(() => {})
-        await rm(join(CONFIG_DIR, `${botId}.json`), { force: true }).catch(() => {})
-        await rm(join(LOGS_DIR, `${botId}.log`), { force: true }).catch(() => {})
-        // FIX: Also delete .running marker file to prevent ghost auto-start on service restart
-        await rm(join(CONFIG_DIR, `${botId}.running`), { force: true }).catch(() => {})
+        // FIX (M6): Validate paths before deletion to prevent traversal
+        const configPath = safeDeletePath(CONFIG_DIR, botId, '.json')
+        const logPath = safeDeletePath(LOGS_DIR, botId, '.log')
+        const runningPath = safeDeletePath(CONFIG_DIR, botId, '.running')
+        if (configPath) await rm(configPath, { force: true }).catch(() => {})
+        if (logPath) await rm(logPath, { force: true }).catch(() => {})
+        if (runningPath) await rm(runningPath, { force: true }).catch(() => {})
         botProcesses.delete(botId)
         deployStatus.delete(botId)
         // Clean up tracking sets to prevent memory leak and stale state
         intentionalStopSet.delete(botId)
         memoryKilledSet.delete(botId)
+        cleanupBotLogState(botId)
         io.emit('bot:deleted', { botId })
       }
 
       // Use event-driven approach: listen for process close event with timeout fallback
       const bot = botProcesses.get(botId)
       if (bot?.process) {
-        const closeTimeout = setTimeout(deleteFiles, 5000)
+        const closeTimeout = setTimeout(() => deleteFiles().catch(e => logger.error('delete', `deleteFiles timeout error for ${botId}`, e instanceof Error ? e.message : String(e))), 5000)
         bot.process.once('close', () => {
           clearTimeout(closeTimeout)
-          deleteFiles()
+          deleteFiles().catch(e => logger.error('delete', `deleteFiles close error for ${botId}`, e instanceof Error ? e.message : String(e)))
         })
       } else {
-        deleteFiles()
+        deleteFiles().catch(e => logger.error('delete', `deleteFiles error for ${botId}`, e instanceof Error ? e.message : String(e)))
+      }
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err)
+        logger.error('delete', `Error deleting bot ${botId}: ${message}`)
+        socket.emit('bot:status', { botId, status: 'error', error: message })
       }
     })
 
@@ -429,6 +499,7 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
 
     socket.on('disconnect', () => {
       logger.info('socket', `Client disconnected: ${socket.id}`)
+      socketRateLimits.delete(socket.id)
     })
 
     // ── PM2-style process management events ──────────────────────────────
@@ -470,7 +541,7 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
         const bot = botProcesses.get(botId)
         const hadProcess = !!bot?.process
 
-        stopBotProcess(botId)
+        await stopBotProcess(botId)
 
         // BUG FIX: Use event-driven restart (same as bot:restart)
         if (hadProcess && bot?.process) {
@@ -526,7 +597,7 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
         // Cancel any in-progress deploy and auto-restart timer
         cancelActiveDeploy(botId)
         cancelRestartTimer(botId)
-        stopBotProcess(botId)
+        stopBotProcess(botId).catch(e => logger.error('pm2:stop', `stopBotProcess error for ${botId}`, e instanceof Error ? e.message : String(e)))
         callback?.({ success: true })
       } catch (err: unknown) {
         callback?.({ success: false, error: err instanceof Error ? err.message : String(err) })
@@ -549,7 +620,7 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
         cancelRestartTimer(botId)
         cancelActiveDeploy(botId)
         const bot = botProcesses.get(botId)
-        stopBotProcess(botId)
+        stopBotProcess(botId).catch(e => logger.error('pm2:delete', `stopBotProcess error for ${botId}`, e instanceof Error ? e.message : String(e)))
 
         // P2-BR-13 FIX: Listen for process 'close' event with timeout fallback
         let deleteCalled = false
@@ -562,18 +633,26 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
             callback?.({ success: false, error: 'Bot was restarted during deletion' })
             return
           }
+          // FIX (S-7): Check if a deploy is in progress — don't delete files
+          // while a deploy is actively writing to the bot directory.
+          if (activeDeploys.has(botId)) {
+            logger.info('pm2-delete', `Bot ${botId} has active deploy, skipping file deletion`)
+            callback?.({ success: false, error: 'Bot has active deploy' })
+            return
+          }
           // Clean up all disk artifacts
           const botDir = getBotDir(botId)
-          const configPath = join(CONFIG_DIR, `${botId}.json`)
-          const logPath = join(LOGS_DIR, `${botId}.log`)
-          const runningPath = join(CONFIG_DIR, `${botId}.running`)
+          // FIX (M6): Validate paths before deletion to prevent traversal
+          const configPath = safeDeletePath(CONFIG_DIR, botId, '.json')
+          const logPath = safeDeletePath(LOGS_DIR, botId, '.log')
+          const runningPath = safeDeletePath(CONFIG_DIR, botId, '.running')
 
           // Clean up PID file first (prevents ghost port conflicts on restart)
-          try { cleanupPidFile(botDir) } catch { /* ignore */ }
+          try { await cleanupPidFile(botDir) } catch { /* ignore */ }
           await rm(botDir, { recursive: true, force: true }).catch(() => {})
-          await rm(configPath, { force: true }).catch(() => {})
-          await rm(logPath, { force: true }).catch(() => {})
-          await rm(runningPath, { force: true }).catch(() => {})
+          if (configPath) await rm(configPath, { force: true }).catch(() => {})
+          if (logPath) await rm(logPath, { force: true }).catch(() => {})
+          if (runningPath) await rm(runningPath, { force: true }).catch(() => {})
 
           // Remove from memory
           botProcesses.delete(botId)
@@ -581,6 +660,7 @@ const SENSITIVE_ENV_PATTERNS = ['BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIK
           // Clean up tracking sets to prevent memory leak and stale state
           intentionalStopSet.delete(botId)
           memoryKilledSet.delete(botId)
+          cleanupBotLogState(botId)
 
           logger.info('pm2-delete', `${botId} fully removed (memory + disk)`)
           // FIX: Broadcast bot:deleted to all clients (not just the requester)

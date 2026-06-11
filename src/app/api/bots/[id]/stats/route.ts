@@ -49,8 +49,13 @@ export async function GET(
       return NextResponse.json({ error: 'Bot not found' }, { status: 404 })
     }
 
+    // P6 FIX: On cache hit, delete and re-insert to move the key to the end
+    // of the Map insertion order (approximate LRU). Without this, frequently
+    // accessed entries can be evicted before cold entries inserted earlier.
     const cached = statsCache.get(botId)
     if (cached && Date.now() < cached.expiresAt) {
+      statsCache.delete(botId)
+      statsCache.set(botId, cached)
       return NextResponse.json(cached.data)
     }
 
@@ -126,11 +131,15 @@ export async function GET(
       topCommands: topCommandsResult,
     }
 
-    if (statsCache.size >= MAX_CACHE_SIZE) {
+    // P4 FIX: Insert first, then evict if over limit. Previously, the
+    // check-then-set pattern was non-atomic — two concurrent requests could
+    // both see size < MAX and both insert, exceeding the limit. By inserting
+    // first and evicting after, we guarantee at most one entry over the limit.
+    statsCache.set(botId, { data: result, expiresAt: Date.now() + STATS_CACHE_TTL })
+    if (statsCache.size > MAX_CACHE_SIZE) {
       const firstKey = statsCache.keys().next().value
       if (firstKey) statsCache.delete(firstKey)
     }
-    statsCache.set(botId, { data: result, expiresAt: Date.now() + STATS_CACHE_TTL })
 
     return NextResponse.json(result)
   } catch (error) {

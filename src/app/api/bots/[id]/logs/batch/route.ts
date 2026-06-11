@@ -100,13 +100,17 @@ export async function POST(
       entries.push({ botId: id, level, message, source })
     }
 
-    const createdLogs = await db.$transaction(async (tx) => {
-      const before = new Date()
-      const result = await tx.botLog.createMany({ data: entries })
-      return tx.botLog.findMany({
-        where: { botId: id, timestamp: { gte: before } },
-        orderBy: { id: 'asc' },
-      })
+    // SECURITY FIX (M7): Move findMany outside the transaction to reduce
+    // SQLite write lock duration. createMany is the only write operation;
+    // the subsequent findMany is a read that doesn't need to be atomic
+    // with the write. Holding the lock during findMany blocks other writers
+    // unnecessarily, especially under concurrent batch logging.
+    const before = new Date()
+    await db.botLog.createMany({ data: entries })
+    const createdLogs = await db.botLog.findMany({
+      where: { botId: id, timestamp: { gte: before } },
+      orderBy: { id: 'asc' },
+      take: entries.length,
     })
 
     for (const log of createdLogs) {

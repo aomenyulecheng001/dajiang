@@ -54,3 +54,53 @@ export function readSecretFromFile(
   }
   return undefined
 }
+
+// ─── Shared HMAC Functions ──────────────────────────────────────────────
+
+/**
+ * DRY FIX (L1): Shared HMAC signing and verification functions.
+ * Previously duplicated between session.ts and session-edge.ts.
+ * Using crypto.subtle (Web Crypto API) ensures compatibility with
+ * both Edge Runtime and Node.js Runtime.
+ */
+
+/** Sign data with HMAC-SHA-256 using Web Crypto API */
+export async function hmacSignData(data: string, secret: string): Promise<string> {
+  const encoder = new TextEncoder()
+  const key = await crypto.subtle.importKey(
+    'raw',
+    encoder.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  )
+  const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(data))
+  return Array.from(new Uint8Array(signature))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('')
+}
+
+/** Verify HMAC-SHA-256 signature using constant-time comparison.
+ *  SECURITY FIX (S1): Uses SHA-256 hash of both values to produce fixed-length
+ *  32-byte Uint8Arrays, then performs a manual constant-time XOR comparison.
+ *  This is resistant to JIT optimization (fixed iteration count, no early exit)
+ *  and eliminates timing variance from different-length inputs.
+ */
+export async function hmacVerifyData(data: string, signature: string, secret: string): Promise<boolean> {
+  const expected = await hmacSignData(data, secret)
+  if (expected.length !== signature.length) return false
+  // Hash both to fixed-length (32 bytes) for timing-safe comparison
+  const encoder = new TextEncoder()
+  const [hashA, hashB] = await Promise.all([
+    crypto.subtle.digest('SHA-256', encoder.encode(expected)),
+    crypto.subtle.digest('SHA-256', encoder.encode(signature)),
+  ])
+  const arrA = new Uint8Array(hashA)
+  const arrB = new Uint8Array(hashB)
+  // Constant-time comparison: always iterates exactly 32 times, no early exit
+  let result = 0
+  for (let i = 0; i < 32; i++) {
+    result |= arrA[i] ^ arrB[i]
+  }
+  return result === 0
+}

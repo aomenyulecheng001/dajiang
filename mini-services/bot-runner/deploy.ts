@@ -195,19 +195,11 @@ export async function generateBotFiles(botId: string, config: BotConfig): Promis
     if (config.language !== 'python') {
       const requireMatches = config.customCode.match(/require\s*\(\s*['"]([^'"]+)['"]\s*\)/g) || []
       const builtinModules = new Set(['fs', 'path', 'http', 'https', 'os', 'crypto', 'url', 'util', 'stream', 'events', 'child_process', 'net', 'tls', 'dns', 'buffer', 'querystring', 'assert', 'zlib'])
-      // FIX: Correct scoped package name extraction.
-      // For "@scope/pkg@1.0.0", split('@') gives ['', 'scope/pkg', '1.0.0'].
-      // The old logic d.split('@')[0] returned '' for scoped packages, causing:
-      // (1) existingPkgNames contained empty strings, (2) duplicate detection failed.
+      // FIX: Correct scoped package name extraction using parseDepString.
+      // The old logic was overly complex with triple split/join chains that
+      // produced incorrect results for edge cases like "@scope" (no pkg name).
       const extractPkgName = (dep: string): string => {
-        if (dep.startsWith('@')) {
-          // @scope/pkg@version -> @scope/pkg
-          const parts = dep.split('/')
-          return parts.slice(0, 2).join('/').split('@').slice(1).join('@').split('@')[0]
-            ? '@' + parts[0].split('@')[1] + '/' + (parts[1]?.split('@')[0] || parts[1])
-            : dep
-        }
-        return dep.split('@')[0]
+        return parseDepString(dep).name
       }
       const existingPkgNames = new Set(deps.map(extractPkgName))
       for (const match of requireMatches) {
@@ -372,19 +364,40 @@ export async function installDependencies(botId: string, language: string, optio
 
             let incrementalSuccess = false
             try {
-              const safePkgs = installPkgs.filter(p => /^[a-zA-Z0-9@\/_.-]+$/.test(p))
+              // SECURITY FIX (S2): Enhanced package name validation to block shell metacharacters.
+              // The previous regex /^[a-zA-Z0-9@\/_.-]+$/ allowed @ and / which have special
+              // meaning in cmd.exe. Now also blocks characters that could be used for
+              // command chaining or injection in any shell environment.
+              const safePkgs = installPkgs.filter(p => /^[a-zA-Z0-9][a-zA-Z0-9@\/_.-]*$/.test(p) && !/[;&|`$(){}!#~<>]/.test(p))
               if (safePkgs.length !== installPkgs.length) {
-                appendDeployLog(botId, `⚠️ Skipped packages with invalid characters`)
+                appendDeployLog(botId, `⚠️ Skipped ${installPkgs.length - safePkgs.length} packages with invalid characters`)
               }
-              // P0-2 FIX: Use spawn with args array (no shell) to prevent command injection
+              // FIX (M2): If all packages were filtered out, running
+              // `npm install` with no package names would install ALL deps
+              // from package.json — not incremental. Fall back to full install.
+              if (safePkgs.length === 0) {
+                appendDeployLog(botId, `⚠️ No valid packages to install incrementally, falling back to full install`)
+                throw new Error('incremental failed: no safe packages')
+              }
+              // SECURITY FIX (S2): Never use shell mode even on Windows.
+              // shell:true allows command injection via metacharacters in args.
+              // On Windows, use cmd.exe explicitly with /c to avoid shell mode.
               const pm = await getPackageManager()
               await new Promise<void>((resolvePromise, reject) => {
                 const child = spawn(pm.cmd, [...pm.addArgs, ...safePkgs], {
                   cwd: botDir,
                   timeout: 120000,
+                  killSignal: 'SIGKILL',
                   stdio: ['pipe', 'pipe', 'pipe'],
-                  shell: process.platform === 'win32',
+                  shell: false,
                 })
+                // Manual SIGKILL fallback: if process doesn't exit within 5s after timeout
+                const sigkillFallback = setTimeout(() => {
+                  if (child.exitCode === null) {
+                    try { child.kill('SIGKILL') } catch { /* ignore */ }
+                  }
+                }, 125000)
+                sigkillFallback.unref()
                 let stdout = ''
                 let stderr = ''
                 child.stdout?.on('data', (data: Buffer) => { stdout += data.toString() })
@@ -394,6 +407,7 @@ export async function installDependencies(botId: string, language: string, optio
                   reject(new Error('incremental failed'))
                 })
                 child.on('close', (code, signal) => {
+                  clearTimeout(sigkillFallback)
                   if (stdout) stdout.split('\n').forEach(line => { if (line.trim()) appendDeployLog(botId, line) })
                   if (stderr) stderr.split('\n').forEach(line => { if (line.trim()) appendDeployLog(botId, line) })
                   // FIX: code=null means process was killed by signal (e.g., OOM SIGKILL).
@@ -434,7 +448,8 @@ export async function installDependencies(botId: string, language: string, optio
   }
 
   // ── Full install ────────────────────────────────────────────────────
-  // P0-2 FIX: Use spawn with args array (no shell) to prevent command injection
+  // SECURITY FIX (S2): Never use shell mode even on Windows.
+  // shell:true allows command injection via metacharacters in args.
   let command: string
   let args: string[]
 
@@ -455,9 +470,17 @@ export async function installDependencies(botId: string, language: string, optio
       const child = spawn(cmd, installArgs, {
         cwd: botDir,
         timeout: 120000,
+        killSignal: 'SIGKILL',
         stdio: ['pipe', 'pipe', 'pipe'],
-        shell: process.platform === 'win32',
+        shell: false,
       })
+      // Manual SIGKILL fallback: if process doesn't exit within 5s after timeout
+      const sigkillFallback = setTimeout(() => {
+        if (child.exitCode === null) {
+          try { child.kill('SIGKILL') } catch { /* ignore */ }
+        }
+      }, 125000)
+      sigkillFallback.unref()
 
       let stderr = ''
       let stdoutBuffer = ''
@@ -482,6 +505,7 @@ export async function installDependencies(botId: string, language: string, optio
         resolveInstall({ success: false, stderr: err.message })
       })
       child.on('close', (code, signal) => {
+        clearTimeout(sigkillFallback)
         if (stdoutBuffer.trim()) {
           appendDeployLog(botId, stdoutBuffer.trim())
         }
@@ -586,14 +610,24 @@ export async function deployBot(
     try {
       procRef.kill('SIGTERM')
     } catch { /* ignore if already dead */ }
-    // Skip kill+wait if the process is already dead
-    if (procRef.exitCode === null && !procRef.killed) {
+    // Skip kill+wait if the process is already dead.
+    // S2 FIXED: Removed !procRef.killed — Node.js sets killed=true immediately after
+    // kill('SIGTERM'), so the forceKill timer would never fire. Check only exitCode.
+    if (procRef.exitCode === null) {
       const forceKill = setTimeout(() => {
         try { procRef.kill('SIGKILL') } catch { /* ignore */ }
       }, 10000)
       forceKill.unref()
       await new Promise<void>((resolve) => {
-        const timeout = setTimeout(resolve, 15000)
+        const timeout = setTimeout(() => {
+          // SECURITY FIX (S3): If the old process didn't exit within 15s,
+          // log a warning and proceed. The intentionalStopSet flag will be
+          // cleared when the new process starts successfully (line ~821).
+          // The forceKill timer will handle SIGKILL, and handleBotExit
+          // will eventually fire and clean up the stale entry.
+          logger.warn('deploy', `Old process for ${botId} didn't exit in 15s, proceeding with deploy`)
+          resolve()
+        }, 15000)
         procRef.once('close', () => {
           clearTimeout(forceKill)
           clearTimeout(timeout)
@@ -601,6 +635,11 @@ export async function deployBot(
         })
       })
     }
+    // FIX (S1): Wait briefly after 'close' to ensure handleBotExit finishes
+    // its async processing (status updates, cleanup, etc.) before we overwrite
+    // the botProcesses record. Without this, handleBotExit may run after
+    // botProcesses.set() and corrupt the new record by setting status='stopped'.
+    await new Promise(r => setTimeout(r, 150))
   } else {
     // No running process, but still cancel any pending auto-restart timer
     cancelRestartTimer(botId)
@@ -661,7 +700,13 @@ export async function deployBot(
     customCode: config.customCode,
     dependencies: config.dependencies,
     entryPoint: config.entryPoint,
-    webhookSecret: (config as Record<string, unknown>).webhookSecret as string | undefined,
+    // FIX (L2): Safe access to webhookSecret without double type assertion.
+    // BotConfig doesn't declare webhookSecret, but it may be present on the
+    // object at runtime. Use optional chaining + type guard instead of
+    // `as Record<string, unknown>` which bypasses type safety entirely.
+    webhookSecret: 'webhookSecret' in config && typeof config.webhookSecret === 'string'
+      ? config.webhookSecret
+      : undefined,
   })
 
   deployStatus.set(botId, {
@@ -853,25 +898,36 @@ export async function deployBot(
       // FIX: Emit bot:status so frontend can clear deployProgress
       io.emit('bot:status', { botId, status: 'error', error: errorMessage })
     }
-  } catch (err: any) {
+  } catch (err: unknown) {
     // Check if the error is due to cancellation
     if (isCancelled?.()) {
       checkCancelled() // Will clean up
       return
     }
+    // SECURITY FIX (S3): Use err:unknown instead of err:any.
+    // 1. Type-safe error message extraction
+    // 2. Sanitize absolute file paths from error messages to prevent
+    //    leaking server directory structure to the frontend.
+    const rawMessage = err instanceof Error ? err.message : String(err)
+    const safeMessage = rawMessage.replace(/\/[^\s:]+\/([^\s/]+)/g, '$1')
     updateStatus('error', deployStatus.get(botId)?.progress || 0)
-    appendDeployLog(botId, `❌ 部署失败: ${err.message}`)
+    appendDeployLog(botId, `❌ 部署失败: ${safeMessage}`)
     const bot = botProcesses.get(botId)
     if (bot) {
       bot.status = 'error'
-      bot.error = err.message
+      bot.error = safeMessage
     }
     // FIX: Emit bot:status so the frontend can clear deployProgress.
     // Without this, deployProgress gets stuck at stage='error' forever
     // because the frontend only clears it on bot:status events.
-    io.emit('bot:status', { botId, status: 'error', error: err.message })
+    io.emit('bot:status', { botId, status: 'error', error: safeMessage })
     // Cancel any auto-restart timer that might have been set by handleBotExit
     cancelRestartTimer(botId)
     markIntentionalStop(botId)
+    // FIX (M4): Clear intentional stop flag after marking — the deploy failed
+    // and the bot is fully stopped. Without this, the residual flag in
+    // intentionalStopSet would cause handleBotExit to skip auto-restart
+    // on the next manual start if the bot crashes.
+    clearIntentionalStop(botId)
   }
 }

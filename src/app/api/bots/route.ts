@@ -116,7 +116,8 @@ export async function POST(request: Request) {
     }
 
     // Parse request body with size limit protection (shared utility)
-    const parsed = await parseJsonBody(request)
+    // SECURITY FIX (S5): Explicit 5MB limit for bot creation (projectFiles can be large)
+    const parsed = await parseJsonBody(request, 5_000_000)
     if (parsed instanceof NextResponse) return parsed
     const bot = parsed
 
@@ -181,15 +182,9 @@ export async function POST(request: Request) {
     logger.error('bots', 'POST /api/bots error', error instanceof Error ? error.message : String(error))
     // Handle Prisma unique constraint violations with specific error messages
     if (error && typeof error === 'object' && 'code' in error && (error as { code: string }).code === 'P2002') {
-      const meta = 'meta' in error ? (error as { meta?: { target?: string[] } }).meta : undefined
-      const target = meta?.target?.[0]
-      if (target === 'name') {
-        return NextResponse.json({ error: 'A bot with this name already exists' }, { status: 409 })
-      }
-      if (target === 'id') {
-        return NextResponse.json({ error: 'A bot with this ID already exists' }, { status: 409 })
-      }
-      return NextResponse.json({ error: 'A bot with this unique field already exists' }, { status: 409 })
+      // SECURITY FIX (L-11): Unified error message — don't distinguish between
+      // 'name' and 'id' fields to avoid leaking which field caused the conflict.
+      return NextResponse.json({ error: 'A bot with this name or ID already exists' }, { status: 409 })
     }
     return NextResponse.json({ error: 'Failed to create bot' }, { status: 500 })
   }

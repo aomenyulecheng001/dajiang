@@ -6,7 +6,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { useBotRunnerConnection, useBotStatus, useBotResourceData } from '@/lib/bot-runner-context'
 import { useBotStore } from '@/store/bot-store'
-import { useT } from '@/lib/i18n'
+import { useT, type TranslationKey } from '@/lib/i18n'
 import { cn, formatUptimeShort } from '@/lib/utils'
 import {
   Table,
@@ -150,7 +150,7 @@ export function ProcessManager() {
 
 // ─── Status Badge ──────────────────────────────────────────────────────────
 
-function StatusBadge({ status, t }: { status: string; t: (key: any, params?: Record<string, string | number>) => string }) {
+function StatusBadge({ status, t }: { status: string; t: (key: TranslationKey, params?: Record<string, string | number>) => string }) {
   const config: Record<string, { label: string; className: string }> = {
     running: {
       label: t('resourceMonitor.running'),

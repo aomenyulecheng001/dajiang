@@ -205,7 +205,7 @@ export default function Home() {
   useEffect(() => {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), 10000)
-    verifySession(undefined, controller.signal).then(({ valid, username }) => {
+    verifySession(controller.signal).then(({ valid, username }) => {
       clearTimeout(timer)
       if (valid && username) {
         setAuth(true, username, null)

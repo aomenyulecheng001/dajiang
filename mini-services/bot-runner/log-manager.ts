@@ -21,29 +21,30 @@ mkdirSync(LOGS_DIR, { recursive: true })
 /**
  * Patterns for detecting and redacting sensitive information in logs.
  * FIX: Prevents accidental leakage of tokens, passwords, API keys, etc.
+ *
+ * ⚠️ CANONICAL SOURCE: src/lib/security-utils.ts
+ * ⚠️ SYNC REQUIRED: When updating patterns, also update:
+ *   - mini-services/bot-runner/handlers.ts (SENSITIVE_ENV_PATTERNS)
+ *   - mini-services/bot-runner/log-manager.ts (SENSITIVE_PATTERNS)
  */
-// CANONICAL SOURCE: These patterns must be kept in sync with
-// src/lib/security-utils.ts SENSITIVE_DATA_PATTERNS.
-// Any changes here should be mirrored there and vice versa.
 const SENSITIVE_PATTERNS: Array<{ pattern: RegExp; replacement: string }> = [
   // Bot tokens (Telegram, Discord, Slack format)
   { pattern: /\d{9,}:[a-zA-Z0-9_-]{30,}/g, replacement: '[BOT_TOKEN_REDACTED]' },
-  // Generic bot_token patterns
-  { pattern: /bot[_-]?token["\s:=]+[a-zA-Z0-9:_-]+/gi, replacement: 'bot_token=[REDACTED]' },
   // API keys
-  { pattern: /api[_-]?key["\s:=]+[a-zA-Z0-9_-]+/gi, replacement: 'api_key=[REDACTED]' },
+  { pattern: /(?:api[_-]?key|apikey)["\s:=]+[a-zA-Z0-9_-]{20,}/gi, replacement: 'api_key=[REDACTED]' },
   // Passwords
-  { pattern: /password["\s:=]+[^\s]+/gi, replacement: 'password=[REDACTED]' },
+  { pattern: /(?:password|passwd|pwd)["\s:=]+[^\s]+/gi, replacement: 'password=[REDACTED]' },
   // Secrets
-  { pattern: /secret["\s:=]+[^\s]+/gi, replacement: 'secret=[REDACTED]' },
+  { pattern: /(?:secret|signing[_-]?key|access[_-]?token|refresh[_-]?token)["\s:=]+[a-zA-Z0-9_-]{20,}/gi, replacement: 'secret=[REDACTED]' },
   // Authorization headers
   { pattern: /authorization["\s:=]+bearer\s+[a-zA-Z0-9._-]+/gi, replacement: 'authorization=Bearer [REDACTED]' },
   // JWT tokens
   { pattern: /eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*/g, replacement: '[JWT_REDACTED]' },
   // Connection strings with passwords
   { pattern: /:\/\/[^:]+:[^@]+@/g, replacement: '://[USER]:[PASS]@' },
-  // Private keys (PEM format start)
-  { pattern: /-----BEGIN\s+(?:RSA\s+)?PRIVATE\s+KEY-----[\s\S]*?-----END\s+(?:RSA\s+)?PRIVATE\s+KEY-----/g, replacement: '[PRIVATE_KEY_REDACTED]' },
+  // Private keys (PEM format)
+  // L2 FIXED: Avoid [\s\S]*? which causes catastrophic backtracking on long input.
+  { pattern: /-----BEGIN\s+(?:RSA\s+)?PRIVATE\s+KEY-----(?:[^-]|-(?!-{4}))*-----END\s+(?:RSA\s+)?PRIVATE\s+KEY-----/g, replacement: '[PRIVATE_KEY_REDACTED]' },
 ]
 
 /**
@@ -126,6 +127,12 @@ let _enospcWarned = false
 // FIX: Track approximate log file sizes per bot to warn on excessive growth
 const _logFileSizeEstimate = new Map<string, number>()
 let _sizeWarned = new Set<string>()
+
+/** Clean up log tracking state for a deleted bot */
+export function cleanupBotLogState(botId: string): void {
+  _logFileSizeEstimate.delete(botId)
+  _sizeWarned.delete(botId)
+}
 
 // ─── Log Append Functions ─────────────────────────────────────────────────
 

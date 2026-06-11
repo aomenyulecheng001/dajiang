@@ -15,38 +15,8 @@ import { NextResponse } from 'next/server'
 import { safeJsonParse, getCurrentUserId, isBotOwner } from '@/lib/api-helpers'
 import { validateBotId } from '@/lib/validation'
 import { decryptEnvVarsAsync } from '@/lib/crypto'
+import { rateLimit, RATE_LIMIT_REVEAL, getRateLimitHeaders } from '@/lib/rate-limit'
 import { logger } from '@/lib/logger'
-
-const REVEAL_RATE_LIMIT = { max: 10, windowMs: 60_000 }
-const MAX_REVEAL_RATE_ENTRIES = 5000
-const revealRateMap = new Map<string, { count: number; resetAt: number }>()
-
-// Cleanup expired entries every 5 minutes to prevent unbounded memory growth
-const _revealCleanupTimer = setInterval(() => {
-  const now = Date.now()
-  for (const [userId, entry] of revealRateMap) {
-    if (now > entry.resetAt) revealRateMap.delete(userId)
-  }
-}, 5 * 60 * 1000)
-if (_revealCleanupTimer.unref) _revealCleanupTimer.unref()
-
-function checkRevealLimit(key: string): boolean {
-  if (revealRateMap.size >= MAX_REVEAL_RATE_ENTRIES) {
-    const now = Date.now()
-    for (const [k, entry] of revealRateMap) {
-      if (now > entry.resetAt) revealRateMap.delete(k)
-    }
-  }
-  const now = Date.now()
-  const entry = revealRateMap.get(key)
-  if (!entry || now > entry.resetAt) {
-    revealRateMap.set(key, { count: 1, resetAt: now + REVEAL_RATE_LIMIT.windowMs })
-    return true
-  }
-  if (entry.count >= REVEAL_RATE_LIMIT.max) return false
-  entry.count++
-  return true
-}
 
 export async function GET(
   request: Request,
@@ -56,14 +26,17 @@ export async function GET(
   try {
     // SEC FIX: Strict rate limiting on the reveal endpoint.
     // This endpoint returns plaintext secrets — must be more restrictive than normal APIs.
+    // SECURITY FIX (L3): Use shared rateLimit instance with sliding window algorithm
+    // instead of custom fixed-window implementation for consistency.
     const userId = await getCurrentUserId(request)
     if (!userId) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
-    if (!checkRevealLimit(userId)) {
+    const revealRateResult = rateLimit.check(`reveal:${userId}`, RATE_LIMIT_REVEAL)
+    if (!revealRateResult.success) {
       return NextResponse.json(
         { error: 'Too many requests. Please try again later.' },
-        { status: 429, headers: { 'Retry-After': '60' } },
+        { status: 429, headers: { ...getRateLimitHeaders(revealRateResult), 'Retry-After': '60' } },
       )
     }
 
