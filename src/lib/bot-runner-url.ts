@@ -26,10 +26,10 @@ function validateRunnerUrl(url: string): string {
     const internalHostnames = ['localhost', 'localhost.localdomain', 'ip6-localhost', 'ip6-loopback']
 
     if (internalHostnames.includes(hostname)) {
-      // Allow localhost in development mode only
-      if (process.env.NODE_ENV === 'production') {
-        console.error(`SECURITY: BOT_RUNNER_URL points to localhost (${url}). This is not allowed in production.`)
-        console.error('Set BOT_RUNNER_URL to an external URL (e.g., http://bot-runner:3001 in Docker)')
+      // Allow localhost in production when explicitly configured (same-host deployment).
+      // Only warn if it is the default fallback value, not a user-configured setting.
+      if (process.env.NODE_ENV === 'production' && !process.env.BOT_RUNNER_URL) {
+        console.warn(`BOT_RUNNER_URL defaults to localhost (${url}). For container deployments, set BOT_RUNNER_URL to the runner service address.`)
       }
     }
 

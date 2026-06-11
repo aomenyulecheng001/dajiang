@@ -1,4 +1,5 @@
-import { redactSensitiveData } from './security-utils'
+// Import from lightweight module to keep Edge Runtime compatibility
+import { redactSensitiveData } from './sensitive-patterns'
 
 type LogLevel = 'debug' | 'info' | 'warn' | 'error'
 

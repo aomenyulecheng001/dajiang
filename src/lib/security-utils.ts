@@ -9,6 +9,10 @@
 
 import { createHash, timingSafeEqual } from 'crypto'
 import { logger } from '@/lib/logger'
+import { redactSensitiveData } from '@/lib/sensitive-patterns'
+
+// Re-export for backward compatibility — canonical source is sensitive-patterns.ts
+export { SENSITIVE_ENV_KEY_PATTERNS, SENSITIVE_DATA_PATTERNS, redactSensitiveData, sanitizeForLogging } from '@/lib/sensitive-patterns'
 
 // ─── Path Validation ────────────────────────────────────────────────────────
 
@@ -46,86 +50,9 @@ export function isValidFilename(filename: string): boolean {
   return true
 }
 
-// ─── Sensitive Env Var Key Patterns ──────────────────────────────────────────
-
-/**
- * Env var key name patterns that should never be exposed to clients.
- * Used when filtering bot env var keys in API responses and Socket.IO events.
- *
- * ⚠️ CANONICAL SOURCE: src/lib/security-utils.ts
- * ⚠️ SYNC REQUIRED: When updating patterns, also update:
- *   - mini-services/bot-runner/handlers.ts (SENSITIVE_ENV_PATTERNS)
- *   - mini-services/bot-runner/log-manager.ts (SENSITIVE_PATTERNS)
- *
- * SECURITY FIX (M3): Added explicit documentation about the relationship
- * between this list and the bot-runner's copy, and added 'DATABASE_URL'
- * which was previously only in the bot-runner copy.
- */
-export const SENSITIVE_ENV_KEY_PATTERNS = [
-  'BOT_TOKEN', 'SECRET', 'PASSWORD', 'AUTH', 'APIKEY', 'API_KEY',
-  'ACCESS_KEY', 'PRIVATE', 'CREDENTIAL', 'DATABASE_URL',
-] as const
-
-// ─── Sensitive Data Sanitization ────────────────────────────────────────────
-
-/**
- * Patterns for detecting sensitive data in strings.
- * Used for log sanitization and error message redaction.
- *
- * ⚠️ CANONICAL SOURCE: src/lib/security-utils.ts
- * ⚠️ SYNC REQUIRED: When updating patterns, also update:
- *   - mini-services/bot-runner/handlers.ts (SENSITIVE_ENV_PATTERNS)
- *   - mini-services/bot-runner/log-manager.ts (SENSITIVE_PATTERNS)
- */
-export const SENSITIVE_DATA_PATTERNS = {
-  BOT_TOKEN: /\d{9,}:[a-zA-Z0-9_-]{30,}/,
-  API_KEY: /(?:api[_-]?key|apikey)["\s:=]+[a-zA-Z0-9_-]{20,}/i,
-  PASSWORD: /(?:password|passwd|pwd)["\s:=]+[^\s]+/i,
-  // SECURITY FIX (M7): Narrowed SECRET pattern to avoid false positives on
-  // generic "token" references (e.g., "tokenVersion", "token-based").
-  // Now requires "secret" or "token" followed by a separator and a value
-  // that looks like a real credential (20+ chars of hex/base64, or a
-  // Bearer/JWT prefix). Generic short token references are excluded.
-  SECRET: /(?:secret|signing[_-]?key|access[_-]?token|refresh[_-]?token)["\s:=]+[a-zA-Z0-9_-]{20,}/i,
-  AUTH_HEADER: /authorization["\s:=]+bearer\s+[a-zA-Z0-9._-]+/i,
-  JWT: /eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*/,
-  CONNECTION_STRING: /:\/\/[^:]+:[^@]+@/,
-  // L2 FIXED: Avoid [\s\S]*? which causes catastrophic backtracking on long input.
-  // Match content character by character, rejecting the end-marker sequence.
-  PRIVATE_KEY: /-----BEGIN\s+(?:RSA\s+)?PRIVATE\s+KEY-----(?:[^-]|-(?!-{4}))*-----END\s+(?:RSA\s+)?PRIVATE\s+KEY-----/,
-}
-
-/**
- * Redact sensitive information from a string.
- * 
- * @param text - The text to sanitize
- * @returns The sanitized text with sensitive data replaced
- */
-function toGlobalRegex(re: RegExp): RegExp {
-  return new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g')
-}
-
-export function redactSensitiveData(text: string): string {
-  let sanitized = text
-  
-  sanitized = sanitized.replace(toGlobalRegex(SENSITIVE_DATA_PATTERNS.BOT_TOKEN), '[BOT_TOKEN_REDACTED]')
-  
-  sanitized = sanitized.replace(toGlobalRegex(SENSITIVE_DATA_PATTERNS.API_KEY), 'api_key=[REDACTED]')
-  
-  sanitized = sanitized.replace(toGlobalRegex(SENSITIVE_DATA_PATTERNS.PASSWORD), 'password=[REDACTED]')
-  
-  sanitized = sanitized.replace(toGlobalRegex(SENSITIVE_DATA_PATTERNS.SECRET), 'secret=[REDACTED]')
-  
-  sanitized = sanitized.replace(toGlobalRegex(SENSITIVE_DATA_PATTERNS.AUTH_HEADER), 'authorization=Bearer [REDACTED]')
-  
-  sanitized = sanitized.replace(toGlobalRegex(SENSITIVE_DATA_PATTERNS.JWT), '[JWT_REDACTED]')
-  
-  sanitized = sanitized.replace(toGlobalRegex(SENSITIVE_DATA_PATTERNS.CONNECTION_STRING), '://[USER]:[PASS]@')
-  
-  sanitized = sanitized.replace(toGlobalRegex(SENSITIVE_DATA_PATTERNS.PRIVATE_KEY), '[PRIVATE_KEY_REDACTED]')
-  
-  return sanitized
-}
+// NOTE: SENSITIVE_ENV_KEY_PATTERNS, SENSITIVE_DATA_PATTERNS, redactSensitiveData,
+// and sanitizeForLogging are now defined in @/lib/sensitive-patterns.ts (canonical source)
+// and re-exported from this module for backward compatibility.
 
 // ─── Timing-Safe Comparison ─────────────────────────────────────────────────
 
@@ -275,25 +202,4 @@ export function isValidUserIdFormat(userId: string): boolean {
   return true
 }
 
-/**
- * Sanitize a string for safe logging.
- * Removes control characters and truncates if too long.
- * 
- * @param str - The string to sanitize
- * @param maxLength - Maximum allowed length (default 1000)
- * @returns The sanitized string
- */
-export function sanitizeForLogging(str: string, maxLength = 1000): string {
-  if (!str || typeof str !== 'string') return ''
-  
-  // Remove control characters except newline and tab
-  let sanitized = str.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
-  
-  // Truncate if too long
-  if (sanitized.length > maxLength) {
-    sanitized = sanitized.slice(0, maxLength) + '...[truncated]'
-  }
-  
-  // Redact sensitive data
-  return redactSensitiveData(sanitized)
-}
+// sanitizeForLogging is now defined in @/lib/sensitive-patterns.ts and re-exported above

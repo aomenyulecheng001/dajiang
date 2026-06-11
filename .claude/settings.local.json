@@ -37,7 +37,8 @@
       "PowerShell(node -e \"require\\('fs'\\).readdirSync\\('mini-services/bot-runner'\\).filter\\(f=>f.endsWith\\('.ts'\\)\\).forEach\\(f=>{try{require\\('fs'\\).readFileSync\\('mini-services/bot-runner/'+f,'utf8'\\)}catch\\(e\\){console.log\\('Error:',f,e.message\\)}}\\); console.log\\('All bot-runner files readable'\\)\")",
       "Bash(Select-String '^\\\\?\\\\?')",
       "Bash(Select-Object -First 10)",
-      "Bash(git reset *)"
+      "Bash(git reset *)",
+      "Bash(git rm *)"
     ]
   }
 }
