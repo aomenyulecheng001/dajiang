@@ -34,7 +34,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 if [ -d .git ]; then
   echo_info "检测到 Git 仓库，正在拉取最新代码..."
   git fetch origin 2>/dev/null || echo_warn "git fetch 失败，继续执行"
-  git pull origin master 2>/dev/null || echo_warn "git pull 失败，可能已是最新"
+  git pull origin main 2>/dev/null || echo_warn "git pull 失败，可能已是最新"
   echo_success "代码已更新"
 else
   echo_warn "未检测到 Git 仓库，跳过代码更新"
