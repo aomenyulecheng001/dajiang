@@ -10,11 +10,6 @@ function getSecretFilePath(): string {
   return resolveFromProjectRoot('mini-services', 'bot-runner', 'config', 'runner-secret')
 }
 
-function maskSecret(secret: string): string {
-  if (secret.length <= 12) return '***'
-  return secret.slice(0, 8) + '...' + secret.slice(-4)
-}
-
 export async function GET(request: NextRequest) {
   try {
     const clientIp = getSecureClientIp(request)
