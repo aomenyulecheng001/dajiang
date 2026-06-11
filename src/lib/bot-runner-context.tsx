@@ -140,7 +140,7 @@ const BOT_RUNNER_URL = (typeof window !== 'undefined' && (window as unknown as R
   ? String((window as unknown as Record<string, unknown>).__RUNNER_URL__)
   : (typeof window !== 'undefined' 
     ? window.location.origin
-    : `http://localhost:3100`)
+    : `http://localhost:3001`)
 
 if (typeof window !== 'undefined' && (window as unknown as Record<string, unknown>).__DEBUG_BOT_RUNNER__) {
   logger.debug('bot-runner', `BOT_RUNNER_URL = ${BOT_RUNNER_URL} | window.location.origin = ${window.location.origin} | __RUNNER_URL__ = ${(window as unknown as Record<string, unknown>).__RUNNER_URL__}`)
