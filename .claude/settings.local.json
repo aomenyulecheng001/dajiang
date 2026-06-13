@@ -38,7 +38,18 @@
       "Bash(Select-String '^\\\\?\\\\?')",
       "Bash(Select-Object -First 10)",
       "Bash(git reset *)",
-      "Bash(git rm *)"
+      "Bash(git rm *)",
+      "Bash(curl --version)",
+      "Bash(npx --version)",
+      "Bash(npx @anthropic-ai/chromium-cli@latest --help)",
+      "Bash(npx playwright *)",
+      "Bash(taskkill //F //PID 1382)",
+      "Bash(netstat -ano)",
+      "Bash(awk '{print $5}')",
+      "Bash(xargs -I{} taskkill //F //PID {})",
+      "Bash(npm install *)",
+      "Bash(bash *)",
+      "Bash(node *)"
     ]
   }
 }

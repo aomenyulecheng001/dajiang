@@ -69,13 +69,14 @@
     "zustand": "^5.0.6"
   },
   "devDependencies": {
-    "prisma": "^6.11.1",
     "@tailwindcss/postcss": "^4",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "bun-types": "^1.3.4",
     "eslint": "^9",
     "eslint-config-next": "^16.1.1",
+    "playwright": "^1.60.0",
+    "prisma": "^6.11.1",
     "tailwindcss": "^4",
     "tw-animate-css": "^1.3.5",
     "typescript": "^5"
